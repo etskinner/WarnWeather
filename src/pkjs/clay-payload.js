@@ -2,16 +2,57 @@
 // window). Extracted from index.js so the mapping is unit-testable (index.js
 // wires Pebble events and can't be required under node:test). ES5-only (PKJS).
 
+var utf8 = require('./utf8.js');
 var pebbleColors = require('./pebble-colors.js');
 var holidayMask = require('./holidays/holiday-mask.js');
 var paletteWire = require('./weather/palette-wire.js');
 var viewCycle = require('./view-cycle.js');
 var resolveInk = require('./resolve-ink.js').resolveInk;
+var statusThresholds = require('./status-thresholds.js');
+var platformLib = require('./config-ui/lib/platform.js');
+var lineStyle = require('./line-style.js');
+var dateFormat = require('./date-format.js');
 
 var DEFAULT_COLOR_WHITE = pebbleColors.GColorWhite;
 var DEFAULT_COLOR_FOLLY = pebbleColors.GColorFolly;
 // Holiday highlight defaults to Blue Moon (weekends stay Folly/red).
 var DEFAULT_COLOR_BLUE_MOON = pebbleColors.GColorBlueMoon;
+
+/**
+ * Longest prefix of `str` that encodes to at most `maxBytes` UTF-8 bytes —
+ * utf8.js owns the walker (status-lines' wire byte arrays share it); this
+ * wrapper keeps the string-in/string-out shape and the original characters
+ * (a lone surrogate is charged 3 bytes and kept, exactly as before).
+ * @param {string} str Input string.
+ * @param {number} maxBytes Maximum UTF-8 byte budget.
+ * @returns {string} The longest prefix of str that encodes to <= maxBytes bytes.
+ */
+function truncateUtf8Bytes(str, maxBytes) {
+    return utf8.truncateToByteCap(str, maxBytes).str;
+}
+
+/**
+ * The country the holiday features (and the date-order derivation) act for.
+ * An ABSENT key means a pre-holidayCountry install that never re-saved — those
+ * were US-market builds, so the legacy fallback is 'US', deliberately NOT the
+ * schema's fresh-install 'DE': seedDefaults writes the key into every seeded
+ * blob (making this arm unreachable there), but fixture applications and
+ * direct payload builds still exercise it, and flipping them to day-first
+ * dates would be a silent behavior change. THE one home for that knowledge —
+ * it used to be inlined at three sites that could drift apart.
+ *
+ * @param {Object} settings Clay settings blob.
+ * @returns {string} Country code ('US' when the key is absent).
+ */
+function effectiveHolidayCountry(settings) {
+    return Object.prototype.hasOwnProperty.call(settings, 'holidayCountry')
+        ? settings.holidayCountry : 'US';
+}
+
+// Fixed vertical inset for the temperature axis (px) — the watch's
+// BOTTOM_VIEW_PRIMARY_LINE_INSET_Y. Deliberately NOT a user setting; the wire
+// stays a per-series triple so feels-like inherits it only where selected.
+var CURVE_INSET_PX = 7;
 
 /**
  * Build the Clay settings AppMessage payload.
@@ -45,8 +86,7 @@ function buildClayPayload(settings, watchInfo, now) {
         // No-cal date slot order: US writes the month first (mm.dd.yy); everyone
         // else is day-first (dd.mm.yy). Derived from the configured holiday
         // country (defaults to US, matching the holiday-mask default below).
-        "CLAY_DATE_MONTH_FIRST": (settings.hasOwnProperty('holidayCountry')
-            ? settings.holidayCountry : 'US') === 'US',
+        "CLAY_DATE_MONTH_FIRST": effectiveHolidayCountry(settings) === 'US',
         "CLAY_PREV_WEEK": settings.firstWeek === 'prev',
         "CLAY_TOP_VIEW_MODE": topViewIdx,
         "CLAY_THEME": ['dark', 'light', 'bw', 'bw-light'].indexOf(theme),
@@ -61,7 +101,7 @@ function buildClayPayload(settings, watchInfo, now) {
         "CLAY_COLOR_SATURDAY": settings.hasOwnProperty('colorSaturday') ? settings.colorSaturday : DEFAULT_COLOR_FOLLY,
         "CLAY_COLOR_US_FEDERAL": settings.hasOwnProperty('colorUSFederal') ? settings.colorUSFederal : DEFAULT_COLOR_BLUE_MOON,
         "HOLIDAYS": (function() {
-            var country = settings.hasOwnProperty('holidayCountry') ? settings.holidayCountry : 'US';
+            var country = effectiveHolidayCountry(settings);
             var region = settings.holidayRegion || 'all';
             var built = holidayMask.build({
                 startMon: settings.weekStartDay === 'mon',
@@ -82,11 +122,88 @@ function buildClayPayload(settings, watchInfo, now) {
             if (isNaN(rc)) { rc = 60; }
             if ((settings.radarMode || 'graph') === 'off') { rc = 0; }
             return rc;
+        })(),
+        // Health-graph HR line scale, packed lo | (hi << 8) — both ends are <= 220,
+        // so each fits a byte and the pair rides one key instead of two. The watch
+        // reads it as int32 and falls back to its own HEALTH_HR_LO/HI when it is 0
+        // (an older phone build that never sends the key).
+        "CLAY_HR_SCALE": (function() {
+            var lo = 40, hi = 150;            // == HEALTH_HR_LO / HEALTH_HR_HI
+            var m = /^(\d+)-(\d+)$/.exec(String(settings.hrScale || ''));
+            if (m) {
+                var plo = parseInt(m[1], 10), phi = parseInt(m[2], 10);
+                if (plo >= 1 && phi > plo && phi <= 255) { lo = plo; hi = phi; }
+            }
+            return lo | (hi << 8);
         })()
     };
     var palette = paletteWire.buildPaletteTuples(watchInfo, settings);
     payload.BAR_PALETTE_UINT8 = palette.BAR_PALETTE_UINT8;
     payload.RADAR_PALETTE_UINT8 = palette.RADAR_PALETTE_UINT8;
+
+    // Graph line styling, ten bytes: [0] main metric line, [1] area fill, [2] second
+    // metric line, [3] line flags, [4] full-height night hatch, [5] full-height dusk/dawn
+    // line, [6] night-area base, [7] night-area hatch (derived from [6]), [8] night-area
+    // boundary (also derived from [6]), [9] night flags — the user's picks resolved
+    // against the theme's polarity, or the built-in colours when a pick is on Auto. Bytes
+    // [4..9] are byte-for-byte the watch's NIGHT_COLORS persist blob, which is why the
+    // night flag sits in its own byte instead of beside the fill flag in [3]; the full
+    // layout lives on buildLineStyleBytes (line-style.js). Derived from the settings blob
+    // plus the platform's colour/polarity capabilities alone, never from weather data, so
+    // it rides the Clay message. It replaces the four scalar tuples that used to travel on
+    // EVERY weather send (44 B there; 11 B here when it landed as four bytes, 17 B now).
+    // Deliberately NOT platform-gated, unlike the threshold blob / no-rain text / curve
+    // insets above: aplite renders the same two metric lines, so it needs the colours too.
+    payload.CLAY_LINE_STYLE_UINT8 = lineStyle.buildLineStyleBytes(settings, watchInfo);
+
+    // Threshold-highlight settings (enabled bits + colors + health-kind
+    // thresholds) — settings-derived, so they ride the Clay message. Omitted for a
+    // watch that compiles the highlight out (aplite): its settings screen hides the
+    // whole threshold card and its inbox handler for this tuple is gone, so the
+    // 34 B (27 blob + tuple header) stay out of its Clay bundle. An unknown platform
+    // is treated as capable (computeEnv), so a missing watchInfo never drops it.
+    var env = platformLib.computeEnv(watchInfo);
+    if (env.thresholds) {
+        payload.CLAY_THRESHOLDS_UINT8 = statusThresholds.buildSettingsBlob(settings);
+        // Date-slot formats [monthYear, fullDate] — settings-derived, so they ride
+        // the Clay message. Gated with the threshold blob: the pickers live on the
+        // Date slot's edit sheet, which shares this env gate, and an aplite watch
+        // keeps its frozen twin's hardcoded formats and compiles the config fields
+        // out (config_wire.c), so the 9 B stay out of its Clay bundle.
+        payload.CLAY_DATE_FORMAT_UINT8 = dateFormat.buildDateFormatBytes(settings);
+    }
+
+    // Custom radar empty-state text — settings-derived, so it rides the Clay
+    // message. Trimmed, then truncated to 24 UTF-8 BYTES (the watch persists it
+    // in a 25 B buffer incl. NUL). An empty result still rides the wire: the
+    // watch clears its stored text and falls back to the built-in string.
+    // Omitted for a watch that compiles the radar out (aplite): its inbox
+    // handler for this tuple is gone (WW_RAIN_RADAR), so the bytes stay out of
+    // its Clay bundle. An unknown platform is treated as radar-capable
+    // (computeEnv), so a missing watchInfo never drops it.
+    if (env.radar) {
+        payload.CLAY_NORAIN_TEXT = truncateUtf8Bytes(
+            String(settings.radarNoRainText || '').trim(), 24);
+    }
+
+    // Per-series vertical insets for the forecast graph's value-mapped lines,
+    // render-ready in px: [SERIES_FIRST (temp), SERIES_SECOND (main metric),
+    // SERIES_THIRD (second metric)]. The watch stays metric-agnostic — the
+    // phone decides here that feels-like shares the temp curve's configurable
+    // offset (so the two land pixel-aligned on their joint band) while every
+    // other metric keeps the full-height mapping. Settings-derived, so it rides
+    // the Clay message. Omitted for a watch that compiles the configurable
+    // inset out (aplite, no WW_CURVE_INSET): its inbox handler for this tuple
+    // is gone and it keeps the frozen 7/0/0 constants, so the 10 B stay out of
+    // its Clay bundle. An unknown platform is treated as capable (computeEnv's
+    // platform is '' then), so a missing watchInfo never drops it.
+    if (env.platform !== 'aplite') {
+        payload.CLAY_CURVE_INSET_UINT8 = [
+            CURVE_INSET_PX,
+            settings.secondaryLine === 'feels' ? CURVE_INSET_PX : 0,
+            settings.thirdLine === 'feels' ? CURVE_INSET_PX : 0
+        ];
+    }
 
     // Pack the cycle into the three wire bytes (unused slots → 0 = disabled).
     payload.CLAY_VIEW_0 = viewCycle.packSpec(cycle[0] || null);
@@ -94,9 +211,25 @@ function buildClayPayload(settings, watchInfo, now) {
     payload.CLAY_VIEW_2 = viewCycle.packSpec(cycle[2] || null);
     payload.CLAY_VIEW_RESET_MIN = parseInt(settings.viewResetMin, 10) || 0;
 
+    // emery-only axis-font step-up (Layout tab). The simple Boolean() is provably safe
+    // here: engine.js seeds toggles from defaultValue and flips them with !S[key], so a
+    // stored value is a strict boolean or absent -- and absent collapsing to false IS
+    // the default. A default-TRUE toggle would need the hasOwnProperty ternary
+    // dayNightShading uses above. Deliberately NOT platform-gated (unlike the threshold
+    // blob / no-rain text / curve insets, which are omitted for watches that compile the
+    // feature out): the tuple is 11 B, every non-emery Clay bundle has ample headroom, and
+    // sending it unconditionally means an emery watch can't be starved of the setting by a
+    // watchInfo hiccup. The WATCH does the skipping -- config_wire.c only spends a
+    // dict_find on it under PBL_PLATFORM_EMERY (config.h's field carries the same guard).
+    payload.CLAY_LARGE_GRAPH_FONT = Boolean(settings.largeGraphFont);
+
     return payload;
 }
 
 module.exports = {
-    buildClayPayload: buildClayPayload
+    effectiveHolidayCountry: effectiveHolidayCountry,
+    buildClayPayload: buildClayPayload,
+    // Exported for tests (multi-byte boundary cases); production callers go
+    // through buildClayPayload.
+    truncateUtf8Bytes: truncateUtf8Bytes
 };

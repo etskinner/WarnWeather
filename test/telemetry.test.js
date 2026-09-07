@@ -27,6 +27,15 @@ test('buildSettingsSnapshot includes forecast and radar display settings', () =>
   assert.equal(snapshot.devStatsEnabled, true);
 });
 
+// pressureScale is windScale's sibling (graph scale for the pressure line, added
+// alongside it); per this repo's rule a telemetry setting must be added in BOTH the
+// watch-side snapshot here AND the Deno .strip() schema
+// (supabase/functions/telemetry-ingest/index.ts) or it's silently dropped end to end.
+test('buildSettingsSnapshot includes pressureScale', () => {
+  const snapshot = buildSettingsSnapshot({ pressureScale: 'low' });
+  assert.equal(snapshot.pressureScale, 'low');
+});
+
 test('buildSettingsSnapshot coerces toggle settings to real booleans', () => {
   const snapshot = buildSettingsSnapshot({});
 
@@ -88,6 +97,61 @@ test('snapshot includes aqiSource', () => {
   assert.strictEqual(buildSettingsSnapshot({}).aqiSource, undefined);
 });
 
+test('snapshot includes tempSlotDisplay as a string', () => {
+  assert.strictEqual(buildSettingsSnapshot({ tempSlotDisplay: 'both' }).tempSlotDisplay, 'both');
+  assert.strictEqual(buildSettingsSnapshot({}).tempSlotDisplay, undefined);
+});
+
+// The date slot's two format picks, raw like tempSlotDisplay above — same lockstep
+// rule (watch-side snapshot AND the Deno .strip() schema, or ingest drops them).
+test('snapshot includes the two date-slot format picks as strings', () => {
+  assert.strictEqual(
+    buildSettingsSnapshot({ dateSlotMonthFormat: 'name' }).dateSlotMonthFormat, 'name');
+  assert.strictEqual(
+    buildSettingsSnapshot({ dateSlotFullFormat: 'textyear' }).dateSlotFullFormat, 'textyear');
+  assert.strictEqual(buildSettingsSnapshot({}).dateSlotMonthFormat, undefined);
+  assert.strictEqual(buildSettingsSnapshot({}).dateSlotFullFormat, undefined);
+});
+
+// The two per-kind wind-direction toggles. Same lockstep rule as pressureScale above:
+// watch-side snapshot AND the Deno .strip() schema, or ingest silently drops them.
+test('snapshot includes the wind and gust direction toggles as real booleans', () => {
+  assert.strictEqual(buildSettingsSnapshot({ windSlotDirection: true }).windSlotDirection, true);
+  assert.strictEqual(buildSettingsSnapshot({ gustSlotDirection: true }).gustSlotDirection, true);
+  assert.strictEqual(buildSettingsSnapshot({}).windSlotDirection, false);
+  assert.strictEqual(buildSettingsSnapshot({}).gustSlotDirection, false);
+});
+
+// The six per-kind "Show unit" toggles, same lockstep rule again. Four of them ship ON,
+// so an absent key must report the SHIPPED state and not a spurious "off" — otherwise
+// the fleet reads as having turned kph off en masse. seedDefaults backfills the keys at
+// boot, so this is belt and braces, but a telemetry column that can lie about a default
+// is worse than no column.
+test('snapshot includes the six Show unit toggles as real booleans', () => {
+  ['windSlotUnit', 'gustSlotUnit', 'pressureSlotUnit', 'countdownSlotUnit',
+    'tempSlotUnit', 'dewSlotUnit'].forEach((key) => {
+    assert.strictEqual(buildSettingsSnapshot({ [key]: true })[key], true, key + ' reports on');
+    assert.strictEqual(buildSettingsSnapshot({ [key]: false })[key], false, key + ' reports off');
+  });
+});
+
+// Drift guard for the fallbacks above: the snapshot's absent-key value is a SECOND copy
+// of each toggle's shipped default, and the settings schema owns the first. Pin them
+// together so flipping a default in schema.js can never leave telemetry reporting the
+// old one.
+test('an absent Show unit key reports the schema default, not false', () => {
+  const schema = require('../src/pkjs/settings/schema.js');
+  const items = [];
+  schema.tabs.forEach((t) => t.sections.forEach((s) => s.items.forEach((i) => items.push(i))));
+  const snap = buildSettingsSnapshot({});
+  const unitItems = items.filter((i) => /SlotUnit$/.test(i.messageKey || ''));
+  assert.equal(unitItems.length, 6, 'expected six Show unit rows in the schema');
+  unitItems.forEach((item) => {
+    assert.strictEqual(snap[item.messageKey], item.defaultValue,
+      item.messageKey + ' must fall back to its schema default');
+  });
+});
+
 test('snapshot includes windUnits and distanceUnits', () => {
   assert.equal(buildSettingsSnapshot({ windUnits: 'mph' }).windUnits, 'mph');
   assert.equal(buildSettingsSnapshot({ distanceUnits: 'imperial' }).distanceUnits, 'imperial');
@@ -118,6 +182,39 @@ test('buildSettingsSnapshot includes radarMode (default graph)', () => {
   assert.strictEqual(buildSettingsSnapshot({}).radarMode, 'graph');
 });
 
+// The phone-battery slot's Bold mode — the ONLY per-kind bold mode telemetry reports.
+// It earns the column because the slot is Android-only (its reading comes from a host
+// API that exists on no other phone), so how the small subset of phones that can have
+// it actually configure it is worth seeing. Passed through RAW, like tempSlotDisplay:
+// an install that has never opened the sheet reports undefined, which reads as "left at
+// the default" rather than as a deliberate "off".
+test('snapshot includes threshPhoneBatteryBoldMode, raw', () => {
+  assert.strictEqual(buildSettingsSnapshot({ threshPhoneBatteryBoldMode: 'always' }).threshPhoneBatteryBoldMode, 'always');
+  assert.strictEqual(buildSettingsSnapshot({ threshPhoneBatteryBoldMode: 'off' }).threshPhoneBatteryBoldMode, 'off');
+  assert.strictEqual(buildSettingsSnapshot({}).threshPhoneBatteryBoldMode, undefined,
+    'unset stays undefined — do not coerce it to a boolean or to "off"');
+  // The lockstep test below compares key SETS, and a key whose value is undefined is
+  // still a key — so pin that the property exists at all, since dropping it is exactly
+  // how a snapshot field goes missing without the set comparison noticing a shape change.
+  assert.ok(Object.prototype.hasOwnProperty.call(buildSettingsSnapshot({}), 'threshPhoneBatteryBoldMode'),
+    'the key must be emitted even when unset');
+});
+
+// Targeted half of the lockstep for the newest field. The set-equality test below would
+// also catch a one-sided edit, but it fails as a 90-key diff; this one names the key and
+// the file, which is what a reader needs when the two-place rule gets broken.
+test('threshPhoneBatteryBoldMode is declared in the Deno .strip() schema too', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const ts = fs.readFileSync(
+    path.resolve(__dirname, '..', 'supabase', 'functions', 'telemetry-ingest', 'index.ts'), 'utf8');
+  const start = ts.indexOf('const settingsSchema');
+  assert.ok(start !== -1, 'settingsSchema not found in telemetry-ingest/index.ts');
+  const slice = ts.slice(start, ts.indexOf('.strip()', start));
+  assert.match(slice, /^\s*threshPhoneBatteryBoldMode:\s*z\.string\(\)\.optional\(\)/m,
+    'ingest must accept it as an optional string, or .strip() drops it silently');
+});
+
 test('settings snapshot keys match the Deno telemetry schema (lockstep)', () => {
   const fs = require('fs');
   const path = require('path');
@@ -137,4 +234,590 @@ test('settings snapshot keys match the Deno telemetry schema (lockstep)', () => 
   const snapshotKeys = Object.keys(buildSettingsSnapshot({}));
   assert.deepEqual(snapshotKeys.slice().sort(), denoKeys.slice().sort(),
     'buildSettingsSnapshot (telemetry.js) and the Deno settingsSchema must declare the same fields');
+});
+
+test('snapshot includes largeGraphFont as a real boolean', () => {
+  assert.strictEqual(buildSettingsSnapshot({ largeGraphFont: true }).largeGraphFont, true);
+  assert.strictEqual(buildSettingsSnapshot({}).largeGraphFont, false);
+});
+
+// The six graph-colour FIELDS, pinned here by hand. They are named for the ELEMENT of the
+// graph they colour, which is all the Deno schema and the dashboards know; the storage
+// underneath is per metric and per polarity (gcWindLineDark, …), so there is no list in
+// line-style to derive these from any more — the mapping element -> (metric, role) is
+// telemetry.js's own and this file is the thing that pins it.
+//
+// Telemetry reports ONE value per element: the colour for the metric that element is
+// currently painted from, in the polarity the watch ACTUALLY renders, resolved through
+// line-style.renderContext — the same call the wire packer opens with — so a telemetry row
+// can never disagree with the wire. Same lockstep rule as pressureScale above: the watch
+// snapshot AND the Deno .strip() schema, or it is silently dropped.
+const GRAPH_COLOR_FIELDS = ['graphMainColor', 'graphFillColor', 'graphSecondColor',
+                            'nightHatchColor', 'nightBoundaryColor', 'nightFillColor'];
+
+test('graph colours report as #RRGGBB, and default while still on the built-in', () => {
+  const snap = buildSettingsSnapshot({
+    theme: 'dark',
+    secondaryLine: 'wind',
+    thirdLine: 'uv',
+    gcWindLineDark: 0xFFAA00,       // moved off the built-in Yellow
+    gcWindFillDark: 0x555500,       // the built-in ArmyGreen, stored concretely
+    gcUvLineDark: null,             // legacy: JSON persistence turned a NaN hexToInt into null
+    gcNightHatchDark: '#00AAFF'     // a fixture blob carries the hex string, not the int
+    // gcWindNightDark / gcNightBoundaryDark absent entirely
+  });
+
+  assert.strictEqual(snap.graphMainColor, '#FFAA00');
+  assert.strictEqual(snap.graphFillColor, 'default');
+  assert.strictEqual(snap.graphSecondColor, 'default');
+  assert.strictEqual(snap.nightHatchColor, '#00AAFF');
+  assert.strictEqual(snap.nightBoundaryColor, 'default');
+  assert.strictEqual(snap.nightFillColor, 'default');
+  // Never a number and never null on the wire: the ingest types these z.string(), and a
+  // number-typed field would fail safeParse and 400 the WHOLE event, with no retry.
+  GRAPH_COLOR_FIELDS.forEach((field) => {
+    assert.strictEqual(typeof snap[field], 'string', field + ' must serialize as a string');
+  });
+});
+
+// The whole point of the 'default' encoding: with concrete defaults there is no sentinel
+// left, so "still the built-in" has to be a comparison — and it is line-style's comparison
+// (graphColorIsDefault), not a hex match here. gust's dark line is the case that proves it:
+// its built-in follows rainBarColor, so BOTH greys read as untouched.
+test('a colour equal to the built-in reports as default, including gust either way', () => {
+  const gust = (extra) => buildSettingsSnapshot(
+    Object.assign({ theme: 'dark', secondaryLine: 'gust' }, extra)).graphMainColor;
+
+  assert.strictEqual(gust({ rainBarColor: 'white', gcGustLineDark: 0xFFFFFF }), 'default');
+  assert.strictEqual(gust({ rainBarColor: 'white', gcGustLineDark: 0xAAAAAA }), 'default');
+  assert.strictEqual(gust({ rainBarColor: 'multicolor', gcGustLineDark: 0xFFFFFF }), 'default');
+  // A real pick still reports as one — the wart is only that White and LightGray cannot be
+  // pinned deliberately on this one row.
+  assert.strictEqual(gust({ rainBarColor: 'white', gcGustLineDark: 0xFF0000 }), '#FF0000');
+});
+
+// gust's dark line is the ONLY colour that holds a concrete value without having been
+// chosen. A metric's night tint used to be a second one: the settings page wrote each new
+// fill pick into the tint key, so the report had to guess by comparing the two — and got a
+// deliberately fill-coloured tint wrong. The carry is derived at resolve time now
+// (line-style.js' graphNightTint), so the tint key holds a value only when someone put it
+// there, and this report is a straight "is it off its built-in?" again.
+test('a night tint is reported on its own key, whatever the fill did', () => {
+  const tint = (extra) => buildSettingsSnapshot(
+    Object.assign({ theme: 'dark', secondaryLine: 'wind', thirdLine: 'off' }, extra)).nightFillColor;
+
+  assert.strictEqual(tint({ gcWindFillDark: 0x00AA55 }), 'default',
+    'a tint still on its built-in is untouched even though the fill moved — the cascade ' +
+    'that paints the night band in the fill colour is a render rule, not a pick');
+  assert.strictEqual(tint({ gcWindFillDark: 0x00AA55, gcWindNightDark: 0x00AA55 }), '#00AA55',
+    'a tint deliberately set to the fill colour IS a pick, and is mined as one');
+  assert.strictEqual(tint({ gcWindFillDark: 0x00AA55, gcWindNightDark: 0x550055 }), '#550055',
+    'a tint chosen for itself is a pick too');
+  // The fill is reported on its own terms in every one of those cases.
+  assert.strictEqual(buildSettingsSnapshot({ theme: 'dark', secondaryLine: 'wind',
+    gcWindFillDark: 0x00AA55, gcWindNightDark: 0x00AA55 }).graphFillColor, '#00AA55');
+});
+
+// The field names are per element, but the colours are stored per METRIC: which one
+// graphMainColor reports is whichever metric is currently the secondary line. The metric
+// itself rides the same snapshot (secondaryLine / thirdLine), so a query can slice by it.
+test('the reported colour follows the metric each element is painted from', () => {
+  const blob = { theme: 'dark', gcWindLineDark: 0x0000AA, gcUvLineDark: 0xFF0000 };
+
+  assert.strictEqual(
+    buildSettingsSnapshot(Object.assign({ secondaryLine: 'wind' }, blob)).graphMainColor, '#0000AA');
+  assert.strictEqual(
+    buildSettingsSnapshot(Object.assign({ secondaryLine: 'uv' }, blob)).graphMainColor, '#FF0000');
+  assert.strictEqual(
+    buildSettingsSnapshot(Object.assign({ secondaryLine: 'wind', thirdLine: 'uv' }, blob)).graphSecondColor,
+    '#FF0000');
+});
+
+// No third line, no colour in effect — sleepStartHour's rule, and it keeps 'off' installs
+// out of the sample when the third line's colours are ranked.
+test('graphSecondColor reports nothing when the third line is off', () => {
+  const off = buildSettingsSnapshot({
+    theme: 'dark', secondaryLine: 'wind', thirdLine: 'off', gcUvLineDark: 0xFF0000 });
+  assert.strictEqual(off.graphSecondColor, undefined);
+  // Assigned undefined, never deleted — the key must survive for the set-equality lockstep.
+  assert.ok(Object.prototype.hasOwnProperty.call(off, 'graphSecondColor'),
+    'graphSecondColor must still be emitted as a key');
+  // The other five are unaffected by the third line.
+  assert.strictEqual(off.graphMainColor, 'default');
+});
+
+test('the reported graph colour is the pick for the polarity the watch renders', () => {
+  const picks = {
+    secondaryLine: 'wind',
+    gcWindLineDark: 0x0000AA, gcWindLineLight: 0xFF0000,
+    gcWindNightDark: 0x555555, gcWindNightLight: 0xAA5500
+  };
+  const dark = buildSettingsSnapshot(Object.assign({ theme: 'dark' }, picks), { platform: 'basalt' });
+  assert.strictEqual(dark.graphMainColor, '#0000AA');
+  assert.strictEqual(dark.nightFillColor, '#555555');
+
+  const light = buildSettingsSnapshot(Object.assign({ theme: 'light' }, picks), { platform: 'basalt' });
+  assert.strictEqual(light.graphMainColor, '#FF0000');
+  // The night tint is selectable in BOTH polarities — a Light pick moved off the built-in
+  // opts the watch into the night re-shade it otherwise skips — so it reports on light too.
+  assert.strictEqual(light.nightFillColor, '#AA5500');
+
+  // emery is the other colour platform, and it ships the light polarity, so a light
+  // install there reports its Light picks like basalt does.
+  const emery = buildSettingsSnapshot(Object.assign({ theme: 'light' }, picks), { platform: 'emery' });
+  assert.strictEqual(emery.graphMainColor, '#FF0000');
+});
+
+// CHANGED, deliberately, from "aplite reports its Dark picks on a light theme". That
+// pinned a divergence: this file had copied line-style's effectiveTheme fold but not its
+// colour-display check, so a B&W watch reported picks the wire was already resolving away
+// to GColorWhite — the dashboards would have counted a pick nobody could see. Both halves
+// now come from line-style.renderContext, so a B&W watch reports nothing, exactly like a
+// B&W theme below. The aplite polarity fold still matters and is still tested — on the
+// wire (test/line-style.test.js), where it changes a colour that is actually painted.
+test('a watch with no colour display reports no graph colours at all', () => {
+  const picks = {
+    theme: 'light', secondaryLine: 'wind', thirdLine: 'uv',
+    gcWindLineDark: 0x0000AA, gcWindLineLight: 0xFF0000,
+    gcWindNightDark: 0x555555, gcWindNightLight: 0xAA5500
+  };
+  ['aplite', 'diorite'].forEach((platform) => {
+    const snap = buildSettingsSnapshot(picks, { platform });
+    GRAPH_COLOR_FIELDS.forEach((field) => {
+      assert.strictEqual(snap[field], undefined,
+        platform + ' paints no colour, so ' + field + ' must report nothing');
+      assert.ok(Object.prototype.hasOwnProperty.call(snap, field),
+        field + ' must still be emitted as a key on ' + platform);
+    });
+  });
+});
+
+test('a Black & White theme reports no graph colours at all', () => {
+  ['bw', 'bw-light'].forEach((theme) => {
+    const snap = buildSettingsSnapshot({
+      theme: theme, secondaryLine: 'wind', thirdLine: 'uv',
+      gcWindLineDark: 0xFFAA00, gcWindFillDark: 0xFF0000,
+      gcUvLineDark: 0x00FF00, gcNightHatchDark: 0x0000AA,
+      gcNightBoundaryDark: 0xAAAAAA, gcWindNightDark: 0x555555
+    });
+    GRAPH_COLOR_FIELDS.forEach((field) => {
+      assert.strictEqual(snap[field], undefined,
+        theme + ' paints no colour, so ' + field + ' must report nothing');
+      // Assigned undefined, never deleted: the key must still EXIST for the
+      // set-equality lockstep above, which is what catches a one-sided edit.
+      assert.ok(Object.prototype.hasOwnProperty.call(snap, field),
+        field + ' must still be emitted as a key on ' + theme);
+    });
+  });
+});
+
+// The failure the split authority produced, pinned so it cannot come back: the value
+// telemetry reports for an element and the colour the wire resolves for it have to agree
+// about whether the pick survived at all.
+test('the reported pick agrees with the wire on every platform', () => {
+  const lineStyle = require('../src/pkjs/line-style.js');
+  const settings = { theme: 'dark', secondaryLine: 'wind', thirdLine: 'off',
+                     gcWindLineDark: 0xFF0000 };
+  ['basalt', 'emery', 'diorite', 'aplite'].forEach((platform) => {
+    const watchInfo = { platform };
+    const reported = buildSettingsSnapshot(settings, watchInfo).graphMainColor;
+    const painted = lineStyle.resolveLineStyle(settings, watchInfo).secondary === 0xFF0000;
+    assert.strictEqual(reported === '#FF0000', painted,
+      platform + ' must not report a pick the wire resolved away (or vice versa)');
+  });
+});
+
+// The other half of that agreement, which only became possible once "untouched" stopped
+// being a sentinel and became a comparison: telemetry saying 'default' has to mean the wire
+// is painting the built-in, on the gust row where the built-in is not even a constant.
+test('reporting default agrees with the wire painting the built-in', () => {
+  const lineStyle = require('../src/pkjs/line-style.js');
+  [{ rainBarColor: 'white', stored: 0xFFFFFF, builtIn: 0xAAAAAA },
+   { rainBarColor: 'multicolor', stored: 0xAAAAAA, builtIn: 0xFFFFFF }].forEach((c) => {
+    const settings = { theme: 'dark', secondaryLine: 'gust', thirdLine: 'off',
+                       rainBarColor: c.rainBarColor, gcGustLineDark: c.stored };
+    assert.strictEqual(buildSettingsSnapshot(settings, { platform: 'basalt' }).graphMainColor,
+      'default', 'a gust line on either built-in reads as untouched');
+    assert.strictEqual(lineStyle.resolveLineStyle(settings, { platform: 'basalt' }).secondary,
+      c.builtIn, 'and the wire paints the rainBarColor-correct built-in, not the stored byte');
+  });
+});
+
+// Targeted half of the lockstep for the six colour fields, per threshPhoneBatteryBoldMode
+// above — and the ONLY automated guard on their TYPE: the set-equality test catches a
+// missing key but not a wrong type, and `mise test-deno` never loads telemetry-ingest
+// (it runs rainbow-nowcast and news only). A z.number() here would make every 'default'
+// fail safeParse and 400 the whole event fleet-wide, taking the fetch outcome with it.
+// These six names and types are what the per-metric redesign deliberately did NOT move:
+// the storage changed, the reporting contract did not.
+test('the six graph colour fields are optional STRINGS in the Deno .strip() schema', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const ts = fs.readFileSync(
+    path.resolve(__dirname, '..', 'supabase', 'functions', 'telemetry-ingest', 'index.ts'), 'utf8');
+  const start = ts.indexOf('const settingsSchema');
+  assert.ok(start !== -1, 'settingsSchema not found in telemetry-ingest/index.ts');
+  const slice = ts.slice(start, ts.indexOf('.strip()', start));
+  GRAPH_COLOR_FIELDS.forEach((field) => {
+    assert.match(slice, new RegExp('^\\s*' + field + ':\\s*z\\.string\\(\\)\\.optional\\(\\)', 'm'),
+      field + ' must be z.string().optional() — a number-typed field would reject the event');
+  });
+});
+
+// The ingest refuses a body over MAX_BODY_BYTES with a 413, and a 413 is terminal:
+// send() logs the non-2xx and nothing retries it. So the heaviest realistic envelope has
+// to stay under the cap with room left to grow.
+// Ledger (MEASURED — read the byte count off this test's own console line, never
+// arithmetic): 2956 B of 4096, headroom 1140. The six colours are 169 B of that, and that
+// is their WORST case however they are set: '#RRGGBB' and 'default' are both seven
+// characters. This envelope was 2787 B before them.
+test('the heaviest realistic telemetry envelope stays under MAX_BODY_BYTES', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const ts = fs.readFileSync(
+    path.resolve(__dirname, '..', 'supabase', 'functions', 'telemetry-ingest', 'index.ts'), 'utf8');
+  const cap = Number(/const MAX_BODY_BYTES = (\d+)/.exec(ts)[1]);
+  assert.equal(cap, 4096, 'read the cap from the function, do not pin a stale copy here');
+
+  // Every reported setting on its longest realistic option, on a light-polarity colour
+  // theme so all six picks report (bw would report none of them).
+  const settings = {
+    temperatureUnits: 'fahrenheit', tempSlotDisplay: 'both', aqiScale: 'european',
+    dateSlotMonthFormat: 'name', dateSlotFullFormat: 'textyear',
+    aqiSource: 'openmeteo', windUnits: 'beaufort', distanceUnits: 'imperial',
+    windSlotDirection: true, gustSlotDirection: true,
+    threshPhoneBatteryBoldMode: 'always', configTheme: 'light', dayNightShading: true,
+    healthMode: 'status', provider: 'openweathermap', fetchIntervalMin: '120',
+    rainCountdownHorizon: '60', sleepNightEnabled: true, sleepStartHour: '23',
+    sleepEndHour: '7', axisTimeFormat: 'h12', timeFont: 'bitham', timeLeadingZero: true,
+    timeShowAmPm: true, weekStartDay: 'monday', firstWeek: 'iso', showQt: true,
+    batteryLowOnly: true, topViewMode: 'compact', layoutPreset: 'compactDense',
+    viewResetMin: '15', largeGraphFont: true, vibe: true, btIcons: 'both',
+    secondaryLine: 'precip_prob', secondaryLineFill: true, windScale: 'high',
+    pressureScale: 'high', thirdLine: 'pressure', barSource: 'precip_prob',
+    rainBarColor: 'white', radarProvider: 'rainbow', radarMode: 'countdown',
+    radarColor: 'multicolor', devStatsEnabled: true, theme: 'light',
+    statusForecastLeft: 'phone_battery', statusForecastMid: 'phone_battery',
+    statusForecastRight: 'phone_battery', statusRadarLeft: 'phone_battery',
+    statusRadarMid: 'phone_battery', statusRadarRight: 'phone_battery',
+    statusTopLeft: 'phone_battery', statusTopMid: 'phone_battery',
+    statusTopRight: 'phone_battery', statusHealthLeft: 'phone_battery',
+    statusHealthMid: 'phone_battery', statusHealthRight: 'phone_battery',
+    colorTime: 0xFFFFFF, colorToday: 0xFF0000, colorSunday: 0xFF0000,
+    colorSaturday: 0xFF0000, colorUSFederal: 0xFF0000,
+    // The light-polarity colours for the two metrics selected above (precip_prob as the
+    // secondary line, pressure as the third), each moved off its built-in so all six
+    // fields report the seven-character form.
+    gcPrecipLineLight: 0xFF00FF, gcPrecipFillLight: 0xAAFF55,
+    gcPressureLineLight: 0x00AAFF, gcPrecipNightLight: 0xAA5500,
+    gcNightHatchLight: 0xAAAAAA, gcNightBoundaryLight: 0xFF0000
+  };
+  const payload = {
+    eventType: 'weather_fetch',
+    timestampUtc: new Date().toISOString(),
+    accountToken: 'a'.repeat(64),
+    watchToken: 'b'.repeat(64),
+    provider: 'openweathermap',
+    success: false,
+    usedGpsCache: true,
+    gpsErrorCode: 2,
+    locationMode: 'manual_coordinates',
+    error: 'e'.repeat(512),  // serializeError's own cap
+    countryCode: 'DEU',
+    settings: buildSettingsSnapshot(settings, { platform: 'basalt' }),
+    appVersion: '10.10.10',
+    buildProfile: 'release',
+    watchInfo: {
+      platform: 'basalt', model: 'qemu_platform_basalt', language: 'en_US',
+      firmware: { major: 4, minor: 4, patch: 4, suffix: 'beta10' }
+    },
+    durationMs: 999999,
+    attempt: 99
+  };
+  const bytes = Buffer.byteLength(JSON.stringify(payload));
+  console.log('heaviest telemetry envelope: ' + bytes + ' B of ' + cap
+    + ' B (headroom ' + (cap - bytes) + ')');
+  assert.ok(bytes < cap, 'heaviest envelope ' + bytes + ' B must stay under ' + cap + ' B');
+});
+
+// --- batching ----------------------------------------------------------------
+// One event used to mean one POST (~59 edge invocations per watch per day);
+// events now queue in localStorage and drain as ONE batch when the queue is
+// full enough (FLUSH_AT_EVENTS) or its head old enough (FLUSH_AT_AGE_MS).
+// These tests drive the real client against fake localStorage/Pebble/XHR.
+const createTelemetryClient = require('../src/pkjs/telemetry.js');
+const { TELEMETRY_BATCH } = createTelemetryClient;
+const { TELEMETRY_QUEUE_KEY, TELEMETRY_SENDING_KEY } = require('../src/pkjs/storage-keys.js');
+
+function batchHarness() {
+  createTelemetryClient._resetBatchStateForTests();
+  const store = {};
+  global.localStorage = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem: (k, v) => { store[k] = String(v); },
+    removeItem: (k) => { delete store[k]; },
+  };
+  global.Pebble = {
+    getAccountToken: () => 'a'.repeat(32),
+    getWatchToken: () => 'w'.repeat(32),
+  };
+  const requests = [];
+  global.XMLHttpRequest = function FakeXhr() {
+    const xhr = this;
+    requests.push(xhr);
+    xhr.open = (method, url) => { xhr.method = method; xhr.url = url; };
+    xhr.setRequestHeader = () => {};
+    xhr.send = (body) => { xhr.body = JSON.parse(body); };
+    xhr.respond = (status) => { xhr.status = status; xhr.onload(); };
+    xhr.fail = () => xhr.onerror();
+  };
+  const client = createTelemetryClient({
+    endpoint: 'https://example.test/ingest', appVersion: '9.9.9', buildProfile: 'test',
+  });
+  const queue = () => JSON.parse(store[TELEMETRY_QUEUE_KEY] || '[]');
+  const track = (over) => client.trackWeatherFetch(Object.assign({
+    provider: 'dwd', success: true, settings: {}, watchInfo: { platform: 'basalt' },
+  }, over || {}));
+  return { store, requests, client, queue, track };
+}
+
+test('events queue as slim records and nothing sends below both flush triggers', () => {
+  const h = batchHarness();
+  for (let i = 0; i < TELEMETRY_BATCH.FLUSH_AT_EVENTS - 1; i++) { h.track(); }
+  assert.equal(h.requests.length, 0, 'no request before either trigger');
+  const q = h.queue();
+  assert.equal(q.length, TELEMETRY_BATCH.FLUSH_AT_EVENTS - 1);
+  const rec = q[0];
+  assert.equal(typeof rec.t, 'number', 'client timestamp on every record');
+  assert.equal(rec.provider, 'dwd');
+  assert.equal(rec.error, null, 'success carries a null error');
+  assert.ok(!('settings' in rec) && !('watchInfo' in rec) && !('accountToken' in rec),
+    'records are SLIM — the heavy header rides the envelope once');
+});
+
+test('the count trigger drains the queue as one batch envelope', () => {
+  const h = batchHarness();
+  for (let i = 0; i < TELEMETRY_BATCH.FLUSH_AT_EVENTS; i++) { h.track(); }
+  assert.equal(h.requests.length, 1, 'exactly one batch request at the threshold');
+  const body = h.requests[0].body;
+  assert.equal(body.eventType, 'weather_fetch_batch');
+  assert.equal(body.events.length, TELEMETRY_BATCH.FLUSH_AT_EVENTS);
+  assert.equal(body.accountToken, 'a'.repeat(32));
+  assert.ok(body.settings && typeof body.settings === 'object', 'settings header once');
+  assert.equal(body.watchInfo.platform, 'basalt');
+  h.requests[0].respond(202);
+  assert.equal(h.queue().length, 0, 'the ACK clears the sent head');
+});
+
+test('an ACK removes exactly the sent head — events queued mid-flight survive', () => {
+  const h = batchHarness();
+  for (let i = 0; i < TELEMETRY_BATCH.FLUSH_AT_EVENTS; i++) { h.track(); }
+  // A fetch completes while the batch is in flight (no second request opens —
+  // one batch in flight at a time, or the same head would post twice).
+  h.track({ provider: 'openmeteo' });
+  assert.equal(h.requests.length, 1, 'no concurrent second batch');
+  h.requests[0].respond(202);
+  const q = h.queue();
+  assert.equal(q.length, 1, 'the mid-flight event survives the splice');
+  assert.equal(q[0].provider, 'openmeteo');
+});
+
+test('a failed send keeps the queue but backs off — no per-fetch retry storm', () => {
+  const h = batchHarness();
+  for (let i = 0; i < TELEMETRY_BATCH.FLUSH_AT_EVENTS; i++) { h.track(); }
+  h.requests[0].respond(500);
+  assert.equal(h.queue().length, TELEMETRY_BATCH.FLUSH_AT_EVENTS, '5xx keeps the head');
+  h.track();
+  h.track();
+  assert.equal(h.requests.length, 1,
+    'tracks inside the backoff window must NOT retry — that would restore the '
+    + 'one-POST-per-fetch rate against a struggling endpoint');
+  createTelemetryClient._resetBatchStateForTests();   // the backoff window elapses
+  h.track();
+  assert.equal(h.requests.length, 2, 'after the backoff the next track retries');
+  h.requests[1].fail();
+  assert.equal(h.queue().length, TELEMETRY_BATCH.FLUSH_AT_EVENTS + 3, 'network error keeps it too');
+  createTelemetryClient._resetBatchStateForTests();
+  h.track();
+  h.requests[2].respond(400);
+  assert.equal(h.queue().length, 0, 'a 400 would fail identically forever — dropped');
+});
+
+test('the age trigger flushes a short queue once its head is old enough', () => {
+  const h = batchHarness();
+  const old = { t: Date.now() - TELEMETRY_BATCH.FLUSH_AT_AGE_MS - 1000, provider: 'dwd',
+    success: true, error: null, countryCode: null, usedGpsCache: false,
+    gpsErrorCode: null, locationMode: null, durationMs: null, attempt: null };
+  h.store[TELEMETRY_QUEUE_KEY] = JSON.stringify([old]);
+  h.track();
+  assert.equal(h.requests.length, 1, 'an old head flushes without the count trigger');
+  assert.equal(h.requests[0].body.events.length, 2);
+});
+
+test('stale events beyond the 72h clamp window are dropped, never sent', () => {
+  const h = batchHarness();
+  const stale = { t: Date.now() - TELEMETRY_BATCH.MAX_EVENT_AGE_MS - 1000, provider: 'dwd',
+    success: true, error: null, countryCode: null, usedGpsCache: false,
+    gpsErrorCode: null, locationMode: null, durationMs: null, attempt: null };
+  h.store[TELEMETRY_QUEUE_KEY] = JSON.stringify([stale]);
+  h.track();
+  assert.equal(h.requests.length, 0, 'one fresh event alone meets no trigger');
+  assert.equal(h.queue().length, 1, 'the stale record is gone, the fresh one queued');
+});
+
+test('the queue is bounded — oldest events drop past MAX_QUEUE_EVENTS', () => {
+  const h = batchHarness();
+  for (let i = 0; i < TELEMETRY_BATCH.MAX_QUEUE_EVENTS + 30; i++) {
+    h.track();
+    // Answer every flush with a retryable failure so the queue keeps growing.
+    if (h.requests.length && !h.requests[h.requests.length - 1].status) {
+      h.requests[h.requests.length - 1].respond(500);
+    }
+  }
+  assert.ok(h.queue().length <= TELEMETRY_BATCH.MAX_QUEUE_EVENTS,
+    'queue stays bounded at ' + TELEMETRY_BATCH.MAX_QUEUE_EVENTS);
+});
+
+test('a flush never posts more than the ingest batch cap', () => {
+  const h = batchHarness();
+  const now = Date.now();
+  const many = [];
+  for (let i = 0; i < TELEMETRY_BATCH.MAX_BATCH_EVENTS + 40; i++) {
+    many.push({ t: now - i, provider: 'dwd', success: true, error: null,
+      countryCode: null, usedGpsCache: false, gpsErrorCode: null,
+      locationMode: null, durationMs: null, attempt: null });
+  }
+  h.store[TELEMETRY_QUEUE_KEY] = JSON.stringify(many);
+  h.track();
+  assert.equal(h.requests[0].body.events.length, TELEMETRY_BATCH.MAX_BATCH_EVENTS,
+    'the batch is capped; the remainder drains on later flushes');
+});
+
+test('client batch cap and ingest z.array max are in lockstep', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const ts = fs.readFileSync(
+    path.resolve(__dirname, '..', 'supabase', 'functions', 'telemetry-ingest', 'index.ts'), 'utf8');
+  assert.match(ts, /eventType: z\.literal\("weather_fetch_batch"\)/,
+    'ingest accepts the batch shape');
+  const cap = Number(/const MAX_BATCH_EVENTS = (\d+)/.exec(ts)[1]);
+  assert.equal(cap, TELEMETRY_BATCH.MAX_BATCH_EVENTS,
+    'a batch the client sends must never exceed what the ingest accepts');
+  const age = Number(/const MAX_BATCH_EVENT_AGE_MS = (\d+) \* 60 \* 60 \* 1000/.exec(ts)[1]);
+  assert.equal(age * 60 * 60 * 1000, TELEMETRY_BATCH.MAX_EVENT_AGE_MS,
+    'the client drop window matches the ingest clamp window');
+});
+
+test('the heaviest batch envelope stays under the ingest batch body cap', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const ts = fs.readFileSync(
+    path.resolve(__dirname, '..', 'supabase', 'functions', 'telemetry-ingest', 'index.ts'), 'utf8');
+  const cap = Number(/const MAX_BATCH_BODY_BYTES = (\d+)/.exec(ts)[1]);
+  const events = [];
+  for (let i = 0; i < TELEMETRY_BATCH.MAX_BATCH_EVENTS; i++) {
+    events.push({ t: Date.now(), provider: 'openweathermap', success: false,
+      error: 'e'.repeat(512), countryCode: 'DEU', usedGpsCache: true,
+      gpsErrorCode: 2, locationMode: 'manual_coordinates', durationMs: 999999,
+      attempt: 99 });
+  }
+  const envelope = {
+    eventType: 'weather_fetch_batch',
+    accountToken: 'a'.repeat(64), watchToken: 'b'.repeat(64),
+    appVersion: '10.10.10', buildProfile: 'release',
+    watchInfo: { platform: 'basalt', model: 'qemu_platform_basalt', language: 'en_US',
+      firmware: { major: 4, minor: 4, patch: 4, suffix: 'beta10' } },
+    // The same worst-case settings snapshot the single-envelope test builds
+    // would add ~2.5 KB; an empty object underestimates — use a generous pad.
+    settings: { pad: 'x'.repeat(4096) },
+    events,
+  };
+  const bytes = Buffer.byteLength(JSON.stringify(envelope));
+  console.log('heaviest batch envelope: ' + bytes + ' B of ' + cap
+    + ' B (headroom ' + (cap - bytes) + ')');
+  assert.ok(bytes < cap, 'heaviest batch ' + bytes + ' B must stay under ' + cap + ' B');
+});
+
+test('records carry a unique id — what the ACK removes by', () => {
+  const h = batchHarness();
+  h.track(); h.track();
+  const q = h.queue();
+  assert.equal(typeof q[0].id, 'string');
+  assert.notEqual(q[0].id, q[1].id, 'same-millisecond fetches must not collide');
+});
+
+test('ACK at the 200-cap removes ONLY the sent records (identity, not position)', () => {
+  // The review-confirmed race: a full queue, a batch in flight, and a track
+  // whose cap-splice drops a HEAD record that IS in the flight. A count-based
+  // splice then destroyed one unsent record per mid-flight track.
+  const h = batchHarness();
+  const now = Date.now();
+  const full = [];
+  for (let i = 0; i < TELEMETRY_BATCH.MAX_QUEUE_EVENTS; i++) {
+    full.push({ id: 'p' + i, t: now - (TELEMETRY_BATCH.MAX_QUEUE_EVENTS - i), provider: 'dwd',
+      success: true, error: null, countryCode: null, usedGpsCache: false,
+      gpsErrorCode: null, locationMode: null, durationMs: null, attempt: null });
+  }
+  h.store[TELEMETRY_QUEUE_KEY] = JSON.stringify(full);
+  h.track();                       // opens the flight; cap drops p0 first
+  assert.equal(h.requests.length, 1);
+  const sentIds = h.requests[0].body.events.map((e) => e.id);
+  h.track();                       // mid-flight: cap drops another head record
+  h.requests[0].respond(202);
+  const left = h.queue().map((r) => r.id);
+  sentIds.forEach((id) => assert.ok(left.indexOf(id) === -1, id + ' was sent and must be gone'));
+  left.forEach((id) => assert.ok(sentIds.indexOf(id) === -1,
+    id + ' was never sent and must survive the ACK'));
+});
+
+test('a mark left by a session that died mid-send drops those records instead of resending', () => {
+  const h = batchHarness();
+  const now = Date.now();
+  const rec = (id) => ({ id, t: now - 1000, provider: 'dwd', success: true, error: null,
+    countryCode: null, usedGpsCache: false, gpsErrorCode: null, locationMode: null,
+    durationMs: null, attempt: null });
+  h.store[TELEMETRY_QUEUE_KEY] = JSON.stringify([rec('dead1'), rec('dead2'), rec('kept')]);
+  h.store[TELEMETRY_SENDING_KEY] = JSON.stringify({ ids: ['dead1', 'dead2'] });
+  h.track();
+  assert.equal(h.requests.length, 0, 'two survivors meet no flush trigger');
+  const ids = h.queue().map((r) => r.id);
+  assert.ok(ids.indexOf('dead1') === -1 && ids.indexOf('dead2') === -1,
+    'unknown-outcome records are dropped — a resend would duplicate rows server-side');
+  assert.ok(ids.indexOf('kept') !== -1, 'unmarked records survive');
+  assert.equal(h.store[TELEMETRY_SENDING_KEY], undefined, 'the mark is cleared');
+});
+
+test('a flush writes the mark before the POST and clears it on the outcome', () => {
+  const h = batchHarness();
+  for (let i = 0; i < TELEMETRY_BATCH.FLUSH_AT_EVENTS; i++) { h.track(); }
+  const mark = JSON.parse(h.store[TELEMETRY_SENDING_KEY]);
+  assert.equal(mark.ids.length, TELEMETRY_BATCH.FLUSH_AT_EVENTS, 'mark covers the flight');
+  h.requests[0].respond(202);
+  assert.equal(h.store[TELEMETRY_SENDING_KEY], undefined, 'cleared on ACK');
+});
+
+test('creating a disabled client purges any parked queue', () => {
+  const h = batchHarness();
+  h.track(); h.track();
+  assert.equal(h.queue().length, 2);
+  createTelemetryClient({ enabled: false, endpoint: 'https://example.test/ingest' });
+  assert.equal(h.store[TELEMETRY_QUEUE_KEY], undefined,
+    'the user turned telemetry off — pending events are purged, not parked');
+});
+
+test('a synchronous XHR throw releases the latch and backs off instead of wedging the session', () => {
+  const h = batchHarness();
+  const RealXhr = global.XMLHttpRequest;
+  global.XMLHttpRequest = function ThrowingXhr() {
+    this.open = () => {}; this.setRequestHeader = () => {};
+    this.send = () => { throw new Error('boom'); };
+  };
+  for (let i = 0; i < TELEMETRY_BATCH.FLUSH_AT_EVENTS; i++) { h.track(); }
+  assert.equal(h.queue().length, TELEMETRY_BATCH.FLUSH_AT_EVENTS, 'nothing lost on the throw');
+  assert.equal(h.store[TELEMETRY_SENDING_KEY], undefined, 'mark cleared on the throw');
+  global.XMLHttpRequest = RealXhr;
+  createTelemetryClient._resetBatchStateForTests();   // backoff elapses
+  h.track();
+  assert.equal(h.requests.length, 1, 'the latch is free — the next window flushes normally');
+  h.requests[0].respond(202);
 });

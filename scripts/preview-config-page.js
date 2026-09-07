@@ -15,26 +15,52 @@ var platformLib = require(path.join(ROOT, 'src/pkjs/config-ui/lib/platform.js'))
 var schema = require(path.join(ROOT, 'src/pkjs/settings/schema.js'));
 var previewPalette = require(path.join(ROOT, 'src/pkjs/settings/preview-palette.js'));
 var APP_FILES = [
-  // view-cycle.js and status-line-catalog.js must precede blocks.js: blocks.js's VC /
-  // statusLineCatalog fallbacks (used when this page is a flat concatenated <script>,
-  // not a Node module) read their declarations directly from this shared top-level
-  // scope. Keep in lockstep with build-config-page.js's APP_FILES — both build the
+  // view-cycle.js must precede preview-layout.js and status-line-catalog.js must
+  // precede blocks.js: their VC / statusLineCatalog fallbacks (used when this page is a
+  // flat concatenated <script>, not a Node module) read their declarations directly from
+  // this shared top-level scope. Keep in lockstep with build-config-page.js's APP_FILES — both build the
   // same page, from two separate entrypoints.
   // country-defaults.js (COUNTRY_DEFAULTS global) must precede blocks.js + wizard.js.
   path.join(ROOT, 'src/pkjs/settings/country-defaults.js'),
   path.join(ROOT, 'src/pkjs/view-cycle.js'),
   path.join(ROOT, 'src/pkjs/status-line-catalog.js'),
   path.join(ROOT, 'src/pkjs/settings/tomorrowio-budget.js'),
+  // The graph-colour resolver the forecast preview draws from, plus its two deps.
+  // ORDER IS LOAD-BEARING: each reads the previous one's window global while its own
+  // top-level body runs. See build-config-page.js's copy for the full note.
+  path.join(ROOT, 'src/pkjs/pebble-colors.js'),
+  path.join(ROOT, 'src/pkjs/resolve-ink.js'),
+  path.join(ROOT, 'src/pkjs/line-style.js'),
+  // The five preview blocks, split by concern; preview-svg.js / preview-rain.js are the
+  // two libraries they read (window.PreviewSvg / window.PreviewRain) while their own
+  // top-level bodies run, so those come first. See build-config-page.js's copy.
+  path.join(ROOT, 'src/pkjs/settings/preview-svg.js'),
+  path.join(ROOT, 'src/pkjs/settings/preview-rain.js'),
+  path.join(ROOT, 'src/pkjs/settings/preview-forecast.js'),
+  path.join(ROOT, 'src/pkjs/settings/preview-radar.js'),
+  path.join(ROOT, 'src/pkjs/settings/preview-diagnostics.js'),
+  path.join(ROOT, 'src/pkjs/settings/preview-layout.js'),
   path.join(ROOT, 'src/pkjs/settings/blocks.js'),
   // wizard-screenshots.generated.js assigns PConf.screenshots; must precede wizard.js, which reads it.
   path.join(ROOT, 'src/pkjs/settings/wizard-screenshots.generated.js'),
+  // defaults-policy.js assigns window.DefaultsPolicy and must precede wizard.js, which
+  // resolves the rule table on the wizard's finish button.
+  path.join(ROOT, 'src/pkjs/settings/defaults-policy.js'),
   path.join(ROOT, 'src/pkjs/settings/wizard.js'),
   path.join(ROOT, 'src/pkjs/settings/onbuild.js'),
+  path.join(ROOT, 'src/pkjs/settings/key-test.js'),
   path.join(ROOT, 'src/pkjs/settings/owm-key-test.js'),
   path.join(ROOT, 'src/pkjs/settings/tomorrowio-key-test.js'),
+  path.join(ROOT, 'src/pkjs/settings/news-protocol.js'),
   path.join(ROOT, 'src/pkjs/settings/news.js'),
+  // support.js must FOLLOW news.js — see the note in build-config-page.js.
+  path.join(ROOT, 'src/pkjs/settings/support.js'),
   path.join(ROOT, 'src/pkjs/settings/theme-convert.js'),
   path.join(ROOT, 'src/pkjs/settings/reset-status-defaults.js'),
+  // status-thresholds.js: the flat page has no require(), so blocks.js/onbuild.js
+  // read window.StatusThresholds from it — lazily (at render/boot time), so its
+  // position here only has to be somewhere in the bundle.
+  path.join(ROOT, 'src/pkjs/status-thresholds.js'),
   path.join(ROOT, 'src/pkjs/settings/notices-panel.js')
 ];
 var DEFAULT_OUT = path.join(ROOT, 'build/config-ui-preview.html');
@@ -61,8 +87,17 @@ function parseArgs(args) {
 
 // Delegate to the platform SoT (platform.js) so color/round/health env-gates
 // render exactly as they would on-watch — no duplicated platform table here.
+//
+// computeEnv() answers only what the PLATFORM determines. Phone-runtime
+// capabilities are overlaid by index.js at generateUrl() time (env:
+// {phoneBattery: ...}), which this script bypasses — so without this overlay the
+// preview silently omits every phone-gated item and cannot be used to review them.
+// Default on, because the preview exists to eyeball items that exist; set
+// PREVIEW_PHONE_BATTERY=0 to see what an iPhone user's slot dropdown looks like.
 function envFor(platform) {
-  return platformLib.computeEnv({ platform: platform });
+  var env = platformLib.computeEnv({ platform: platform });
+  env.phoneBattery = process.env.PREVIEW_PHONE_BATTERY !== '0';
+  return env;
 }
 
 function run(opts) {

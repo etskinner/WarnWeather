@@ -1,9 +1,8 @@
 var WeatherProvider = require('./provider.js');
-var request = WeatherProvider.request;
 var failure = WeatherProvider.failure;
 
-var FORECAST_HOURS = 24;
-var HOUR_SECONDS = 60 * 60;
+var hourlyWindow = require('./hourly-window.js');
+var FORECAST_HOURS = hourlyWindow.FORECAST_HOURS;
 var YANDEX_ENDPOINT = 'https://api.weather.yandex.ru/graphql/query';
 
 /**
@@ -21,9 +20,23 @@ function buildQuery(lat, lon) {
     var latNum = Number(lat);
     var lonNum = Number(lon);
     return '{ weatherByPoint(request: {lat: ' + latNum + ', lon: ' + lonNum + '}) {'
-        + ' now { temperature(unit: FAHRENHEIT) }'
+        + ' now { temperature(unit: FAHRENHEIT) feelsLike(unit: FAHRENHEIT) }'
+        // No pressure field on purpose: Yandex exposes station-level pressure only,
+        // and a station reading at altitude is ~830 hPa where every other provider
+        // reports ~1013 MSL. Leaving pressureTrend empty degrades to a line-off and
+        // a '--' slot, rather than showing a number that means something different
+        // from the same slot on any other provider.
+        // No dew-point or wind-direction field either, and for a different reason:
+        // this is GraphQL, so a field name that does not exist fails the ENTIRE
+        // query rather than returning null for that one field — and production
+        // telemetry shows Yandex has logged a single event in its lifetime, so the
+        // change cannot be verified against live traffic. Guessing wrong costs
+        // Yandex users their weather altogether to gain a reading for effectively
+        // nobody. Both degrade exactly as pressure does: dewTrend/windDirTrend stay
+        // empty, the dew slot shows '--' and the wind slots draw no arrow. Revisit
+        // if Yandex traffic ever appears.
         + ' forecast { days(limit: 3) { hours {'
-        + ' timestamp temperature(unit: FAHRENHEIT) precProbability prec'
+        + ' timestamp temperature(unit: FAHRENHEIT) feelsLike(unit: FAHRENHEIT) precProbability prec'
         + ' windSpeed(unit: KILOMETERS_PER_HOUR) windGust(unit: KILOMETERS_PER_HOUR) uvIndex'
         + ' } } } } }';
 }
@@ -54,21 +67,11 @@ function flattenHours(weatherByPoint) {
     return hours;
 }
 
-/**
- * Index of the first hourly bucket at or after the current wall-clock hour.
- * @param {Object[]} hours Flattened hours (each with a unix-seconds string timestamp).
- * @param {number} nowEpoch Current time in epoch seconds.
- * @returns {number} Index of the first bucket >= the floored current hour, or -1.
- */
+// hourly-window owns the anchor rule; Yandex hours carry unix-second strings.
 function anchorIndex(hours, nowEpoch) {
-    var hourFloor = Math.floor(nowEpoch / HOUR_SECONDS) * HOUR_SECONDS;
-    var i;
-    for (i = 0; i < hours.length; i += 1) {
-        if (parseInt(hours[i].timestamp, 10) >= hourFloor) {
-            return i;
-        }
-    }
-    return -1;
+    return hourlyWindow.anchorIndex(hours, nowEpoch, function(hour) {
+        return parseInt(hour.timestamp, 10);
+    });
 }
 
 /**
@@ -103,6 +106,7 @@ function mapResponse(json, nowEpoch) {
     var windTrend = [];
     var gustTrend = [];
     var uvTrend = [];
+    var feelsTrend = [];
     var i;
     var hr;
     for (i = 0; i < FORECAST_HOURS; i += 1) {
@@ -113,6 +117,9 @@ function mapResponse(json, nowEpoch) {
         windTrend.push(typeof hr.windSpeed === 'number' ? hr.windSpeed : 0);
         gustTrend.push(typeof hr.windGust === 'number' ? hr.windGust : 0);
         uvTrend.push(typeof hr.uvIndex === 'number' ? hr.uvIndex : 0);
+        // Server-side °F like temperature; a missing hour falls back to the
+        // mapped temp so the series stays numeric.
+        feelsTrend.push(typeof hr.feelsLike === 'number' ? hr.feelsLike : tempTrend[i]);
     }
 
     return {
@@ -122,8 +129,11 @@ function mapResponse(json, nowEpoch) {
         windTrend: windTrend,
         gustTrend: gustTrend,
         uvTrend: uvTrend,
+        feelsTrend: feelsTrend,
         startTime: parseInt(hours[anchor].timestamp, 10),
-        currentTemp: now.temperature
+        currentTemp: now.temperature,
+        // Missing → null so FEELS_CURRENT is omitted rather than echoing the temp.
+        currentFeels: typeof now.feelsLike === 'number' ? now.feelsLike : null
     };
 }
 
@@ -155,41 +165,22 @@ YandexProvider.prototype.withProviderData = function(lat, lon, force, onSuccess,
         onFailure(failure('provider_data', 'yandex_missing_api_key'));
         return;
     }
-    var body = JSON.stringify({ query: buildQuery(lat, lon) });
-    var headers = {
-        'Content-Type': 'application/json',
-        'X-Yandex-Weather-Key': this.apiKey
-    };
-    request(YANDEX_ENDPOINT, 'POST', (function(response) {
-        var json;
-        var mapped;
-        try {
-            json = JSON.parse(response);
-        }
-        catch (ex) {
-            onFailure(failure('provider_data', 'yandex_parse_error'));
-            return;
-        }
-        mapped = mapResponse(json, Math.floor(Date.now() / 1000));
-        if (mapped === null) {
-            onFailure(failure('provider_data', 'yandex_missing_fields'));
-            return;
-        }
-        this.tempTrend = mapped.tempTrend;
-        this.precipTrend = mapped.precipTrend;
-        this.rainTrend = mapped.rainTrend;
-        this.windTrend = mapped.windTrend;
-        this.gustTrend = mapped.gustTrend;
-        if (this.fetchUv) {
-            this.uvTrend = mapped.uvTrend;
-        }
-        this.startTime = mapped.startTime;
-        this.currentTemp = mapped.currentTemp;
+    // requestMapped owns the parse/missing-fields/error-code grammar; adoptMapped
+    // owns the field adoption and the feels/uv gates. The GraphQL response has no
+    // pressure, dew or bearing series — mapped simply lacks those keys, and
+    // adoptMapped assigns only what is present.
+    WeatherProvider.requestMapped({
+        url: YANDEX_ENDPOINT, method: 'POST', id: 'yandex', label: 'Yandex',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Yandex-Weather-Key': this.apiKey
+        },
+        body: JSON.stringify({ query: buildQuery(lat, lon) }),
+        map: function(json) { return mapResponse(json, Math.floor(Date.now() / 1000)); }
+    }, (function(mapped) {
+        this.adoptMapped(mapped);
         onSuccess();
-    }).bind(this), function(error) {
-        console.log('[!] Yandex request failed: ' + JSON.stringify(error));
-        onFailure(failure('provider_data', 'yandex_' + error.code));
-    }, headers, body);
+    }).bind(this), onFailure);
 };
 
 module.exports = {

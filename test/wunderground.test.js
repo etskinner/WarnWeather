@@ -124,3 +124,129 @@ test('WU reuses the cached current-hour forecast across the hour boundary', () =
   assert.equal(p.tempTrend[0], 50, 'cached real current-hour temp, not the next-hour clone (61)');
   assert.equal(p.precipTrend[0], 0, 'cached real current-hour pop, not the next-hour clone (0.8)');
 });
+
+test('wunderground maps mslp (mean sea level pressure, mb == hPa) into pressureTrend', () => {
+  responder = respondWith([
+    { temp: 50, pop: 0, qpf: 0, wspd: 0, gust: 0, uv_index: 0, mslp: 1019, fcst_valid: NOW_HOUR },
+    // no mslp on this station feed -> 0, which forecast-series rejects (line off)
+    { temp: 52, pop: 0, qpf: 0, wspd: 0, gust: 0, uv_index: 0, fcst_valid: NOW_HOUR + HOUR }
+  ], 71);
+  const p = new WundergroundProvider();
+  withMockedNow(NOW_HOUR + 800, function() {
+    p.withProviderData(0, 0, false, function() {},
+      function(f) { throw new Error('unexpected failure ' + JSON.stringify(f)); });
+  });
+  assert.deepEqual(p.pressureTrend, [1019, 0]);
+});
+
+test('WU maps v1 hourly feels_like and v3 current temperatureFeelsLike (both °F, units=e)', () => {
+  responder = function(url, onSuccess) {
+    if (url.indexOf('/wx/observations/current') !== -1) {
+      onSuccess(JSON.stringify({ temperature: 71, temperatureFeelsLike: 66.4 }));
+      return;
+    }
+    onSuccess(JSON.stringify({ forecasts: [
+      { temp: 50, feels_like: 44, pop: 0, qpf: 0, wspd: 0, gust: 0, uv_index: 0, fcst_valid: NOW_HOUR },
+      // no feels_like (e.g. the cache-cloned current-hour bucket) -> temp fallback
+      { temp: 60, pop: 0, qpf: 0, wspd: 0, gust: 0, uv_index: 0, fcst_valid: NOW_HOUR + HOUR }
+    ] }));
+  };
+  const p = new WundergroundProvider();
+  withMockedNow(NOW_HOUR + 800, function() {
+    p.withProviderData(0, 0, false, function() {},
+      function(f) { throw new Error('unexpected failure ' + JSON.stringify(f)); });
+  });
+  assert.deepEqual(p.feelsTrend, [44, 60]);
+  assert.equal(p.currentFeels, 66.4);
+});
+
+test('WU maps hourly dewpt into dewTrend (°F) and wdir into windDirTrend (degrees)', () => {
+  responder = respondWith([
+    { temp: 50, dewpt: 44, wdir: 270, pop: 0, qpf: 0, wspd: 10, gust: 20, uv_index: 0, fcst_valid: NOW_HOUR },
+    { temp: 60, dewpt: 48, wdir: 15, pop: 0, qpf: 0, wspd: 0, gust: null, uv_index: 0, fcst_valid: NOW_HOUR + HOUR }
+  ], 71);
+  const p = new WundergroundProvider();
+  withMockedNow(NOW_HOUR + 800, function() {
+    p.withProviderData(0, 0, false, function() {},
+      function(f) { throw new Error('unexpected failure ' + JSON.stringify(f)); });
+  });
+
+  // One entry per hourly slot. (Not p.numEntries: that is the 24-hour wire
+  // window getPayload slices to; these fixtures are deliberately shorter, and
+  // every other trend here is the same length as the forecast.)
+  assert.equal(p.dewTrend.length, p.tempTrend.length, 'one dew entry per hourly slot');
+  assert.equal(p.windDirTrend.length, p.tempTrend.length, 'one bearing per hourly slot');
+  assert.deepEqual(p.dewTrend, [44, 48], 'dewpt passthrough (units=e default → °F)');
+  assert.ok(p.dewTrend.every((v) => typeof v === 'number' && v >= -80 && v <= 140),
+    'plausible °F numbers');
+  assert.deepEqual(p.windDirTrend, [270, 15], 'wdir passthrough, "comes from" degrees');
+  assert.ok(p.windDirTrend.every((v) => typeof v === 'number' && v >= 0 && v < 360),
+    'bearings in [0, 360)');
+});
+
+test('WU degrades a missing dewpt/wdir to null, keeping the hourly slots aligned', () => {
+  responder = respondWith([
+    { temp: 50, dewpt: 44, wdir: 270, pop: 0, qpf: 0, wspd: 0, gust: 0, uv_index: 0, fcst_valid: NOW_HOUR },
+    // a station feed without either field: null, never 0 (0 °F and 0° north are
+    // both real values) and never the temp fallback feels_like uses
+    { temp: 60, pop: 0, qpf: 0, wspd: 0, gust: 0, uv_index: 0, fcst_valid: NOW_HOUR + HOUR }
+  ], 71);
+  const p = new WundergroundProvider();
+  withMockedNow(NOW_HOUR + 800, function() {
+    p.withProviderData(0, 0, false, function() {},
+      function(f) { throw new Error('unexpected failure ' + JSON.stringify(f)); });
+  });
+  assert.deepEqual(p.dewTrend, [44, null]);
+  assert.deepEqual(p.windDirTrend, [270, null]);
+});
+
+test('WU wraps a 360 bearing to 0 so every value stays in [0, 360)', () => {
+  responder = respondWith([
+    { temp: 50, dewpt: 44, wdir: 360, pop: 0, qpf: 0, wspd: 0, gust: 0, uv_index: 0, fcst_valid: NOW_HOUR }
+  ], 71);
+  const p = new WundergroundProvider();
+  withMockedNow(NOW_HOUR + 800, function() {
+    p.withProviderData(0, 0, false, function() {},
+      function(f) { throw new Error('unexpected failure ' + JSON.stringify(f)); });
+  });
+  assert.deepEqual(p.windDirTrend, [0]);
+});
+
+test('the anchored current-hour bucket keeps dew point and wind bearing', () => {
+  // Regression guard for pickBucket's whitelist: the reconstructed current hour
+  // silently loses any field the whitelist omits.
+  responder = respondWith([
+    { temp: 50, dewpt: 44, wdir: 270, pop: 0, qpf: 0, wspd: 0, gust: null, uv_index: 0, fcst_valid: NOW_HOUR },
+    { temp: 60, dewpt: 55, wdir: 90, pop: 80, qpf: 0.2, wspd: 10, gust: 20, uv_index: 3, fcst_valid: NOW_HOUR + HOUR }
+  ], 49);
+  withMockedNow(NOW_HOUR - HOUR + 800, function() {   // capture NOW_HOUR into the cache
+    new WundergroundProvider().withProviderData(0, 0, false, function() {},
+      function(f) { throw new Error(JSON.stringify(f)); });
+  });
+
+  // WU has now rounded up past the in-progress hour; the cached bucket fills it.
+  responder = respondWith([
+    { temp: 61, dewpt: 55, wdir: 90, pop: 80, qpf: 0.2, wspd: 10, gust: 20, uv_index: 3, fcst_valid: NOW_HOUR + HOUR },
+    { temp: 62, dewpt: 56, wdir: 100, pop: 90, qpf: 0.3, wspd: 12, gust: 24, uv_index: 4, fcst_valid: NOW_HOUR + 2 * HOUR }
+  ], 55);
+  const p = new WundergroundProvider();
+  withMockedNow(NOW_HOUR + 800, function() {
+    p.withProviderData(0, 0, false, function() {},
+      function(f) { throw new Error(JSON.stringify(f)); });
+  });
+
+  assert.equal(p.dewTrend[0], 44, 'cached real current-hour dewpt, not the next-hour clone (55)');
+  assert.equal(p.windDirTrend[0], 270, 'cached real current-hour wdir, not the next-hour clone (90)');
+});
+
+test('WU leaves currentFeels null when the observation has no temperatureFeelsLike', () => {
+  responder = respondWith([
+    { temp: 50, pop: 0, qpf: 0, wspd: 0, gust: 0, uv_index: 0, fcst_valid: NOW_HOUR }
+  ], 71); // respondWith's current observation carries only `temperature`
+  const p = new WundergroundProvider();
+  withMockedNow(NOW_HOUR + 800, function() {
+    p.withProviderData(0, 0, false, function() {},
+      function(f) { throw new Error('unexpected failure ' + JSON.stringify(f)); });
+  });
+  assert.equal(p.currentFeels, null, 'null → FEELS_CURRENT omitted, temp slot degrades');
+});

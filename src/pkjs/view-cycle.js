@@ -1,7 +1,7 @@
 // src/pkjs/view-cycle.js
 // Single source of truth for the layout-preset matrix and the packed per-slot
 // ViewSpec wire byte. ES5 only (required from clay-payload.js at watch runtime).
-// Also required by settings/blocks.js (config-UI preview) and the node tests.
+// Also read by settings/preview-layout.js (config-UI preview) and the node tests.
 
 var TIER_OFF = 0, TIER_NONE = 1, TIER_COMPACT = 2, TIER_FULL = 3;
 var TOP_EMPTY = 0, TOP_CAL = 1, TOP_RADAR = 2;
@@ -60,6 +60,15 @@ var CAL2_HF_D    = spec(TIER_COMPACT, TOP_CAL,   BODY_FC,    STATUS_SRC_HEALTH, 
 var CAL2_RF_D    = spec(TIER_COMPACT, TOP_CAL,   BODY_FC,    STATUS_SRC_RADAR,    STATUS_SRC_FORECAST);
 var CAL2_RDR_W   = spec(TIER_COMPACT, TOP_CAL,   BODY_RADAR, STATUS_SRC_RADAR,    STATUS_SRC_NONE);
 var CAL2_GRAPH_D = spec(TIER_COMPACT, TOP_CAL,   BODY_GRAPH, STATUS_SRC_HEALTH,   STATUS_SRC_FORECAST);
+// compactDense radar flicks: the dense preset stays DENSE on the radar view too
+// (radarMode='status' demotes the chart to the forecast graph via demoteRadarBody,
+// keeping both rows). With a health bar: health upper + radar lower over the chart.
+// Without one (health off/slot): the default's radar-upper + forecast-lower pair
+// carries over onto the chart. CAL2_HR_D also serves as fullCal's radar flick when
+// health=status — once that cycle's health flick drops to the 2-row calendar, the
+// radar flick keeps the same tier instead of bouncing back to 3 rows.
+var CAL2_HR_D    = spec(TIER_COMPACT, TOP_CAL,   BODY_RADAR, STATUS_SRC_HEALTH,   STATUS_SRC_RADAR);
+var CAL2_RDR_D   = spec(TIER_COMPACT, TOP_CAL,   BODY_RADAR, STATUS_SRC_RADAR,    STATUS_SRC_FORECAST);
 var NONE_FC_W    = spec(TIER_NONE,    TOP_EMPTY, BODY_FC,    STATUS_SRC_FORECAST, STATUS_SRC_NONE);
 var NONE_FC_H    = spec(TIER_NONE,    TOP_EMPTY, BODY_FC,    STATUS_SRC_HEALTH,   STATUS_SRC_NONE);
 var NONE_GRAPH_H = spec(TIER_NONE,    TOP_EMPTY, BODY_GRAPH, STATUS_SRC_HEALTH,   STATUS_SRC_NONE);
@@ -72,7 +81,9 @@ var NONE_RDR_W   = spec(TIER_NONE,    TOP_EMPTY, BODY_RADAR, STATUS_SRC_RADAR,  
 var MATRIX = {
   fullCal: {
     off:    { n: [CAL3_FC_W],              r: [CAL3_FC_W, CAL3_RDR_W] },
-    status: { n: [CAL3_FC_W, CAL2_HF_D],   r: [CAL3_FC_W, CAL2_HF_D, CAL3_RDR_W] },
+    // status: the health flick drops to the 2-row dense view, so the radar flick rides
+    // the SAME 2-row tier (dense health+radar) — flicks never bounce back to 3 rows.
+    status: { n: [CAL3_FC_W, CAL2_HF_D],   r: [CAL3_FC_W, CAL2_HF_D, CAL2_HR_D] },
     all:    { n: [CAL3_FC_W, NONE_GRAPH_H],r: [CAL3_FC_W, NONE_GRAPH_H, NONE_RDR_W] }
   },
   compactCal: {
@@ -81,9 +92,13 @@ var MATRIX = {
     all:    { n: [CAL2_FC_W, NONE_GRAPH_H],r: [CAL2_FC_W, NONE_GRAPH_H, NONE_RDR_W] }
   },
   compactDense: {
-    off:    { n: [CAL2_FC_W],              r: [CAL2_FC_W, CAL2_RDR_W] },
-    status: { n: [CAL2_HF_D],              r: [CAL2_HF_D, CAL2_RDR_W] },
-    all:    { n: [CAL2_HF_D, CAL2_GRAPH_D],r: [CAL2_HF_D, CAL2_GRAPH_D, CAL2_RDR_W] }
+    // off/slot + radar: dense still shows up — radar upper + weather lower (the same
+    // default the radarMode='status' special case below builds), and the radar flick
+    // keeps that dense pair over the chart; health-and-radar-less dense has only ONE
+    // weather status line, so it degrades to the single-row view.
+    off:    { n: [CAL2_FC_W],              r: [CAL2_RF_D, CAL2_RDR_D] },
+    status: { n: [CAL2_HF_D],              r: [CAL2_HF_D, CAL2_HR_D] },
+    all:    { n: [CAL2_HF_D, CAL2_GRAPH_D],r: [CAL2_HF_D, CAL2_GRAPH_D, CAL2_HR_D] }
   },
   noCal: {
     off:    { n: [NONE_FC_W],              r: [NONE_FC_W, NONE_RDR_W] },
@@ -179,7 +194,7 @@ function resolvePresetKey(state) {
 // Single public API object, defined once. As a CommonJS module (watch runtime, tests)
 // this is module.exports. When this file is instead concatenated as a plain <script> into
 // the config-UI webview (see scripts/build-config-page.js, which has no `module`),
-// settings/blocks.js reads this same VIEW_CYCLE object from the shared top-level scope
+// settings/preview-layout.js reads this same VIEW_CYCLE object from the shared top-level scope
 // rather than require()-ing it — one export list, no hand-copied duplicate to drift.
 var VIEW_CYCLE = {
   TIER_OFF: TIER_OFF, TIER_NONE: TIER_NONE, TIER_COMPACT: TIER_COMPACT, TIER_FULL: TIER_FULL,

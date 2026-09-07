@@ -1,25 +1,20 @@
 var WeatherProvider = require('./provider.js');
-var request = WeatherProvider.request;
 var failure = WeatherProvider.failure;
 
-var FORECAST_HOURS = 24;
-var HOUR_SECONDS = 60 * 60;
+var hourlyWindow = require('./hourly-window.js');
+var FORECAST_HOURS = hourlyWindow.FORECAST_HOURS;
+var HOUR_SECONDS = hourlyWindow.HOUR_SECONDS;
+// Shared unit helpers (wire-units.js owns them; local aliases keep call sites).
+var celsiusToFahrenheit = require('../wire-units.js').celsiusToFahrenheit;
+var normalizeBearing = require('../wire-units.js').normalizeBearing;
 var TIMELINES_ENDPOINT = 'https://api.tomorrow.io/v4/timelines';
 // Core-layer fields only. AQI/pollen are enterprise-gated (403 on a free key)
 // and nothing in the app consumes a condition code, so no weatherCode either.
-var FIELDS = 'temperature,precipitationProbability,precipitationIntensity,windSpeed,windGust,uvIndex';
+// dewPoint and windDirection are free Core-tier fields and cost nothing extra:
+// the budget guard bills per CALL, not per field (settings/tomorrowio-budget.js
+// WEATHER_CALLS_PER_CYCLE), and this is still the same single Timelines GET.
+var FIELDS = 'temperature,precipitationProbability,precipitationIntensity,windSpeed,windGust,uvIndex,pressureSeaLevel,temperatureApparent,dewPoint,windDirection';
 var MPS_TO_KMH = 3.6;
-
-/**
- * Convert Celsius to Fahrenheit (the provider tempTrend contract — see
- * metno.js/dwd.js; getPayload rounds raw °F values).
- *
- * @param {number} celsius Temperature in degrees Celsius.
- * @returns {number} Temperature in degrees Fahrenheit.
- */
-function celsiusToFahrenheit(celsius) {
-    return celsius * 9 / 5 + 32;
-}
 
 /**
  * Build the Timelines request URL. startTime is the floored current wall-clock
@@ -59,27 +54,18 @@ function num(value) {
     return typeof value === 'number' ? value : 0;
 }
 
-/**
- * Index of the first interval at or after the current wall-clock hour.
- *
- * @param {Object[]} intervals Timelines intervals (ISO startTime each).
- * @param {number} nowEpoch Current time in epoch seconds.
- * @returns {number} Index of the first bucket >= the floored hour, or -1.
- */
+// hourly-window owns the anchor rule; Timelines intervals carry ISO startTimes.
 function anchorIndex(intervals, nowEpoch) {
-    var hourFloor = Math.floor(nowEpoch / HOUR_SECONDS) * HOUR_SECONDS;
-    for (var i = 0; i < intervals.length; i += 1) {
-        if (Math.round(Date.parse(intervals[i].startTime) / 1000) >= hourFloor) {
-            return i;
-        }
-    }
-    return -1;
+    return hourlyWindow.anchorIndex(intervals, nowEpoch, function(interval) {
+        return Math.round(Date.parse(interval.startTime) / 1000);
+    });
 }
 
 /**
  * Map a Timelines response into provider trend fields. Anchors the 24-hour
  * window at the current wall-clock hour. Conversions: °C->°F, m/s->km/h,
- * probability %->[0,1]; rain (mm/h) and UV pass through (getPayload scales).
+ * probability %->[0,1]; rain (mm/h) and UV pass through (getPayload scales);
+ * dew point °C->°F; the bearing is already degrees and only gets normalized.
  * The anchor bucket's temperature doubles as currentTemp (metno.js precedent —
  * no separate "current conditions" call, keeping the cycle at one API call).
  *
@@ -107,6 +93,17 @@ function mapResponse(json, nowEpoch) {
     var windTrend = [];
     var gustTrend = [];
     var uvTrend = [];
+    var pressureTrend = [];
+    var feelsTrend = [];
+    var currentFeels = null;
+    // Dew point and bearing skip num()'s 0-collapse: 0 °F and 0° are both real
+    // readings, so a missing value must never be flattened into one. A missing
+    // hour becomes null and the series still runs the full length — the same
+    // convention the other five adapters use, so a future consumer that reads
+    // past index 0 (a dew forecast line, a per-hour arrow) sees one shape from
+    // every provider. A null head renders '--' / draws no arrow.
+    var dewTrend = [];
+    var windDirTrend = [];
     var i;
     var values;
     for (i = 0; i < FORECAST_HOURS; i += 1) {
@@ -117,6 +114,20 @@ function mapResponse(json, nowEpoch) {
         windTrend.push(num(values.windSpeed) * MPS_TO_KMH);
         gustTrend.push(num(values.windGust) * MPS_TO_KMH);
         uvTrend.push(num(values.uvIndex));
+        pressureTrend.push(num(values.pressureSeaLevel));   // sea-level, NOT pressureSurfaceLevel
+        // °C→°F like temperature; a missing hour falls back to the mapped temp
+        // so the series stays numeric (0 would be a real 0 °F feels).
+        feelsTrend.push(typeof values.temperatureApparent === 'number'
+            ? celsiusToFahrenheit(values.temperatureApparent) : tempTrend[i]);
+        dewTrend.push(typeof values.dewPoint === 'number'
+            ? celsiusToFahrenheit(values.dewPoint) : null);
+        windDirTrend.push(typeof values.windDirection === 'number'
+            ? normalizeBearing(values.windDirection) : null);
+        if (i === 0 && typeof values.temperatureApparent === 'number') {
+            // Anchor bucket doubles as "now" (currentTemp precedent); missing →
+            // null so FEELS_CURRENT is omitted rather than echoing the temp.
+            currentFeels = feelsTrend[0];
+        }
     }
 
     return {
@@ -126,8 +137,13 @@ function mapResponse(json, nowEpoch) {
         windTrend: windTrend,
         gustTrend: gustTrend,
         uvTrend: uvTrend,
+        pressureTrend: pressureTrend,
+        feelsTrend: feelsTrend,
+        dewTrend: dewTrend,             // °F, unrounded (formatValue rounds per unit)
+        windDirTrend: windDirTrend,     // degrees 0-359, "comes from"
         startTime: Math.round(Date.parse(intervals[anchor].startTime) / 1000),
-        currentTemp: tempTrend[0]
+        currentTemp: tempTrend[0],
+        currentFeels: currentFeels
     };
 }
 
@@ -162,42 +178,22 @@ TomorrowIoProvider.prototype.withProviderData = function(lat, lon, force, onSucc
         onFailure(failure('provider_data', 'tomorrowio_missing_api_key'));
         return;
     }
-    var url = buildUrl(lat, lon, this.apiKey, Math.floor(Date.now() / 1000));
-    request(url, 'GET', (function(response) {
-        var json;
-        var mapped;
-        try {
-            json = JSON.parse(response);
-        }
-        catch (ex) {
-            onFailure(failure('provider_data', 'tomorrowio_parse_error'));
-            return;
-        }
-        mapped = mapResponse(json, Math.floor(Date.now() / 1000));
-        if (mapped === null) {
-            onFailure(failure('provider_data', 'tomorrowio_missing_fields'));
-            return;
-        }
-        this.tempTrend = mapped.tempTrend;
-        this.precipTrend = mapped.precipTrend;
-        this.rainTrend = mapped.rainTrend;
-        this.windTrend = mapped.windTrend;
-        this.gustTrend = mapped.gustTrend;
-        if (this.fetchUv) {
-            this.uvTrend = mapped.uvTrend;
-        }
-        this.startTime = mapped.startTime;
-        this.currentTemp = mapped.currentTemp;
+    // requestMapped owns the parse/missing-fields/error-code grammar; adoptMapped
+    // owns the field adoption and the feels/uv gates. Everything rides the one
+    // Timelines call (dew point, bearing and temperatureApparent are Core-tier
+    // fields), so mapped carries the full shape and the gates decide what lands.
+    WeatherProvider.requestMapped({
+        url: buildUrl(lat, lon, this.apiKey, Math.floor(Date.now() / 1000)),
+        id: 'tomorrowio', label: 'Tomorrow.io',
+        map: function(json) { return mapResponse(json, Math.floor(Date.now() / 1000)); }
+    }, (function(mapped) {
+        this.adoptMapped(mapped);
         onSuccess();
-    }).bind(this), function(error) {
-        console.log('[!] Tomorrow.io request failed: ' + JSON.stringify(error));
-        onFailure(failure('provider_data', 'tomorrowio_' + error.code));
-    });
+    }).bind(this), onFailure);
 };
 
 module.exports = {
     buildUrl: buildUrl,
     mapResponse: mapResponse,
-    celsiusToFahrenheit: celsiusToFahrenheit,
     TomorrowIoProvider: TomorrowIoProvider
 };

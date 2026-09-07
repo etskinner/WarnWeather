@@ -21,8 +21,8 @@ const { WEATHER_CATEGORIES } = require('../src/pkjs/outbox');
 // half-duplex — see outbox.js), so the watch's inbox must hold the heaviest
 // bundle the phone can emit in a single fetch. The worst realistic case is the
 // DWD provider with secondary + third metric lines both active: two 24-byte
-// trends + THIRD_LINE_COLOR + rain bars + radar — so forecast + status + sun +
-// radar all bundle together.
+// trends + rain bars + radar — so forecast + status + sun + radar all bundle
+// together. (The lines' colours are settings-derived and ride the Clay message.)
 //
 // This guard caught the gust-third-line overflow: the inbox was sized for
 // bundled forecast+radar before the 24-byte gust series existed, so DWD+wind
@@ -87,9 +87,10 @@ function buildWeatherOutboxPayload(payload) {
 function buildHeaviestBundle() {
   const range = Array.from({ length: N }, function(_, i) { return i; });
 
-  // Base forecast payload as provider.getPayload emits it (pre-series).
+  // Base forecast payload as provider.getPayload emits it (pre-series): raw
+  // whole-degree temps; applyForecastSeries encodes them to the 24 wire bytes.
   const payload = {
-    TEMP_TREND_UINT8: range.map(function() { return 200; }), // 24 bytes
+    TEMP_RAW_TREND: range.map(function() { return 25; }), // -> 24 TEMP_TREND_UINT8 bytes
     TEMP_MIN: -10,
     TEMP_MAX: 35,
     PRECIP_TREND_UINT8: range.map(function() { return 100; }),
@@ -107,7 +108,7 @@ function buildHeaviestBundle() {
   };
 
   // PKJS resolves the render-ready series; worst case = secondary line + a
-  // distinct third line (two 24-byte trends + THIRD_LINE_COLOR) + rain bars.
+  // distinct third line (two 24-byte trends) + rain bars.
   applyForecastSeries(payload, {
     secondaryLine: 'wind', thirdLine: 'gust', secondaryLineFill: false, barSource: 'rain', windScale: 'high',
     temperatureUnits: 'c', axisTimeFormat: '12h', timeShowAmPm: true,
@@ -161,7 +162,12 @@ test('weather bundle keeps explicit headroom below the watch inbox', () => {
   const size = dictSize(buildHeaviestBundle());
   const inbox = readInboxSize();
   console.log(`heaviest weather bundle: ${size} B of ${inbox} B (headroom ${inbox - size})`);
-  assert.equal(size, 517, 'update the recorded realistic bundle size when its wire contract changes');
+  // 525 -> 526 when STATUS_LEVELS_UINT8 widened to 2 bytes (UV thresholds).
+  // Headroom then sat EXACTLY on the 10 B floor.
+  // 526 -> 482 when the four settings-derived line-style tuples moved to the
+  // Clay message (SECONDARY_LINE_COLOR / _FILL / _FILL_COLOR / THIRD_LINE_COLOR,
+  // 4 x 11 B = 7 B tuple header + 4 B int32/bool each). Headroom 10 -> 54 B.
+  assert.equal(size, 482, 'update the recorded realistic bundle size when its wire contract changes');
   assert.ok(inbox - size >= 10, `headroom ${inbox - size} B is below the 10 B floor`);
 });
 
@@ -173,7 +179,12 @@ function buildHeaviestClayMessage() {
     btIcons: 'both', vibe: true, timeShowAmPm: true, dayNightShading: true,
     fetchIntervalMin: '30', holidayCountry: 'US', holidaysEnabled: true,
     rainBarColor: 'multicolor', radarColor: 'multicolor', rainCountdownHorizon: '120',
-    healthMode: 'all', theme: 'bw',
+    // The theme must stay COLOUR-capable: a bw theme collapses the bar and radar
+    // palettes to a single stop and understates the worst case.
+    healthMode: 'all', theme: 'dark', largeGraphFont: true,
+    // Worst-case custom no-rain text: the full 24-byte UTF-8 cap (CLAY_NORAIN_TEXT
+    // packs it + NUL; clay-payload truncates anything longer at pack time).
+    radarNoRainText: 'Kein Regen in Sichtweite',
   }, { platform: 'emery' }, new Date('2026-06-26T00:00:00Z'));
 }
 
@@ -183,4 +194,40 @@ test('Clay settings message (with palette) fits the watch inbox', function() {
   assert.ok(
     size <= inbox,
     'Clay message is ' + size + ' B but inbox_size is only ' + inbox + ' B — bump inbox_size.');
+});
+
+test('Clay settings message keeps its recorded size (and headroom)', () => {
+  const size = dictSize(buildHeaviestClayMessage());
+  const inbox = readInboxSize();
+  console.log(`heaviest Clay message: ${size} B of ${inbox} B (headroom ${inbox - size})`);
+  // Recorded exactly, like the weather bundle above: the Clay message grows key by key
+  // (the palette, then the threshold blob), so the next task that adds one has to see the
+  // running total move instead of silently eating the remaining headroom.
+  // 389 -> 391 when the threshold blob widened 27 -> 29 (UV color pair).
+  // 391 -> 395 when it widened 29 -> 33 (the four per-kind bold-mode bytes:
+  // 16 kinds x 2 bits, bold-only kinds 8..15 included).
+  // 395 -> 427 when the custom radar no-rain text joined (CLAY_NORAIN_TEXT:
+  // 7 B tuple header + 24 B text cap + 1 B NUL = 32 B).
+  // 427 -> 428 when the threshold blob widened 33 -> 34 (the battery-% bold
+  // cell, kind 16, opened byte 33).
+  // 428 -> 438 when the per-series curve insets joined (CLAY_CURVE_INSET_UINT8:
+  // 7 B tuple header + 3 B data).
+  // 438 -> 449 when the graph line styling joined (CLAY_LINE_STYLE_UINT8:
+  // 7 B tuple header + 4 B data). It replaces 44 B on the weather message.
+  // 449 -> 460 when the emery "Larger graph fonts" toggle joined
+  // (CLAY_LARGE_GRAPH_FONT: 7 B tuple header + 4 B boolean-packed-as-int).
+  // 460 -> 484 when the fixture theme moved bw -> dark: bw collapsed the bar and
+  // radar palettes and understated the worst case (MEASURED, not arithmetic).
+  // 484 -> 489 when CLAY_LINE_STYLE_UINT8 grew 4 -> 9 bytes for the user-selectable
+  // graph colours (the 7 B tuple header was already paid).
+  // 489 -> 490 when that tuple grew 9 -> 10: the night-fill-explicit bit moved out of the
+  // line flag byte [3] into a night flag byte [9] of its own, so wire bytes [4..9] are
+  // byte-for-byte the watch's NIGHT_COLORS persist blob (NIGHT_COLOR_BYTES = 6) and
+  // app_message.c stores the tail straight through instead of translating one bit between
+  // two positions under two names. One byte for that.
+  // 490 -> 499 when the date-slot formats joined (CLAY_DATE_FORMAT_UINT8:
+  // 7 B tuple header + 2 B [monthYear, fullDate]). Threshold-gated like the
+  // threshold blob, so an aplite bundle stays without it.
+  assert.equal(size, 499, 'update the recorded Clay message size when its wire contract changes');
+  assert.ok(inbox - size >= 10, `headroom ${inbox - size} B is below the 10 B floor`);
 });

@@ -1,6 +1,7 @@
 #include <string.h>
 
 #include "health_graph_layer.h"
+#include "layer_util.h"
 #include "c/appendix/chart.h"
 #include "c/appendix/forecast_grid.h"
 #include "c/appendix/series.h"          // MAX_BOTTOM_VIEW_ENTRIES
@@ -9,6 +10,8 @@
 #include "c/services/health.h"
 #include "c/services/health_cache.h"
 #include "c/appendix/theme.h"
+#include "c/appendix/hr_scale.h"
+#include "c/appendix/config.h"
 
 // The health view exists only on health-capable hardware. Platforms without
 // PBL_HEALTH (e.g. aplite, which has no sensors) compile this module out
@@ -25,9 +28,11 @@
 #define SLEEP_STRIPE_H            6
 #endif
 
-// HR fixed scale (resting..high): 40..180 BPM.
+// HR scale fallback (resting..high): 40..180 BPM. The user can narrow or widen this
+// per install (Health tab -> "Heart-rate scale", packed into config.hr_scale); these
+// are what an unset value resolves to, and the phone-side default mirrors them.
 #define HEALTH_HR_LO              40
-#define HEALTH_HR_HI             180
+#define HEALTH_HR_HI             150
 
 // Gray axis frame, matching the forecast's night axis (GColorDarkGray); theme_fg()
 // on B&W. theme_furniture() flattens the gray to black in the light theme.
@@ -60,12 +65,18 @@ static int16_t s_steps[MAX_BOTTOM_VIEW_ENTRIES];
 static int16_t s_hr[MAX_BOTTOM_VIEW_ENTRIES];
 static uint8_t s_sleep[MAX_BOTTOM_VIEW_ENTRIES];
 
+// Per-slot HR_CLAMP_* for the HR line: which hours fell outside the configured
+// scale, and which way. Filled by hr_scale_apply() in health_graph_compute();
+// consumed by hr_clamp_draw() to dot the edge where the line left the plot.
+static uint8_t s_hr_clamp[MAX_BOTTOM_VIEW_ENTRIES];
+
 // Refresh-time results the update proc renders from (see health_graph_compute).
 static int    s_visible_slots;     // slots filled in s_steps/s_hr/s_sleep
 static int    s_step_hi;           // bars/HR scale top (peak rounded up to 100)
 static int    s_step_marks[2];     // step values of the labeled dotted lines, top first
 static int    s_step_mark_n;       // number of marks in use (1 or 2)
 static time_t s_end_hour;          // hour boundary the last visible slot ends at
+static int    s_hr_lo, s_hr_hi;    // resolved HR scale for this refresh
 
 // Sleep-stripe payload handed to the CUSTOM layer's fn via the user pointer.
 typedef struct {
@@ -146,6 +157,50 @@ static void step_grid_draw(const ChartRender *r, void *user) {
     }
 }
 
+// CUSTOM layer: one dot per off-scale hour, at the edge the HR line left through
+// (see hr_scale_apply). Those hours are CHART_ABSENT in the LINE layer's values, so
+// the solid line breaks around them; the dots are what makes the break legible as
+// "off scale" rather than "no reading". Drawn AFTER the line so they sit on top.
+//
+// A 3x3 filled square, not a circle: at this size a square is crisper, needs no
+// antialiasing, and matches the existing bar-dot idiom (chart_draw_bar_dots). The y
+// values mirror the LINE layer's own mapping exactly — value==hi lands at
+// plot_top + inset_top, value==lo at plot_bottom - inset_bottom — so a dot sits
+// where the line's own point would have been, fully inside the plot.
+typedef struct {
+    const uint8_t *clamp;         // per-slot HR_CLAMP_*
+    int            count;         // visible slots
+    int            inset_top;     // same insets handed to the LINE layer
+    int            inset_bottom;
+    GColor         color;
+} HrClampDots;
+
+#define HR_CLAMP_DOT_SIZE 3
+
+static void hr_clamp_draw(const ChartRender *r, void *user) {
+    const HrClampDots *d = (const HrClampDots *)user;
+    if (!d || !d->clamp) {
+        return;
+    }
+    const GRect c        = r->geo.content;
+    const int   y_high   = c.origin.y + d->inset_top;
+    const int   y_low    = c.origin.y + c.size.h - d->inset_bottom;
+    const int   count    = (d->count > r->def->num_slots) ? r->def->num_slots : d->count;
+    const int   half     = HR_CLAMP_DOT_SIZE / 2;
+    graphics_context_set_fill_color(r->ctx, d->color);
+    for (int i = 0; i < count; ++i) {
+        const uint8_t state = d->clamp[i];
+        if (state == HR_CLAMP_NONE) {
+            continue;
+        }
+        const int cy = (state == HR_CLAMP_HIGH) ? y_high : y_low;
+        graphics_fill_rect(r->ctx,
+                           GRect(chart_slot_tick_x(&r->geo, i) - half, cy - half,
+                                 HR_CLAMP_DOT_SIZE, HR_CLAMP_DOT_SIZE),
+                           0, GCornerNone);
+    }
+}
+
 // Health-graph grid, distinct from FORECAST_GRID_DEF. The forecast shows near-term
 // hours and keeps its fixed (wider) pitch, but the health view must always span a FULL
 // 24 h so the *previous night's* sleep band stays on screen through the day. At the
@@ -214,11 +269,12 @@ static void compute_step_marks(int peak) {
 }
 
 // Read health for the visible window and derive the step scale + labeled marks into
-// the module statics the update proc renders from. When report_width is true (refresh
-// path) it also feeds the widest mark label into bottom_view so the shared left strip
-// widens to fit; create passes false so a paint while hidden never perturbs forecast's
-// strip before the health view is ever shown.
-static void health_graph_compute(bool report_width) {
+// the module statics the update proc renders from, then feed the widest mark label
+// into bottom_view so the shared left strip widens to fit — bottom_view repaints
+// both strip consumers itself when the effective width moves. Create does NOT call
+// this (no compute until the cache is warm), so the strip stays forecast-sized
+// until the first refresh.
+static void health_graph_compute(void) {
     const GRect    bounds     = layer_get_bounds(s_health_graph_layer);
     const ChartDef def        = health_grid_def();
     const int      pitch      = chart_def_pitch(&def);
@@ -234,6 +290,23 @@ static void health_graph_compute(bool report_width) {
     // HealthService calls on this path. The cache returns the grid anchor (top
     // of the current hour); the in-progress hour is the last slot.
     const time_t end_hour = health_cache_read(s_steps, s_hr, s_sleep, visible_slots);
+
+    // Resolve the configured HR window, then blank every off-scale hour to
+    // CHART_ABSENT (recording which edge it left through). Two consequences:
+    // the LINE layer's existing run-breaking stops the solid line around the
+    // excursion instead of plotting it OUTSIDE the plot rect, and hr_clamp_draw
+    // can dot the edge so a break can't be misread as a genuinely flat hour.
+    //
+    // This belongs here, not in the update proc: a settings save runs
+    // main_window_refresh_health_graph() -> health_graph_layer_refresh() -> this
+    // function whenever the graph is reachable (health_graph_renderable() in
+    // main_window.c) -- hidden view included -- so a new scale re-reads raw values
+    // from the cache and re-derives the flags. Clamping at render time would
+    // instead see already-blanked values on the second redraw and could never
+    // recover the original readings.
+    hr_scale_resolve(config_get()->hr_scale, HEALTH_HR_LO, HEALTH_HR_HI,
+                     &s_hr_lo, &s_hr_hi);
+    hr_scale_apply(s_hr, s_hr_clamp, visible_slots, s_hr_lo, s_hr_hi, CHART_ABSENT);
 
     int step_peak = 0;
     for (int i = 0; i < visible_slots; ++i) {
@@ -254,19 +327,17 @@ static void health_graph_compute(bool report_width) {
     s_visible_slots = visible_slots;
     s_end_hour      = end_hour;
 
-    if (report_width) {
-        const GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_18);
-        const GRect box  = GRect(0, 0, 200, 40);
-        int max_w = 0;
-        for (int i = 0; i < s_step_mark_n; ++i) {
-            char label[6];
-            step_mark_label(s_step_marks[i], label, sizeof label);
-            const GSize sz = graphics_text_layout_get_content_size(
-                label, font, box, GTextOverflowModeFill, GTextAlignmentRight);
-            if (sz.w > max_w) { max_w = sz.w; }
-        }
-        bottom_view_report_label_w(BOTTOM_VIEW_SRC_HEALTH, max_w);
+    const GFont font = bottom_view_label_font();
+    const GRect box  = GRect(0, 0, 200, 40);
+    int max_w = 0;
+    for (int i = 0; i < s_step_mark_n; ++i) {
+        char label[6];
+        step_mark_label(s_step_marks[i], label, sizeof label);
+        const GSize sz = graphics_text_layout_get_content_size(
+            label, font, box, GTextOverflowModeFill, GTextAlignmentRight);
+        if (sz.w > max_w) { max_w = sz.w; }
     }
+    bottom_view_report_label_w(BOTTOM_VIEW_SRC_HEALTH, max_w);
 }
 
 // Left-axis strip: labels each dotted step mark (see compute_step_marks) as a single-row
@@ -285,18 +356,30 @@ static void draw_left_axis(GContext *ctx, int h, int hi) {
     if (axis_y <= 0 || hi <= 0) { return; }
 
     graphics_context_set_text_color(ctx, theme_fg());
-    const GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_18);
+    const GFont font = bottom_view_label_font();
+    // Single-row label centred on the gridline y: seat the INK centre on y + 1. Pebble
+    // seats a digit's cap box on the BOTTOM of its measured content box
+    // (layers/status_metrics.h), its ink centre status_glyph_below(content_h) above the
+    // content bottom, so the box top solves to y + 1 - content_h + below. Fully
+    // font-derived -- whatever tier bottom_view_label_font() resolves, with no per-tier
+    // tuning: the same expression seats GOTHIC_18 at today's shipped lift (11) and
+    // emery's large-font GOTHIC_24 at 16. (The retired "half the line height plus 2"
+    // guess hung the taller cap 3 px below its gridline: the model centres the INK, not
+    // the content box.) The box needs content_h plus slack or graphics_draw_text drops
+    // the row entirely.
+    const int content_h = status_content_h(font);
+    const int ty_lift   = content_h - 1 - status_glyph_below(content_h);
+    const int box_h     = content_h + 2;
     for (int i = 0; i < s_step_mark_n; ++i) {
         const int v = s_step_marks[i];
         if (v <= 0 || v > hi) { continue; }
         const int y = axis_y - (int)(((int32_t)v * axis_y) / hi);
 
-        // Single-row label centered on the gridline y (box top ≈ y - 11).
         char label[6];
         step_mark_label(v, label, sizeof label);
-        int ty = y - 11;
+        int ty = y - ty_lift;
         if (ty < 0) { ty = 0; }
-        graphics_draw_text(ctx, label, font, GRect(0, ty, strip_w, 20),
+        graphics_draw_text(ctx, label, font, GRect(0, ty, strip_w, box_h),
                            GTextOverflowModeFill, GTextAlignmentRight, NULL);
     }
 }
@@ -360,6 +443,7 @@ static void health_graph_update_proc(Layer *layer, GContext *ctx) {
     //  2. Step gridlines (CUSTOM) — dashed 1k rules, under the data.
     //  3. Step bars (BARS) — green, scaled to s_step_hi.
     //  4. HR line (LINE, solid) — primary line, styled like forecast's temp line.
+    //  4b. Clamp dots (CUSTOM) — off-scale hours, over the line.
     //  5. Frame (left + bottom borders).
     //  6. Axis (bottom hour labels/ticks).
     // On B&W (device or bw theme) the fill is theme_bg() — the polarity background,
@@ -374,8 +458,8 @@ static void health_graph_update_proc(Layer *layer, GContext *ctx) {
     step_stops[0] = (ChartColorStop){ .from = 0, .color = theme_pick(GColorGreen, theme_bg()) };
 
     // aplite-style discipline: per-frame layer array is module-static, not stack.
-    // Max reachable here is 6 (sleep + gridlines + bars + HR + frame + axis).
-    static ChartLayer layers[6];
+    // Max reachable here is 7 (sleep + gridlines + bars + HR + clamp dots + frame + axis).
+    static ChartLayer layers[7];
     int n = 0;
 
     layers[n++] = (ChartLayer){ CHART_LAYER_CUSTOM, .custom = {
@@ -393,18 +477,33 @@ static void health_graph_update_proc(Layer *layer, GContext *ctx) {
     // Always add the HR line: the cache stores CHART_ABSENT for hours with no
     // reading, so the solid line breaks across gaps and draws nothing when HR is
     // entirely absent — no render-path HR-availability query needed.
+    // Insets are shared with the clamp-dot pass below, so a dot lands exactly where
+    // the line's own point for that value would have been.
+    const int hr_inset_top    = BOTTOM_VIEW_PRIMARY_LINE_INSET_Y;
+    const int hr_inset_bottom = SLEEP_STRIPE_H + (s_full_mode ? HR_STRIPE_GAP_FULL
+                                                             : HR_STRIPE_GAP_OTHER);
+    const GColor hr_color     = theme_pick(GColorRed, theme_fg());
+
     layers[n++] = (ChartLayer){ CHART_LAYER_LINE, .line = {
         .values = s_hr, .count = visible_slots,
-        .lo = HEALTH_HR_LO, .hi = HEALTH_HR_HI,
-        .color = theme_pick(GColorRed, theme_fg()),
+        .lo = s_hr_lo, .hi = s_hr_hi,
+        .color = hr_color,
         .width = 3,
         // Normal top margin; the bottom reserves the sleep-stripe height plus a gap
         // so low sleeping-hour HR readings ride clear above the stripe instead of
         // overlaying it. Full top-view's graph band is shorter, so it uses a tighter
         // gap to avoid squashing the line.
-        .inset_top    = BOTTOM_VIEW_PRIMARY_LINE_INSET_Y,
-        .inset_bottom = SLEEP_STRIPE_H + (s_full_mode
-                                              ? HR_STRIPE_GAP_FULL : HR_STRIPE_GAP_OTHER) } };
+        .inset_top    = hr_inset_top,
+        .inset_bottom = hr_inset_bottom } };
+
+    // Off-scale hours: dots on the edge the line left through, over the line itself.
+    // A plain local (like `stripe` / `grid` above) — chart_draw() runs before this
+    // frame's stack unwinds, so the .user pointer stays valid.
+    HrClampDots hr_dots = { .clamp = s_hr_clamp, .count = visible_slots,
+                            .inset_top = hr_inset_top, .inset_bottom = hr_inset_bottom,
+                            .color = hr_color };
+    layers[n++] = (ChartLayer){ CHART_LAYER_CUSTOM, .custom = {
+        .fn = hr_clamp_draw, .user = &hr_dots } };
 
     layers[n++] = (ChartLayer){ CHART_LAYER_FRAME, .frame = { .frame = {
         .left   = { 1, HEALTH_AXIS_COLOR },
@@ -424,6 +523,9 @@ static void health_graph_update_proc(Layer *layer, GContext *ctx) {
 void health_graph_layer_create(Layer *parent_layer, GRect frame) {
     s_health_graph_layer = layer_create(frame);
     layer_set_update_proc(s_health_graph_layer, health_graph_update_proc);
+    // Strip-width consumer: a forecast-side width change repaints this graph too
+    // (shared strip, bottom_view.h) — it reads the gutter at draw time.
+    bottom_view_register_consumer(s_health_graph_layer);
     // No compute here: the cache populates on reset (boot/enable); the update
     // proc paints the loading state until health_cache_ready().
     layer_add_child(parent_layer, s_health_graph_layer);
@@ -436,13 +538,19 @@ Layer *health_graph_layer_get_root(void) {
 void health_graph_layer_refresh(void) {
     if (!health_cache_ready()) {
         layer_mark_dirty(s_health_graph_layer);   // paints the loading state
+        // Report NOTHING while the (re)build runs: the loading frame has no
+        // left-axis labels, so 0 would be the honest measurement — but it would
+        // also shrink the SHARED strip for the duration of a sliced build and
+        // grow it back when the build lands, wobbling the visible forecast's
+        // gutter twice over. Holding the last known width leaves it still.
         return;
     }
-    health_graph_compute(true);   // copy from the cache + report the strip width
+    health_graph_compute();   // copy from the cache + report the width
     layer_mark_dirty(s_health_graph_layer);
 }
 
 void health_graph_layer_destroy(void) {
+    bottom_view_unregister_consumer(s_health_graph_layer);
     layer_destroy(s_health_graph_layer);
     s_health_graph_layer = NULL;
 }

@@ -7,6 +7,79 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
 
 (function () {
     /**
+     * The "Highlight this value" toggles are DERIVED state, recomputed on every
+     * open: on = the stored warn/danger pair is complete and ordered — the exact
+     * rule kindConfig() applies at pack time — so the toggle can never disagree
+     * with what the watch actually highlights (locationMode pattern below).
+     * Flipping it live is the thresholdToggle onChange hook in blocks.js.
+     * @param {{ get: function, set: function }} ctx onLoad context
+     * @returns {void}
+     */
+    function deriveThresholdToggles(ctx) {
+        // Node (tests): CommonJS require. Webview: the flat page exposes
+        // window.StatusThresholds (resolved lazily at boot, after all scripts loaded).
+        var contract = (typeof require !== 'undefined')
+            ? require('../status-thresholds.js')
+            : (typeof window !== 'undefined' ? window.StatusThresholds : null);
+        if (!contract) { return; }
+        // Auto colors (see blocks.js thresholdAutoColor): a never-customized color
+        // tracks the current theme's text color, re-derived on every open so a theme
+        // switch updates it. blocks.js is bundled/required before this hook runs.
+        var auto = PConf.thresholdAutoColor;
+        var fg = auto ? auto.fgFor(ctx.get('theme')) : null;
+        for (var i = 0; i < contract.KINDS.length; i++) {
+            var kind = contract.KINDS[i];
+            var warn = contract.parseThreshold(ctx.get('thresh' + kind.key + 'Warn'));
+            var danger = contract.parseThreshold(ctx.get('thresh' + kind.key + 'Danger'));
+            ctx.set('thresh' + kind.key + 'On', contract.pairOrdered(warn, danger));
+            if (auto) {
+                // WARN, weather kinds: the default is NO outline (bold text only) — an
+                // unset color stays '' and a legacy auto-fg value converts back to ''.
+                // GOAL kinds: the green "close" outline is the default — never-touched
+                // and legacy-fg values seed DEFAULT_GOAL_COLOR; only an explicit ''
+                // (their outline toggle turned off) stays off. A user pick survives
+                // either way and means "outline on".
+                var goalHex = contract.DEFAULT_GOAL_HEX;
+                var rawWarn = ctx.get('thresh' + kind.key + 'WarnColor');
+                if (kind.goal) {
+                    if (rawWarn === null) {
+                        // The old parseResponse bug's footprint for an explicitly
+                        // turned-off outline (hexToInt('') = NaN, persisted as
+                        // null; never-touched keys are absent, not null — see
+                        // status-thresholds.js). Heal to the off-sentinel the
+                        // user meant, so the next save stores a durable ''.
+                        ctx.set('thresh' + kind.key + 'WarnColor', '');
+                        rawWarn = '';
+                    } else if (rawWarn !== '' && auto.isAuto(rawWarn)) {
+                        ctx.set('thresh' + kind.key + 'WarnColor', goalHex);
+                        rawWarn = goalHex;
+                    }
+                } else if (auto.isAuto(rawWarn)) {
+                    // WEATHER kinds: the STORED toggle owns the on/off state and
+                    // rides every save; the color is its detail. A custom pick
+                    // survives untouched (this branch not taken — outline on in
+                    // that color); an auto-valued color — blank, the old NaN
+                    // bug's null, or an fg seed/legacy residue — resolves by the
+                    // toggle: stored ON keeps tracking the theme fg (re-derived
+                    // each open, and on B&W the fg seed is the only on-state
+                    // there is), stored OFF or a pre-toggle legacy blob with no
+                    // stored toggle reads as no outline.
+                    var storedOn = ctx.get('thresh' + kind.key + 'WarnOutlineOn') === true;
+                    ctx.set('thresh' + kind.key + 'WarnColor', storedOn ? fg : '');
+                    rawWarn = storedOn ? fg : '';
+                }
+                // Both branches above normalize null/undefined away, so blank is
+                // the one remaining off-state.
+                ctx.set('thresh' + kind.key + 'WarnOutlineOn', rawWarn !== '');
+                var rawDanger = ctx.get('thresh' + kind.key + 'DangerColor');
+                if (auto.isAuto(rawDanger)) {
+                    ctx.set('thresh' + kind.key + 'DangerColor', kind.goal ? goalHex : fg);
+                }
+            }
+        }
+    }
+
+    /**
      * onLoad: reset transient toggles so they never persist across open/close, and
      * mirror the stored location into the GPS/Manual picker (locationMode has no
      * watch-side meaning — an empty vs set location is the real GPS/manual contract,
@@ -24,6 +97,7 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
         // leave it pre-checked on the next open.
         ctx.set('reset', false);
         ctx.set('locationMode', ctx.get('location') ? 'manual' : 'gps');
+        deriveThresholdToggles(ctx);
         if (ctx.env && ctx.env.platform === 'aplite') {
             ctx.set('radarMode', 'off');
             ctx.set('healthMode', 'off');

@@ -1,4 +1,5 @@
 #include "config.h"
+#include "date_format.h"
 #include "persist.h"
 #include "math.h"
 #include "memory_log.h"
@@ -50,7 +51,21 @@ static Config config_defaults(void) {
         .view_spec2 = { 0x244, 0x000, 0x000 },
         .theme = 0,   // dark — today's look, unchanged until the user picks otherwise
         .battery_low_only = true,
-        .date_month_first = false   // day-first (dd.mm.yy); phone overrides per holiday country
+        .date_month_first = false,  // day-first (dd.mm.yy); phone overrides per holiday country
+#if defined(PBL_PLATFORM_EMERY)
+        // emery: on out of the box, matching the phone's schema default -- this covers
+        // only the window before the first Clay message (a fresh install, or a phone
+        // that predates the key), and starting it false would flip the axis labels
+        // small -> large a moment after boot. Guarded because the field itself is
+        // (see config.h).
+        .large_graph_font = true,
+#endif
+#if !defined(PBL_PLATFORM_APLITE)
+        // Auto — today's formats ("%b %Y" / dd.mm.yy per date_month_first) until
+        // the user picks otherwise on the Date slot's edit sheet.
+        .date_month_format = DATE_MONTH_AUTO,
+        .date_full_format = DATE_FULL_AUTO,
+#endif
     };
 }
 

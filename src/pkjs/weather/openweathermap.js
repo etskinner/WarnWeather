@@ -4,6 +4,36 @@ var mphToKmh = require('../wire-units.js').mphToKmh;
 var request = WeatherProvider.request;
 var failure = WeatherProvider.failure;
 
+/**
+ * Lift one numeric field out of the One Call `hourly` array, aligned 1:1 with
+ * the other trends. A missing or non-finite hour becomes `null`, not 0: unlike
+ * pressure (0 hPa is impossible) a dew point of 0 °F and a bearing of 0° (due
+ * north) are both real readings, so a zero fallback would read as data instead
+ * of as a gap. Consumers take the head and degrade on null — '--' for the dew
+ * slot, no arrow for the wind slots. An `hourly` with no usable value at all
+ * collapses to [], the "unsourced" contract the normalized fields promise, so
+ * getPayload omits the key entirely.
+ *
+ * @param {Object[]} hourly One Call `hourly` entries.
+ * @param {string} field Field name to lift out of each entry.
+ * @param {Function|null} transform Optional (number) => number applied to each
+ *   sound value; skipped for gaps.
+ * @returns {Array<number|null>} One entry per hour, or [] when none are numeric.
+ */
+function hourlyTrend(hourly, field, transform) {
+    var sourced = false;
+    var trend = hourly.map(function(entry) {
+        var value = entry ? entry[field] : undefined;
+        if (typeof value !== 'number' || !isFinite(value)) { return null; }
+        sourced = true;
+        return transform ? transform(value) : value;
+    });
+    return sourced ? trend : [];
+}
+
+// Shared bearing fold (wire-units.js): null-tolerant, [0, 360).
+var normalizeBearing = require('../wire-units.js').normalizeBearing;
+
 var OpenWeatherMapProvider = function(apiKey) {
     this._super.call(this);
     this.name = 'OpenWeatherMap';
@@ -49,13 +79,22 @@ OpenWeatherMapProvider.prototype.withOwmResponse = function(lat, lon, callback, 
 };
 
 OpenWeatherMapProvider.prototype.withWeatherData = function(lat, lon, callback, onFailure) {
-    if (this.weatherDataCache === null) {
+    // CONSUME-ONCE: withSunEvents populates the cache each cycle (one metered
+    // One Call XHR serves both consumers) and this read nulls it, so a chain
+    // reorder or a standalone withProviderData call can never serve a PREVIOUS
+    // cycle's forecast — the provider instance persists across fetches, and the
+    // old serve-whenever-non-null cache was fresh only by base-chain call-order
+    // accident. The empty-cache arm re-fetches; on the shipped path it never
+    // fires.
+    var cached = this.weatherDataCache;
+    this.weatherDataCache = null;
+    if (cached === null) {
         this.withOwmResponse(lat, lon, function(owmResponse) {
             callback(owmResponse);
         }, onFailure);
     }
     else {
-        callback(this.weatherDataCache);
+        callback(cached);
     }
 };
 
@@ -135,8 +174,28 @@ OpenWeatherMapProvider.prototype.withProviderData = function(lat, lon, force, on
         this.uvTrend = weatherData.hourly.map(function(entry) {
             return typeof entry.uvi === 'number' ? entry.uvi : 0; // OWM One Call hourly UV index
         });
+        this.pressureTrend = weatherData.hourly.map(function(entry) {
+            return typeof entry.pressure === 'number' ? entry.pressure : 0; // One Call hourly pressure is sea-level hPa
+        });
+        // Dew point rides the same cached One Call response — no extra request,
+        // and already °F because the call is units=imperial, which is exactly
+        // the unit the normalized field wants. No conversion.
+        this.dewTrend = hourlyTrend(weatherData.hourly, 'dew_point', null);
+        // Wind bearing, degrees, meteorological "comes from" — the convention
+        // OWM reports and the normalized field keeps. The downwind flip the
+        // arrow draws happens once, later, at bake time.
+        this.windDirTrend = hourlyTrend(weatherData.hourly, 'wind_deg', normalizeBearing);
+        // API-sourced (no extra request); gated for consistency so "no feels
+        // selection" means no feels data anywhere.
+        this.feelsTrend = this.fetchFeels ? weatherData.hourly.map(function(entry) {
+            // units=imperial → already °F; a missing hour falls back to the
+            // actual temp so the series stays numeric (a feels of 0 °F is real).
+            return typeof entry.feels_like === 'number' ? entry.feels_like : entry.temp;
+        }) : [];
         this.startTime = weatherData.hourly[0].dt;
         this.currentTemp = weatherData.current.temp;
+        this.currentFeels = this.fetchFeels && typeof weatherData.current.feels_like === 'number'
+            ? weatherData.current.feels_like : null; // null → FEELS_CURRENT omitted, temp slot degrades
         onSuccess();
     }).bind(this), onFailure);
 };

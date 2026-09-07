@@ -1,4 +1,6 @@
 #include "chart.h"
+#include "bottom_view.h"
+#include "config.h"
 #include "hatch.h"
 #include "theme.h"
 
@@ -59,11 +61,11 @@ static inline int chart_clamp_count(const ChartRender *r, int count) {
 
 // Label placement constants — per-side/per-platform font-whitespace and
 // optical-centering geometry, in one place (the engine label convention).
+// emery derives its label boxes from the font tier inside chart_axis_label() below;
+// these constants are the 144 px arm only.
 #ifdef PBL_PLATFORM_EMERY
-    // emery: digits sit in the reserved strip below the axis row
-    #define CHART_LABEL_BOTTOM_DY   6
-    #define CHART_LABEL_BOTTOM_H   14
-    #define CHART_LABEL_NUDGE_X     0   // wide pitch: centered digit already sits on its column
+    // emery: wide pitch — the centered digit already sits on its column, no pull-back.
+    #define CHART_LABEL_NUDGE_X     0
 #else
     #define CHART_LABEL_BOTTOM_DY  (-4)  // GOTHIC_14 top-whitespace pull-up
     #define CHART_LABEL_BOTTOM_H   10
@@ -71,9 +73,67 @@ static inline int chart_clamp_count(const ChartRender *r, int count) {
                                          // right of its tick column — pull the box back so the
                                          // digit sits on the column. Permanent (the stage-2
                                          // "center on column" experiment misaligned on-device).
+    #define CHART_LABEL_TOP_RAISE  15
+    #define CHART_LABEL_TOP_H      14
 #endif
-#define CHART_LABEL_TOP_RAISE 15
-#define CHART_LABEL_TOP_H     14
+
+// Axis-label typography, resolved fresh on every axis render. On emery the "Larger
+// graph fonts" setting steps the hour digits up one tier (GOTHIC_14 -> 18) at runtime
+// from a settings apply with no relaunch, and config_get() is only valid after
+// config_load() -- so this must never be hoisted into a file-scope static or computed
+// once at init. On every other platform it constant-folds to today's values.
+typedef struct {
+    GFont font;
+    int   bottom_dy;
+    int   bottom_h;
+    int   top_raise;
+    int   top_h;
+} ChartAxisLabel;
+
+static ChartAxisLabel chart_axis_label(void) {
+#ifdef PBL_PLATFORM_EMERY
+    // emery: the only platform offering the toggle (schema.js gates the row on
+    // platform == 'emery') and the only one whose strips fit GOTHIC_18. The whole box
+    // derives from the tier's content height (== the Gothic nominal size,
+    // layers/layer_util.h) via the measured ink model (layers/status_metrics.h): ink
+    // occupies the box's BOTTOM cap-height rows, status_ink_top(content_h) ..
+    // content_h - 1. Two band-edge constraints then pin every field at ANY tier, with
+    // no per-tier tuning:
+    //   - bottom: the box bottom seats on the hour strip's last drawable row, axis_y +
+    //     AXIS_H + PAD - 1 (forecast/health pad their layer by BOTTOM_VIEW_BOTTOM_PAD),
+    //     so both tiers share one ink floor and a taller tier grows upward. The ink
+    //     onset that falls out, bottom_dy + status_ink_top = 18 - content_h/2, clears
+    //     the 6 px TICK_BIG emery draws under labeled slots (forecast_grid.c) at both
+    //     tiers (rows 11 / 9 below the axis).
+    //   - top: raise = content_h + 1 lands the last ink row 2 rows above the plot,
+    //     leaving exactly one blank row -- the tick row -- to the band bottom whatever
+    //     the band height (the radar's axis strip cancels out of the solve).
+    //     That cancellation is exactly why the radar DOES need a strip bump for the
+    //     taller tier: the box is seated against the PLOT top, so a taller tier grows
+    //     upward out of a fixed-height strip and into whatever sits above the radar.
+    //     rain_radar_layer.c's radar_axis_h() adds the tier's content-height step back.
+    //     Do not "simplify" that away as redundant -- it is what keeps the hour labels
+    //     off the status row in the compact views.
+    const bool large     = config_large_graph_font();
+    const int  content_h = large ? 18 : 14;
+    return (ChartAxisLabel){
+        .font      = fonts_get_system_font(large ? FONT_KEY_GOTHIC_18
+                                                 : FONT_KEY_GOTHIC_14),
+        .bottom_dy = (BOTTOM_VIEW_AXIS_H + BOTTOM_VIEW_BOTTOM_PAD) - content_h,
+        .bottom_h  = content_h,
+        .top_raise = content_h + 1,
+        .top_h     = content_h,
+    };
+#else
+    return (ChartAxisLabel){
+        .font      = fonts_get_system_font(FONT_KEY_GOTHIC_14),
+        .bottom_dy = CHART_LABEL_BOTTOM_DY,
+        .bottom_h  = CHART_LABEL_BOTTOM_H,
+        .top_raise = CHART_LABEL_TOP_RAISE,
+        .top_h     = CHART_LABEL_TOP_H,
+    };
+#endif
+}
 
 static void chart_draw_tick(const ChartRender *r, GraphSide side,
                             int len, GColor color, int x) {
@@ -90,23 +150,24 @@ static void chart_draw_tick(const ChartRender *r, GraphSide side,
 }
 
 static void chart_draw_axis_label(const ChartRender *r, GraphSide side,
-                                  const char *text, GFont font, int x) {
+                                  const char *text, const ChartAxisLabel *lbl, int x) {
     GRect box;
     if (side == GRAPH_SIDE_BOTTOM) {
         const int axis_y = r->outer.origin.y + r->outer.size.h - 1;
         box = GRect(x - 20 + CHART_LABEL_NUDGE_X,
-                    axis_y + CHART_LABEL_BOTTOM_DY, 40, CHART_LABEL_BOTTOM_H);
+                    axis_y + lbl->bottom_dy, 40, lbl->bottom_h);
     } else {
-        box = GRect(x - 20, r->outer.origin.y - CHART_LABEL_TOP_RAISE,
-                    40, CHART_LABEL_TOP_H);
+        box = GRect(x - 20, r->outer.origin.y - lbl->top_raise,
+                    40, lbl->top_h);
     }
-    graphics_draw_text(r->ctx, text, font, box,
+    graphics_draw_text(r->ctx, text, lbl->font, box,
                        GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
 }
 
 static void chart_render_axis(const ChartRender *r, const ChartAxisLayer *a) {
     graphics_context_set_text_color(r->ctx, theme_fg());
-    const GFont font     = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+    const ChartAxisLabel lbl = chart_axis_label();   // per draw call -- the emery
+                                                     // toggle flips without a relaunch
     const int  mid_shift = r->geo.slots.pitch / 2;
     for (int i = 0; i < r->def->num_slots; ++i) {
         const ChartAxisSlot *s = &a->slots[i];
@@ -119,7 +180,7 @@ static void chart_render_axis(const ChartRender *r, const ChartAxisLayer *a) {
                             base + (a->tick_align == ALIGN_MIDDLE ? mid_shift : 0));
         }
         if (s->label[0] != '\0') {
-            chart_draw_axis_label(r, a->side, s->label, font,
+            chart_draw_axis_label(r, a->side, s->label, &lbl,
                                   base + (a->label_align == ALIGN_MIDDLE ? mid_shift : 0));
         }
     }
@@ -212,13 +273,29 @@ static void chart_draw_bar_dots(const ChartRender *r, const ChartLineLayer *l) {
     const int   inner_h     = c.size.h - l->inset_top - l->inset_bottom;
     const int   range       = l->hi - l->lo;
     const int   w           = l->width;
-    // Height is hardcoded (not derived from width). On color a white dot is the dominant case
-    // (gust over colored bars) so it gets a shorter 2px cap; a dimmed gray dot (gust over white
-    // bars, where gray needs more presence) gets a 4px cap. 4 not 3: the top edge is cy - dot_h/2,
-    // and 2/2 and 3/2 both round to 1 — so a 3px cap shared the white cap's top and only grew 1px
-    // downward, reading as the same height. 4/2 = 2 raises the top a pixel too, so the taller gray
-    // cap actually shows. B&W is a fixed 3px.
-    const int   dot_h       = theme_is_bw() ? 3 : (gcolor_equal(l->color, theme_fg()) ? 2 : 4);
+    // Height is hardcoded (not derived from width), and keyed on how loud the dot's
+    // COLOR is — the watch is metric-agnostic, it only ever receives a color.
+    //
+    // ACHROMATIC (the theme foreground, or either gray) reads heavier than a hue at
+    // the same size, so it takes the short 2px cap: gust over colored bars, gust over
+    // white bars, and the feels-like shadow line all land here. HUED (uv magenta,
+    // wind yellow, pressure orange) needs the taller 4px cap to register.
+    //
+    // 4 not 3: the top edge is cy - dot_h/2, and 2/2 and 3/2 both round to 1 — so a
+    // 3px cap would share the short cap's top and grow only 1px downward, reading as
+    // the same height. 4/2 = 2 raises the top a pixel too, so the taller cap shows.
+    //
+    // B&W is a fixed 3px, and the color arm is compiled out rather than merely
+    // constant-folded: theme_pick/theme_is_bw exist so that no color GColor8 constant
+    // is referenced in a B&W image at all (theme.h).
+#ifdef PBL_COLOR
+    const bool  achromatic  = gcolor_equal(l->color, theme_fg())
+                              || gcolor_equal(l->color, GColorLightGray)
+                              || gcolor_equal(l->color, GColorDarkGray);
+    const int   dot_h       = theme_is_bw() ? 3 : (achromatic ? 2 : 4);
+#else
+    const int   dot_h       = 3;
+#endif
     graphics_context_set_fill_color(r->ctx, l->color);
     for (int i = 0; i < count; ++i) {
         if (l->values[i] <= l->lo) continue;           // value 0 → on the baseline, skip
@@ -421,11 +498,25 @@ static void chart_render_area(const ChartRender *r, const ChartAreaLayer *a) {
     GPoint *pts = a->export_points ? a->export_points : s_pts_scratch;
     const GRect c          = r->geo.content;
     const int  plot_bottom = c.origin.y + c.size.h;
+    // The contour shares CHART_LAYER_LINE's inset mapping (value==lo lands at
+    // plot_bottom - inset_bottom, value==hi at plot_top + inset_top) so a fill
+    // under an inset line hugs that line exactly; the fill itself still drops
+    // to the plot bottom below — the axis closes it, inset or not.
+#if defined(WW_CURVE_INSET)
+    const int  inset_bottom = a->inset_bottom;
+    const int  inner_h      = c.size.h - a->inset_top - inset_bottom;
+#else
+    // aplite: curve insets are compiled out (WW_CURVE_INSET, wscript) and no
+    // caller passes a nonzero area inset there — constant-fold the inset math
+    // away (every image byte counts against the aplite launch guard).
+    const int  inset_bottom = 0;
+    const int  inner_h      = c.size.h;
+#endif
     const int  range       = a->hi - a->lo;
     const int  range_safe  = range > 0 ? range : 1;
     for (int i = 0; i < count; ++i) {
-        const int h = (int)(((int32_t)(a->values[i] - a->lo) * c.size.h) / range_safe);
-        pts[i] = GPoint(chart_slot_tick_x(&r->geo, i), plot_bottom - h);
+        const int h = (int)(((int32_t)(a->values[i] - a->lo) * inner_h) / range_safe);
+        pts[i] = GPoint(chart_slot_tick_x(&r->geo, i), plot_bottom - h - inset_bottom);
     }
 
 #ifdef PBL_COLOR

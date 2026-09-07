@@ -16,6 +16,11 @@ void health_graph_layer_set_full_mode(bool full);
 
 Layer *health_graph_layer_get_root(void);
 
-void health_graph_layer_refresh(void);   // re-query health + mark dirty
+// Re-read the cache + mark dirty. The compute also re-reports the left-axis label
+// width into the SHARED strip (bottom_view.h, "wider of both"); bottom_view marks
+// both strip consumers dirty itself when the effective width moves, so callers owe
+// nobody a repaint. No width is reported on the loading path — holding the last
+// known width keeps the visible forecast's gutter still through a sliced rebuild.
+void health_graph_layer_refresh(void);
 
 void health_graph_layer_destroy(void);

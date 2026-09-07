@@ -1,6 +1,7 @@
 #include <string.h>
 
 #include "forecast_layer.h"
+#include "status_metrics.h"
 #include "c/appendix/persist.h"
 #include "c/appendix/config.h"
 #include "c/appendix/memory_log.h"
@@ -8,6 +9,7 @@
 #include "c/appendix/slot_geometry.h"
 #include "c/appendix/display_width.h"
 #include "c/appendix/chart.h"
+#include "c/appendix/hatch.h"
 #include "c/appendix/series.h"
 #include "c/appendix/forecast_grid.h"
 #include "c/appendix/bottom_view.h"
@@ -16,18 +18,59 @@
 #define TEMP_LABEL_PAD 2
 #define TEMP_LABEL_MEASURE_BOX_W 200
 #define TEMP_LABEL_MEASURE_BOX_H 40
-#define NIGHT_HATCH_SPACING (theme_is_bw() ? 7 : 6)
-#define NIGHT_HATCH_COLOR GColorDarkGray
-// bw-dark unchanged (GColorLightGray); bw-light swaps to GColorDarkGray — a
-// LightGray boundary line reads too faint against a white bw-light background.
-#define NIGHT_BOUNDARY_COLOR theme_pick(GColorDarkGray, theme_is_light() ? GColorDarkGray : GColorLightGray)
-// The night base/hatch/boundary for the FILLED area are derived per metric from
-// the day fill colour PKJS sent (night_area_palette_for_fill), so each metric
-// keeps its own hue at night. B&W has no range, so the night-area path draws White
-// over the LightGray fill (has_underlay gated to colour). The full-height night
-// hatch (no fill) uses NIGHT_HATCH_COLOR / NIGHT_BOUNDARY_COLOR above.
+// Base 6 on effectively-colour builds, 7 on B&W (a sparser dot pattern reads better
+// without hue to separate it), then scaled up for taller plots — see hatch.h.
+//
+// aplite: frozen at the unscaled base, so this feature costs the aplite image 0 bytes.
+// The image is already 356 B past the 21800 B launch-safety ceiling on main
+// (scripts/check-aplite-size.sh) and past the ~22058 B cliff where the firmware silently
+// refuses to launch, so aplite cannot afford the scaling arithmetic. Aplite therefore
+// keeps the tighter hatch in its taller presets; it has no rain radar, so the night hatch
+// is the only hatch it draws.
+#ifdef PBL_PLATFORM_APLITE
+#define NIGHT_HATCH_SPACING(plot_h) ((void)(plot_h), theme_is_bw() ? 7 : 6)
+#else
+#define NIGHT_HATCH_SPACING(plot_h) \
+    hatch_stride_scaled(theme_is_bw() ? 7 : 6, HATCH_BASE_PLOT_H, (plot_h))
+#endif
+// Every night colour — the full-height hatch and dusk/dawn line as well as the
+// filled area's base/hatch/boundary triple — is resolved PHONE-side now
+// (line-style.js resolveNightColors) and reaches the watch as the NIGHT_COLORS
+// blob (layout in persist.h), read into s_night_ink below. Left on Auto the
+// phone sends exactly what this file used to hardcode, so the render is
+// unchanged. The B&W arms still live here, in the theme_pick() calls at the two
+// call sites: B&W has no range, so the night-area path draws the theme fg over
+// the LightGray fill (has_underlay gated to colour), and the full-height
+// dusk/dawn line keeps its polarity swap (bw-dark LightGray; bw-light DarkGray —
+// a LightGray boundary reads too faint against a white bw-light background).
 #define FORECAST_TREND_FULL_SCALE 250  // uint8 wire range (PKJS sends 0..250)
 #define DAY_SECONDS (24 * 60 * 60)
+
+// Named indices into the NIGHT_COLORS blob the phone resolved (canonical layout
+// in persist.h). Declared OUTSIDE the PBL_COLOR guard deliberately: on a B&W
+// build NIGHT_C(i) expands to a constant that leaves its argument unexpanded, so
+// an enum hidden inside the guard would still appear to compile there and would
+// break the day a name reached an evaluated position. Enumerators occupy no
+// image bytes, so naming these costs aplite nothing.
+enum night_ink {
+    NIGHT_INK_HATCH = 0,      // full-height night hatch
+    NIGHT_INK_BOUNDARY,       // full-height dusk/dawn line
+    NIGHT_INK_AREA_BASE,      // filled area's night underlay
+    NIGHT_INK_AREA_HATCH,     // filled area's night hatch
+    NIGHT_INK_AREA_BOUNDARY,  // filled area's dusk/dawn line
+    NIGHT_INK_FLAGS           // bit 0 = NIGHT_FLAG_FILL_EXPLICIT — no longer read
+};
+
+// B&W builds never read the blob — theme_pick() is the macro `(bw_arm)` there
+// (theme.h) and has_underlay is false — so both the load and the store compile
+// out entirely and NIGHT_C() expands to a constant that is never evaluated. That
+// is what keeps this feature free on aplite.
+#if defined(PBL_COLOR)
+static uint8_t s_night_ink[NIGHT_COLOR_BYTES];
+#define NIGHT_C(i) ((GColor){ .argb = s_night_ink[(i)] })
+#else
+#define NIGHT_C(i) GColorWhite
+#endif
 
 // Chart config: frame + ticks + slots in one block. Two variants because
 // the axis colour tracks the night-overlay state — orange (or theme_fg() on
@@ -69,16 +112,40 @@ static void load_dataset(ForecastDataset *ds) {
     ds->num_entries = n;
     ds->forecast_start = persist_get_forecast_start();
 
+    // The temp axis owns the vertical inset: feels-like shares the temp curve's
+    // (configurable) offset so the two series scaled against one band land
+    // pixel-aligned, while every other metric keeps the full-height mapping.
+    // The watch stays metric-agnostic — the phone decides, sending three
+    // render-ready per-series px values (CLAY_CURVE_INSET_UINT8 → persist).
+#if defined(WW_CURVE_INSET)
+    uint8_t curve_insets[CURVE_INSET_BYTES];
+    persist_get_curve_insets(curve_insets);
+#else
+    // aplite: frozen constants — temp keeps its fixed 7 px inset, the metric
+    // channels map full-height (the exact pre-feature rendering); feels-like
+    // is not offered there. Plain const (not static) so the constant-indexed
+    // reads fold to immediates and the array itself is elided.
+    const uint8_t curve_insets[3] = { BOTTOM_VIEW_PRIMARY_LINE_INSET_Y, 0, 0 };
+#endif
+
+    // Same read-persist-inline cadence as the insets above: load_dataset runs at
+    // the top of every paint, so the night colours are always the last ones the
+    // phone sent. B&W builds never reference s_night_ink, so this compiles out.
+#if defined(PBL_COLOR)
+    persist_get_night_colors(s_night_ink);
+#endif
+
     ds->series[SERIES_FIRST] = (Series){
         .id = SERIES_FIRST, .kind = SERIES_KIND_LINE, .present = (n > 0),
         .line = { .color = theme_pick(GColorRed, theme_fg()),
-                  .width = 3, .inset_y = BOTTOM_VIEW_PRIMARY_LINE_INSET_Y } };
+                  .width = 3, .inset_y = curve_insets[SERIES_FIRST] } };
 
     ds->series[SERIES_SECOND] = (Series){
         .id = SERIES_SECOND, .kind = SERIES_KIND_LINE,
         .present = persist_series_present(SERIES_SECOND),
         .line = { .color      = persist_get_line_color(),   // raw stroke — SDK reduces on B&W
                   .width      = 1,
+                  .inset_y    = curve_insets[SERIES_SECOND],
                   .fill_on    = persist_get_line_fill(),
                   .fill_color = persist_get_fill_color() } };  // raw per-metric fill — SDK reduces on B&W
 
@@ -87,6 +154,7 @@ static void load_dataset(ForecastDataset *ds) {
         .present = persist_series_present(SERIES_THIRD),
         .line = { .color  = persist_get_third_line_color(),   // raw per-metric — SDK reduces on B&W
                   .width  = FORECAST_GRID_BAR_W,   // dots match the rain-bar columns
+                  .inset_y = curve_insets[SERIES_THIRD],
                   .dotted = true } };
 
     ds->series[SERIES_BARS] = (Series){
@@ -248,22 +316,6 @@ static int build_night_bands(ChartBand *out, int max,
     return n;
 }
 
-typedef struct { GColor base, hatch, boundary; } NightAreaPalette;
-
-// Night base/hatch/boundary for the filled area, keyed on the day fill colour PKJS sent.
-// Used only on colour platforms (B&W draws White via the has_underlay/hatch gates). The
-// eight dark- and light-theme day fills (4 metrics x 2 polarities) are distinct GColor8
-// values, so equality keys them; precip (dark) is the default.
-static NightAreaPalette night_area_palette_for_fill(GColor fill) {
-    if (gcolor_equal(fill, GColorArmyGreen)) { return (NightAreaPalette){ GColorArmyGreen, GColorLimerick, GColorLimerick }; }      // wind (dark)
-    if (gcolor_equal(fill, GColorPurple))    { return (NightAreaPalette){ GColorImperialPurple, GColorPurple, GColorVividViolet }; } // uv (dark)
-    if (gcolor_equal(fill, GColorDarkGray))  { return (NightAreaPalette){ GColorDarkGray, GColorLightGray, GColorLightGray }; }      // gust (dark)
-    // Light-theme fills (Celeste/Inchworm/ShockingPink/LightGray) never reach this
-    // table: light (color) polarity skips the night_under layer entirely — the fill
-    // keeps its day color under the night overlay (see the call site).
-    return (NightAreaPalette){ GColorDukeBlue, GColorBlue, GColorVividCerulean };                                                    // precip (dark) / default
-}
-
 static GSize temp_label_string_size(const char *text);
 
 static void draw_left_axis(GContext *ctx, int h) {
@@ -276,25 +328,34 @@ static void draw_left_axis(GContext *ctx, int h) {
     graphics_fill_rect(ctx, GRect(0, 0, inset_w, h - BOTTOM_VIEW_AXIS_H), 0, GCornerNone);
 
     graphics_context_set_text_color(ctx, theme_fg());
+    const GFont font = bottom_view_label_font();
     GSize hi_size = temp_label_string_size(s_buffer_hi);
     GSize lo_size = temp_label_string_size(s_buffer_lo);
     const int16_t axis_y = h - BOTTOM_VIEW_AXIS_H;
 #ifdef PBL_PLATFORM_EMERY
-    // emery: top label sits flush at the strip top.
-    const int hi_y = 0;
+    // emery: pin the hi label's FIRST INK ROW where GOTHIC_18 has always put it (its
+    // box flush at 0, ink on row 7), whatever tier bottom_view_label_font() resolves: a
+    // taller tier only carries more top whitespace (status_ink_top -- and hi_size.h IS
+    // its content height, measured with the same font), so the box shifts up by the
+    // difference and the on-screen ink row is pixel-identical. At GOTHIC_24 in the
+    // tightest band -- 68 px, the fullCal DEFAULT view and every compactDense view
+    // (test/c/layout_test.c emery goldens) -- the shifted hi box also clears the lo box,
+    // and the INK stays 11 rows apart. Deliberately NO band-height font fallback: 68 px
+    // is the default view, so dropping back to GOTHIC_18 there would erase the feature
+    // exactly where it is most seen.
+    const int hi_y = status_ink_top(18) - status_ink_top(hi_size.h);
 #else
     const int hi_y = -3;  // GOTHIC_18 top-whitespace pull-up
 #endif
     // Min label is bottom-anchored (just above the x-axis baseline) so it tracks
     // the forecast band height across every top-view mode (full/compact/none)
-    // instead of floating at a fixed offset.
+    // instead of floating at a fixed offset. It adapts to the font by itself --
+    // lo_size.h is measured with the same font that draws it.
     const int lo_y = axis_y - lo_size.h - 2;
-    graphics_draw_text(ctx, s_buffer_hi,
-                       fonts_get_system_font(FONT_KEY_GOTHIC_18),
+    graphics_draw_text(ctx, s_buffer_hi, font,
                        GRect(0, hi_y, strip_w, hi_size.h),
                        GTextOverflowModeFill, GTextAlignmentRight, NULL);
-    graphics_draw_text(ctx, s_buffer_lo,
-                       fonts_get_system_font(FONT_KEY_GOTHIC_18),
+    graphics_draw_text(ctx, s_buffer_lo, font,
                        GRect(0, lo_y, strip_w, lo_size.h),
                        GTextOverflowModeFill, GTextAlignmentRight, NULL);
 }
@@ -376,6 +437,8 @@ static void forecast_update_proc(Layer *layer, GContext *ctx)
     }
     const GColor axis_color = night_on ? FORECAST_AXIS_COLOR_NIGHT
                                        : BOTTOM_VIEW_AXIS_COLOR;
+    // One division per redraw, not per hatch layer: both night layers share the stride.
+    const int night_hatch_spacing = NIGHT_HATCH_SPACING(h - BOTTOM_VIEW_AXIS_H);
 
     int bar_num_stops = 0;
     const ChartColorStop *bar_stops = palette_bar_stops(&bar_num_stops);
@@ -404,23 +467,31 @@ static void forecast_update_proc(Layer *layer, GContext *ctx)
         layers[n++] = (ChartLayer){ CHART_LAYER_AREA, .area = {
             .values = second->line.values, .export_points = area_pts,
             .count = ds.num_entries, .lo = 0, .hi = FORECAST_TREND_FULL_SCALE,
+#if defined(WW_CURVE_INSET)
+            // The fill's contour must share the line's inset mapping (feels-like
+            // as Main metric can now draw filled AND inset); the line-over-fill
+            // and the night re-hatch reuse these exported points, so all three
+            // follow. aplite: insets are compile-time constants there and the
+            // area engine skips the inset math, so nothing to pass.
+            .inset_top = second->line.inset_y, .inset_bottom = second->line.inset_y,
+#endif
             .fill_color = second->line.fill_color } };
     }
     // night_under re-shades the filled area, so it needs the AREA layer's
-    // exported contour and only runs when the fill is present. Light (color)
-    // polarity skips it entirely: the fill keeps its day color under the night
-    // overlay (no darker re-shade — user-tuned), and night_over's dots alone
-    // carry the night marking. bw themes keep it (its fg hatch dots below the
-    // contour are B&W's night texture; the underlay is color-only anyway), and
-    // on B&W builds theme_is_bw() is constant-true so the skip compiles out.
-    if (night_on && fill_on && !(theme_is_light() && !theme_is_bw())) {
-        const NightAreaPalette np = night_area_palette_for_fill(second->line.fill_color);
+    // exported contour and only runs when the fill is present. Both polarities
+    // re-shade: light used to skip this entirely, because the built-in triples
+    // were tuned for dark grounds and re-shading a light fill with them muddied
+    // it. line-style.js now carries a light arm of NIGHT_AREA_COLORS tuned on
+    // hardware, so the reason for the skip is gone and light paints like dark.
+    // bw themes were never skipped (their fg hatch dots below the contour are
+    // B&W's night texture; the underlay is color-only anyway).
+    if (night_on && fill_on) {
         layers[n++] = (ChartLayer){ CHART_LAYER_HATCH, .hatch = {
             .bands = night_bands, .num_bands = num_night_bands,
-            .hatch_color    = theme_pick(np.hatch, theme_fg()),
-            .boundary_color = theme_pick(np.boundary, theme_fg()),
-            .spacing        = NIGHT_HATCH_SPACING,
-            .underlay_color = np.base,
+            .hatch_color    = theme_pick(NIGHT_C(NIGHT_INK_AREA_HATCH), theme_fg()),
+            .boundary_color = theme_pick(NIGHT_C(NIGHT_INK_AREA_BOUNDARY), theme_fg()),
+            .spacing        = night_hatch_spacing,
+            .underlay_color = NIGHT_C(NIGHT_INK_AREA_BASE),
             .has_underlay   = !theme_is_bw(),
             .contour        = area_pts, .contour_count = ds.num_entries } };
     }
@@ -428,9 +499,10 @@ static void forecast_update_proc(Layer *layer, GContext *ctx)
     if (night_on) {
         layers[n++] = (ChartLayer){ CHART_LAYER_HATCH, .hatch = {
             .bands = night_bands, .num_bands = num_night_bands,
-            .hatch_color    = theme_pick(NIGHT_HATCH_COLOR, theme_fg()),
-            .boundary_color = NIGHT_BOUNDARY_COLOR,
-            .spacing        = NIGHT_HATCH_SPACING,
+            .hatch_color    = theme_pick(NIGHT_C(NIGHT_INK_HATCH), theme_fg()),
+            .boundary_color = theme_pick(NIGHT_C(NIGHT_INK_BOUNDARY),
+                                         theme_is_light() ? GColorDarkGray : GColorLightGray),
+            .spacing        = night_hatch_spacing,
             .contour        = NULL } };
     }
     // Attach the scaled rain-tier palette to the BARS series (computed above).
@@ -495,7 +567,7 @@ static void forecast_update_proc(Layer *layer, GContext *ctx)
 
 static GSize temp_label_string_size(const char *text)
 {
-    const GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_18);
+    const GFont font = bottom_view_label_font();
     const GRect box = GRect(0, 0, TEMP_LABEL_MEASURE_BOX_W, TEMP_LABEL_MEASURE_BOX_H);
     return graphics_text_layout_get_content_size(text, font, box, GTextOverflowModeFill,
                                                  GTextAlignmentRight);
@@ -526,6 +598,9 @@ void forecast_layer_create(Layer *parent_layer, GRect frame)
 {
     s_forecast_layer = layer_create(frame);
     layer_set_update_proc(s_forecast_layer, forecast_update_proc);
+    // Registered before the first report below, so a width change repaints this
+    // layer from then on (shared strip, bottom_view.h).
+    bottom_view_register_consumer(s_forecast_layer);
     text_labels_refresh();
     layer_add_child(parent_layer, s_forecast_layer);
     MEMORY_LOG_HEAP("after_forecast_layer_create");
@@ -546,6 +621,7 @@ void forecast_layer_refresh()
 void forecast_layer_destroy()
 {
     MEMORY_LOG_HEAP("forecast_layer_destroy:before");
+    bottom_view_unregister_consumer(s_forecast_layer);
     layer_destroy(s_forecast_layer);
     MEMORY_LOG_HEAP("forecast_layer_destroy:after");
 }

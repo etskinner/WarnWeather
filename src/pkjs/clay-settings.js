@@ -1,24 +1,144 @@
 // src/pkjs/clay-settings.js
 //
 // Owner of the 'clay-settings' localStorage blob: read/save, defaults, seed,
-// dev-config apply, fixture apply, and the weekend/holiday color migration.
-// localStorage is the ambient PKJS global; tests inject a fake before require.
+// dev-config apply, fixture apply. localStorage is the ambient PKJS global; tests
+// inject a fake before require.
+//
+// The marker-gated migration ledger lives in clay-migrations.js and reads/writes
+// through here. The dependency is one-way BY DESIGN — this module must never require
+// it back, or the two form a cycle and the owner starts growing with the ledger again
+// (which is what put this file near 1000 lines). test/clay-migrations.test.js pins it.
 
 var settings = require('./settings');
-var platformLib = require('./config-ui/lib/platform.js');   // isHrPlatform (emery + diorite)
+var KEYS = require('./storage-keys');
 
 var STORAGE_KEY = 'clay-settings';
 
+// Credentials "Reset watchface" deliberately KEEPS. The reset is about the face;
+// making someone dig out an API key again — one they may have paid for, or waited
+// on an activation email for — is a different and far more annoying kind of reset
+// than the one they asked for. The Weather Underground key is scraped rather than
+// typed and already lives outside the blob (KEYS.WU_API_KEY), so it is preserved
+// separately below.
+var PRESERVED_SETTING_KEYS = ['owmApiKey', 'yandexApiKey', 'tomorrowioApiKey'];
+
 /**
- * Wipe ALL phone-side PKJS localStorage — the settings blob and every cache /
- * migration-marker key — for a full "Reset watchface" fresh start. The next
- * boot then follows the first-install path (defaults seeded, migrations run
- * once, wizard reopens), so there is nothing pre-migrated to double-apply.
+ * Wipe phone-side PKJS localStorage — the settings blob and every cache /
+ * migration-marker key — for a "Reset watchface" fresh start. The next boot then
+ * follows the first-install path (defaults seeded, migrations run once, wizard
+ * reopens), so there is nothing pre-migrated to double-apply.
  *
- * @returns {void}
+ * The exception is PRESERVED_SETTING_KEYS plus the scraped Weather Underground
+ * key: see the note there for why credentials survive a reset.
+ *
+ * @returns {Object} The preserved credentials, so the caller can keep the live
+ *   in-memory settings usable until the next boot re-seeds them.
  */
 function resetAll() {
+    var blob = read() || {};
+    var keep = {};
+    var kept = false;
+    var wuKey = localStorage.getItem(KEYS.WU_API_KEY);
+    var i;
+    var k;
+    for (i = 0; i < PRESERVED_SETTING_KEYS.length; i++) {
+        k = PRESERVED_SETTING_KEYS[i];
+        if (blob[k]) { keep[k] = blob[k]; kept = true; }
+    }
+    // Backstop, not the primary path: every wired save runs fillFromPreserved
+    // first (index.js webviewclosed), which consumes any parked slot into the
+    // blob — so this normally finds nothing. It stands so resetAll ALONE upholds
+    // "a reset never destroys the parked keys" for any save path that skips the
+    // fill: a second reset in one session would otherwise localStorage.clear()
+    // the only remaining copy. Fill-only, so a key in the blob (typed, or filled
+    // by the save) wins over its parked predecessor.
+    if (restorePreserved(keep)) { kept = true; }
     localStorage.clear();
+    // The settings blob itself must stay ABSENT: the wizard only reopens for a
+    // config with no keys at all, so putting the kept credentials straight back
+    // would silently skip the first-time setup this reset promises. They wait in
+    // their own entry instead, and seedDefaults folds them into the fresh blob on
+    // the next boot. The WU key never lived in the blob, so it just goes back.
+    if (kept) { localStorage.setItem(KEYS.PRESERVED_KEYS_KEY, JSON.stringify(keep)); }
+    if (wuKey) { localStorage.setItem(KEYS.WU_API_KEY, wuKey); }
+    return keep;
+}
+
+/**
+ * The credentials parked by resetAll(), or null when none/malformed. Read-only:
+ * dropping the slot (good parking after a restore, malformed parking always) is
+ * restorePreserved's job — every consumer of the slot goes through it.
+ *
+ * @returns {?Object} Parked key -> value map.
+ */
+function readParked() {
+    var raw = localStorage.getItem(KEYS.PRESERVED_KEYS_KEY);
+    var parsed;
+    if (!raw) { return null; }
+    try {
+        parsed = JSON.parse(raw);
+    } catch (ex) {
+        return null;
+    }
+    // Only a plain object is a parking slot the app could have written; a
+    // JSON-valid string/array (storage corruption) would otherwise be for-in
+    // iterated into junk index keys downstream.
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { return null; }
+    return parsed;
+}
+
+/**
+ * Fill a settings blob's EMPTY credential fields from the parked slot — the live
+ * session's counterpart to the boot-time restore below. Between a reset and the
+ * next boot the page hydrates from an absent blob, so a save from it carries ''
+ * for every key the user did not retype; persisting that '' would leave fetches
+ * failing on an empty key until the next PKJS boot folds the parked copy back.
+ * Fill-only (a typed key always wins), and the slot is CONSUMED: from this save
+ * on the blob holds the keys and the reopened page shows them, so an '' arriving
+ * later is the user deliberately clearing a field — a still-live slot would
+ * refill it and permanently reinstate a removed credential. (A reset-save is
+ * safe with that: resetAll parks from the just-filled blob afterwards.)
+ *
+ * @param {Object} blob Parsed settings response (mutated and returned).
+ * @returns {Object} The same blob, empty credential fields filled.
+ */
+function fillFromPreserved(blob) {
+    if (blob) { restorePreserved(blob); }
+    return blob;
+}
+
+/**
+ * Fold any credentials parked by resetAll() into a settings object, and drop the
+ * parking slot once they are safely in — THE consumer of the slot: the boot-time
+ * seedDefaults restore, the live-session fillFromPreserved, and resetAll's
+ * backstop all merge through here. Missing/malformed parking restores nothing
+ * (and the malformed slot is dropped).
+ *
+ * @param {Object} target Settings object to merge into (mutated).
+ * @returns {boolean} True when something was restored.
+ */
+function restorePreserved(target) {
+    var parked = readParked();
+    var restored = false;
+    var i;
+    var k;
+    if (parked) {
+        for (i = 0; i < PRESERVED_SETTING_KEYS.length; i++) {
+            k = PRESERVED_SETTING_KEYS[i];
+            // FILL ONLY — never overwrite. Between the reset and this merge the user
+            // may well have typed a NEW key (that is the likeliest thing to do right
+            // after a reset), and clobbering it with the parked one is invisible: the
+            // settings page's Test button passes against what they typed, then the
+            // next boot restores the old key underneath them and every fetch is
+            // rejected.
+            if (parked[k] && !target[k]) {
+                target[k] = parked[k];
+                restored = true;
+            }
+        }
+    }
+    localStorage.removeItem(KEYS.PRESERVED_KEYS_KEY);
+    return restored;
 }
 
 /**
@@ -101,6 +221,9 @@ function seedDefaults(colors) {
     var prop;
     if (persistClayString === null) {
         console.log('No clay settings found, setting defaults');
+        // Credentials a reset deliberately kept ride back in here, on the first
+        // boot after the wipe -- this is the branch that boot takes.
+        restorePreserved(defaults);
         save(defaults);
         return;
     }
@@ -110,6 +233,7 @@ function seedDefaults(colors) {
     }
     catch (ex) {
         console.log('Malformed clay settings found, resetting defaults');
+        restorePreserved(defaults);
         save(defaults);
         return;
     }
@@ -122,212 +246,10 @@ function seedDefaults(colors) {
             persistClay[prop] = defaults[prop];
         }
     }
+    // A settings save between the reset and this boot leaves a non-empty blob, so
+    // the branch above never ran; the credentials are still parked and belong here.
+    restorePreserved(persistClay);
     save(persistClay);
-}
-
-/**
- * Shared preamble for the marker-gated migrations: load the stored blob to
- * migrate, or return null to skip when nothing is stored, the migration has
- * already run, or the blob is malformed (logged once, tolerated).
- *
- * @param {Function} isMigrationDone Returns true when the migration marker is set.
- * @param {string} label Migration name, used in the malformed-blob log line.
- * @returns {Object|null} Parsed settings to migrate, or null to skip.
- */
-function loadForMigration(isMigrationDone, label) {
-    var persistClayString = localStorage.getItem(STORAGE_KEY);
-
-    if (persistClayString === null || isMigrationDone()) {
-        return null;
-    }
-
-    try {
-        return JSON.parse(persistClayString);
-    }
-    catch (ex) {
-        console.log('Malformed clay settings found, skipping ' + label);
-        return null;
-    }
-}
-
-/**
- * Move existing installs from the old all-white weekend/holiday defaults to the
- * current highlighted default while preserving any customized color set.
- *
- * @param {{white: number, folly: number, holiday: number}} colors Default color constants.
- * @param {Function} isMigrationDone Returns true when the migration marker is set.
- * @param {Function} markDone Records the migration as complete.
- * @returns {boolean} True when the migrated settings should be sent to the watch.
- */
-function migrateWeekendHolidayColors(colors, isMigrationDone, markDone) {
-    var persistClay = loadForMigration(isMigrationDone, 'weekend/holiday color migration');
-
-    if (persistClay === null) {
-        return false;
-    }
-
-    if (
-        persistClay.colorSunday === colors.white &&
-        persistClay.colorSaturday === colors.white &&
-        persistClay.colorUSFederal === colors.white
-    ) {
-        persistClay.colorSunday = colors.folly;
-        persistClay.colorSaturday = colors.folly;
-        persistClay.colorUSFederal = colors.holiday;
-        save(persistClay);
-        console.log('Migrated weekend/holiday color defaults to Folly/Blue Moon');
-        return true;
-    }
-
-    if (
-        persistClay.colorSunday === colors.folly &&
-        persistClay.colorSaturday === colors.folly &&
-        persistClay.colorUSFederal === colors.holiday
-    ) {
-        return true;
-    }
-
-    markDone();
-    return false;
-}
-
-/**
- * Migrate installs that used white as the holiday "off" flag onto the
- * Holiday highlight toggle. White was the old way to disable holiday
- * highlighting; the toggle now owns on/off and white is no longer a
- * selectable holiday color, so a stored white means "user wanted off".
- * Preserve that intent (holidaysEnabled = false) and reset the color to a
- * valid default for when they re-enable.
- *
- * @param {{white: number, folly: number, holiday: number}} colors Default color constants.
- * @param {Function} isMigrationDone Returns true when the migration marker is set.
- * @param {Function} markDone Records the migration as complete.
- * @returns {boolean} True when the migrated settings should be sent to the watch.
- */
-function migrateHolidayWhiteToToggle(colors, isMigrationDone, markDone) {
-    var persistClay = loadForMigration(isMigrationDone, 'holiday highlight migration');
-
-    if (persistClay === null) {
-        return false;
-    }
-
-    if (persistClay.colorUSFederal === colors.white) {
-        persistClay.holidaysEnabled = false;
-        persistClay.colorUSFederal = colors.holiday;
-        save(persistClay);
-        console.log('Migrated white holiday color to Holiday highlight toggle off');
-        return true;
-    }
-
-    markDone();
-    return false;
-}
-
-/**
- * Collapse the six per-country holidayRegion<CC> keys into the single holidayRegion
- * key, adopting the value for the currently-selected country. One-time; marker-gated.
- *
- * @param {Function} isMigrationDone Returns true when the migration marker is set.
- * @param {Function} markDone Records the migration as complete.
- * @returns {void}
- */
-function migrateHolidayRegionKeys(isMigrationDone, markDone) {
-    var persistClay = loadForMigration(isMigrationDone, 'holidayRegion key migration');
-    var oldKeys = ['holidayRegionDE', 'holidayRegionAT', 'holidayRegionCH', 'holidayRegionES', 'holidayRegionGB', 'holidayRegionUS'];
-    var oldKey;
-    var i;
-
-    if (persistClay === null) {
-        return;
-    }
-
-    oldKey = 'holidayRegion' + persistClay.holidayCountry;
-    if (persistClay[oldKey] && (typeof persistClay.holidayRegion === 'undefined' || persistClay.holidayRegion === 'all')) {
-        persistClay.holidayRegion = persistClay[oldKey];
-    }
-    for (i = 0; i < oldKeys.length; i += 1) {
-        if (Object.prototype.hasOwnProperty.call(persistClay, oldKeys[i])) {
-            delete persistClay[oldKeys[i]];
-        }
-    }
-    if (typeof persistClay.holidayRegion === 'undefined') {
-        persistClay.holidayRegion = 'all';
-    }
-    save(persistClay);
-    markDone();
-}
-
-/**
- * One-time upgrade of the seeded health-line defaults to the HR-capable
- * triple (emery + diorite) (steps/sleep/hr). Only rewrites slots still
- * holding the static defaults, so a user's explicit choice is never clobbered.
- * @param {string} platform watch platform name ('emery', 'basalt', ...)
- * @param {function(): boolean} isMigrationDone marker probe
- * @param {function()} markDone marker setter
- */
-function migrateStatusLineHealthDefaults(platform, isMigrationDone, markDone) {
-    var persistClay = loadForMigration(isMigrationDone, 'status line health defaults');
-    if (persistClay === null) { return; }
-    if (platformLib.isHrPlatform(platform)
-            && persistClay.statusHealthLeft === 'steps'
-            && persistClay.statusHealthMid === 'empty'
-            && persistClay.statusHealthRight === 'sleep') {
-        persistClay.statusHealthMid = 'sleep';
-        persistClay.statusHealthRight = 'hr';
-        save(persistClay);
-        console.log('Migrated health status line to HR-capable defaults');
-    }
-    markDone();
-}
-
-/**
- * One-time migration: existing installs stored statusTopRight = 'empty' while
- * old builds always drew the fixed battery corner. The corner is now the
- * top-right slot (default 'battery'), so a stored 'empty' would hide the
- * battery on upgrade — map it to 'battery'. A user's explicit non-empty choice
- * is left alone.
- * @param {function(): boolean} isMigrationDone marker probe
- * @param {function()} markDone marker setter
- * @returns {void}
- */
-function migrateStatusTopRightBattery(isMigrationDone, markDone) {
-    var persistClay = loadForMigration(isMigrationDone, 'top-right battery slot');
-    if (persistClay === null) { return; }
-    if (persistClay.statusTopRight === 'empty') {
-        persistClay.statusTopRight = 'battery';
-        save(persistClay);
-        console.log('Migrated top-right slot empty -> battery');
-    }
-    markDone();
-}
-
-/**
- * One-time migration onto the radarMode tiered setting. Existing installs that
- * disabled radar via radarProvider:'disabled' map to radarMode:'off' and get
- * their now-invalid provider rewritten to a real default (the Off option was
- * removed from the provider picker). Every other existing install that has no
- * radarMode yet initializes to 'graph' (full radar — the prior default-on
- * behavior). Marker-gated; only touches what needs correcting.
- * @param {string} defaultRadarProvider Provider to adopt when clearing 'disabled' (e.g. 'rainbow').
- * @param {function(): boolean} isMigrationDone marker probe
- * @param {function()} markDone marker setter
- * @returns {void}
- */
-function migrateRadarProviderToMode(defaultRadarProvider, isMigrationDone, markDone) {
-    var persistClay = loadForMigration(isMigrationDone, 'radar view mode');
-    if (persistClay === null) { return; }
-    if (persistClay.radarProvider === 'disabled') {
-        persistClay.radarMode = 'off';
-        persistClay.radarProvider = defaultRadarProvider;
-        save(persistClay);
-        console.log('Migrated radarProvider=disabled -> radarMode=off');
-    }
-    else if (typeof persistClay.radarMode === 'undefined') {
-        persistClay.radarMode = 'graph';
-        save(persistClay);
-        console.log('Initialized radarMode=graph for existing radar install');
-    }
-    markDone();
 }
 
 /**
@@ -341,12 +263,24 @@ function applyDevConfig(devConfig) {
     var persistClay;
     var prop;
 
+    // Every dev-config key that is CONSUMED at boot rather than being a Clay
+    // setting. A key missing here is copied into the persisted settings blob
+    // and stays there forever (four had already leaked: the update-check trio
+    // and the phone-battery fake). When adding a boot-only dev key, add it to
+    // its consumer AND here — the drift test in clay-settings.test.js pins the
+    // known consumers' keys against this list.
     var localOnlyDevConfigKeys = {
         clearPkjsStorageOnBoot: true,
         forceShowReleaseNotificationOnBoot: true,
         maxNotifiedVersion: true,
         resetV134WeekendHolidayColorMigration: true,
         resetV140HolidayRegionKeyMigration: true,
+        // index.js's update-check runner (boot/tick only):
+        resetUpdateNotifiedVersion: true,
+        forceUpdateCheckOnBoot: true,
+        overrideLatestStoreVersions: true,
+        // phone-battery.js's dev fake reading:
+        devPhoneBattery: true
     };
 
     persistClay = read();
@@ -435,17 +369,16 @@ function normalizeFixtureColor(value, colorMap) {
 module.exports = {
     read: read,
     save: save,
+    // The blob's storage key, exported for clay-migrations.js — its loadForMigration
+    // reads the raw string to tell "nothing stored" from "malformed". A shipped
+    // storage key: never change the string.
+    STORAGE_KEY: STORAGE_KEY,
     resetAll: resetAll,
+    fillFromPreserved: fillFromPreserved,
     shouldReset: shouldReset,
     hasStored: hasStored,
     getDefaults: getDefaults,
     seedDefaults: seedDefaults,
     applyDevConfig: applyDevConfig,
-    applyFixtureSettings: applyFixtureSettings,
-    migrateWeekendHolidayColors: migrateWeekendHolidayColors,
-    migrateHolidayWhiteToToggle: migrateHolidayWhiteToToggle,
-    migrateHolidayRegionKeys: migrateHolidayRegionKeys,
-    migrateStatusLineHealthDefaults: migrateStatusLineHealthDefaults,
-    migrateStatusTopRightBattery: migrateStatusTopRightBattery,
-    migrateRadarProviderToMode: migrateRadarProviderToMode
+    applyFixtureSettings: applyFixtureSettings
 };

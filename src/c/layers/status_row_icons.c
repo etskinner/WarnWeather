@@ -123,6 +123,22 @@ static uint32_t icon_resource(uint8_t icon_id) {
         case STATUS_ICON_AQI: return RESOURCE_ID_STATUS_AQI;   // weather metric, all providers
         case STATUS_ICON_POLLEN: return RESOURCE_ID_STATUS_POLLEN;
         case STATUS_ICON_COUNTDOWN: return RESOURCE_ID_STATUS_COUNTDOWN;
+        // Dew point is a temperature, so the droplets glyph is the only thing that
+        // tells it apart from the temperature slot beside it.
+        case STATUS_ICON_DEWPOINT: return RESOURCE_ID_STATUS_DEW;
+        // The PHONE's charge, not the watch's. Two ids for one catalog item: the
+        // phone picks CHG over the plain id at bake time, so the charging state
+        // costs no wire field and no logic here — it is just a different resource.
+        case STATUS_ICON_PHONE_BATTERY: return RESOURCE_ID_STATUS_PHONE_BATTERY;
+        case STATUS_ICON_PHONE_BATTERY_CHG: return RESOURCE_ID_STATUS_PHONE_BATTERY_CHG;
+        // PRESSURE and PHONE_BATTERY_PLAIN are text-only by contract
+        // (status_line.h) — no PDC resource exists for either and none may load.
+        // Returning 0 makes status_row_icons_load() answer NULL, so the slot
+        // reserves ZERO icon width and renders as bare text; the id survives only
+        // to give the no-icon variant a ThreshKind of its own. Belt and braces:
+        // the draw site (status_row.c ensure_glyphs) never asks for them anyway.
+        case STATUS_ICON_PRESSURE: return 0;
+        case STATUS_ICON_PHONE_BATTERY_PLAIN: return 0;
 #if defined(PBL_HEALTH)
         // Distance is a HealthService metric (steps → distance), so it lives with the
         // other health glyphs: no health service means no steps and no distance.
@@ -139,6 +155,15 @@ static uint32_t icon_resource(uint8_t icon_id) {
 // the slot, but a few read visually large at the shared target and get nudged down:
 // the route (distance) sprawls to its bbox corners and the steps footprint is wide.
 // 100 = no change; tune per icon.
+//
+// The vertical companion to this knob is the per-icon optical-centre weight in
+// status_icon_weight.h (50 = centre the ink box on the digits' cap centre, i.e.
+// what the draw site did before weights existed). Both are hand-tuned taste
+// values: this one decides how BIG a glyph reads, that one how HIGH it sits.
+//
+// One family opts out entirely: the phone-battery pair is sized in whole pixels
+// of h by phone_icon_h() below, because what it needs depends on the TIER and
+// this function only ever sees an icon id.
 static int icon_scale_pct(uint8_t icon_id) {
     switch (icon_id) {
         case STATUS_ICON_DISTANCE: return 95;
@@ -147,16 +172,119 @@ static int icon_scale_pct(uint8_t icon_id) {
         case STATUS_ICON_UV:       return 95;
         case STATUS_ICON_AQI:      return 85;
         case STATUS_ICON_TEMP:     return 93;
+        case STATUS_ICON_DEWPOINT: return 88;   // the two-drop pair spans nearly the
+                                                // whole viewbox, so it reads taller
+                                                // than the thermometer beside it
         case STATUS_ICON_STEPS:    return 80;   // the 25x25 footprint glyph is wide
+        // PHONE_BATTERY / _CHG take no percent trim here. The pair is a phone and a
+        // mains plug — two different silhouettes — sharing one INK HEIGHT, and a
+        // percent cannot express what they need anyway: their size is a snapped RUNG
+        // that depends on the tier, so it is chosen in whole pixels by
+        // phone_icon_h() below. 100 here means "no trim, see there".
+        case STATUS_ICON_PHONE_BATTERY:
+        case STATUS_ICON_PHONE_BATTERY_CHG: return 100;
         default:                   return 100;
     }
 }
 
-GDrawCommandImage *status_row_icons_load(uint8_t icon_id, int target_h) {
+// ── The phone-battery pair's size: a rung, not a percent ────────────────────
+//
+// STATUS_ICON_PHONE_BATTERY (a phone with the bolt drawn inside it) and _CHG (a
+// mains plug) swap in place inside ONE slot the moment the phone is plugged in, so
+// they are sized as a PAIR — at every tier but one. Their authored ink HEIGHTS are
+// exactly equal (160 units each), so one h renders both to the same height by
+// construction; only emery's FULL rows deliberately split them.
+//
+// THE SIZE GRAIN IS TWO PIXELS. icon_load() snaps every vertex to a pixel centre,
+// so painted height == bounds_h + 1 and is ALWAYS ODD: h and h+1 paint the same
+// height. A literal "one pixel shorter" IS NOT EXPRESSIBLE for these glyphs — that
+// is why the branches below subtract 2 and never 1, and why an odd h is trimmed
+// down rather than left to buy a rung nobody asked for.
+//
+// The measured 13-column rung ladder, the per-tier painted sizes, the emery FULL
+// split and what it costs, and the history behind each number are in
+// docs/adr/0002-status-glyph-sizing-and-seating.md §3. Do not re-tune these
+// without re-measuring both glyphs: sizes land on snapped rungs, not on percents.
+
+// Smallest h the pair survives: below 9 the plug's prongs merge into its outline
+// and the phone's inner bolt rasterises as a plain bar. The smallest h any shipping
+// tier asks for is 10, so this floor only ever HOLDS h — it never raises it past a
+// tier's target, and so can never push a glyph out of its row band.
+#define PHONE_ICON_MIN_H 9
+
+// The pair's height, in whole pixels. `icon_id` is STATUS_ICON_PHONE_BATTERY or
+// _CHG, `h` is the tier's target after icon_scale_pct() (100 for both ids, so
+// h == target_h unless the row band clamped it), and `top_strip` is the caller's own
+// tier flag, forwarded from status_row_icons_load().
+//
+// Every branch here can only ever LOWER or PASS THROUGH h, never raise it above
+// what the caller asked for (the floor aside, which cannot bite at any shipping
+// tier). That is what keeps a glyph inside its row band no matter how tightly
+// ensure_glyphs() clamped target_h.
+static int phone_icon_h(uint8_t icon_id, int h, bool top_strip) {
+#ifdef PBL_PLATFORM_EMERY
+    // emery: two of emery's three tiers leave the pair's natural rung, and only one
+    // of them splits the pair.
+    //   COMPACT/NONE rows (target 16): BOTH ids spend two requested pixels, 16 -> 14,
+    //     to paint 15 instead of 17 — the watch asked for shorter and the ladder has
+    //     no 1-px step.
+    //   FULL rows (target 12, the smallest of emery's three fonts): the NORMAL glyph
+    //     ALONE spends two, 12 -> 10, to paint 11 instead of 13. The watch asked for
+    //     the normal icon to be less tall there and said nothing about the plug, so
+    //     the plug keeps 12. This is the one tier where the two paint different
+    //     heights; the cost is spelled out above.
+    // The TOP STRIP (target 13) takes no branch of its own: it parity-trims to 12
+    // like any other odd request and paints 13, for both ids. The `h <= 12` guard is
+    // what keeps the split to the FULL tier — a compact row whose band clamped its
+    // target into 13..15 falls through to the parity trim with the pair still
+    // height-matched.
+    if (h >= 16) {
+        h -= 2;
+    } else if (!top_strip && h <= 12 && icon_id == STATUS_ICON_PHONE_BATTERY) {
+        h -= 2;
+    }
+#else
+    // basalt/diorite/flint: one answer for both ids at every tier, so neither the id
+    // nor the tier flag is consulted here. The parity trim below is the whole policy.
+    (void) icon_id;
+    (void) top_strip;
+#endif
+    // Parity trim: an ODD h paints target + 2 rows where an even one paints
+    // target + 1, so an odd request buys a rung nobody asked for. Rounding down
+    // spends it back.
+    if (h & 1) { h--; }
+    return (h < PHONE_ICON_MIN_H) ? PHONE_ICON_MIN_H : h;
+}
+
+GDrawCommandImage *status_row_icons_load(uint8_t icon_id, int target_h, bool top_strip) {
     if (target_h <= 0) { return NULL; }
     int h = (target_h * icon_scale_pct(icon_id)) / 100;
     if (h < 1) { h = 1; }
     uint32_t resource = icon_resource(icon_id);
+    // Under ~10px the detailed thermometer's tube walls + mercury merge into a solid
+    // stick (the 144px watches' full/dense rows render it at 8px — MEASURED on basalt
+    // dense). In the regular rows, swap in the small aplite-style silhouette and draw
+    // it at its NATIVE 10px (h 9 = the authored ink bbox height, so the 1:1 scale
+    // lands every vertex on its authored pixel row — crisp like aplite's bit mask,
+    // and near aplite's icon-as-tall-as-the-digits proportions; the taller glyph
+    // still clears the dense band, 15 - ICON_BAND_MARGIN). NOT in the top strip: its
+    // deliberately smaller icon tier exists to protect the strip->calendar seam, so a
+    // 10px glyph there would spend exactly the rows STATUS_STRIP_CAL_GAP just freed.
+    // Every tier from 10px up (all of emery, the 144px compact row) keeps the
+    // detailed liquid glyph.
+    if (icon_id == STATUS_ICON_TEMP && h < 10 && !top_strip) {
+        resource = RESOURCE_ID_STATUS_TEMP_SMALL;
+        h = 9;
+    }
+    // Same shape as the thermometer swap above, and for the same reason: the phone
+    // pair's right size depends on the TIER, which icon_scale_pct() never sees. It
+    // is picked in whole pixels of h rather than as a percent, off a ladder grained
+    // in 2-px steps, and it takes BOTH the id and the tier flag — a tier can be given
+    // a rung of its own, and (emery's FULL rows only) the two ids a rung each,
+    // without touching this call. See phone_icon_h().
+    if (icon_id == STATUS_ICON_PHONE_BATTERY || icon_id == STATUS_ICON_PHONE_BATTERY_CHG) {
+        h = phone_icon_h(icon_id, h, top_strip);
+    }
     if (resource == 0) { return NULL; }
     return icon_load(resource, h);
 }
@@ -167,9 +295,10 @@ void status_row_icons_destroy(GDrawCommandImage *image) {
 
 #else  // aplite: frozen lean fork, no PDC resources — every id is text-only.
 
-GDrawCommandImage *status_row_icons_load(uint8_t icon_id, int target_h) {
+GDrawCommandImage *status_row_icons_load(uint8_t icon_id, int target_h, bool top_strip) {
     (void) icon_id;
     (void) target_h;
+    (void) top_strip;
     return NULL;
 }
 

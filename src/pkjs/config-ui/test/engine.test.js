@@ -116,6 +116,11 @@ test('renderControl color: excludeColors drops swatches from the open palette on
   assert.ok(filtered.indexOf('data-color-pick="#FF0055"') >= 0, 'other swatches remain');
 });
 
+test('renderControl color: every picker offers all 64', () => {
+  const full = E.renderControl({ type: 'color', messageKey: 'tint' }, { value: '#FF0055', openColor: 'tint' });
+  assert.equal(full.split('data-color-pick=').length - 1, 64, 'the shared PALETTE is untouched');
+});
+
 test('renderRow: stacked for text/radio/open-color, wrap when multi-line hinted, inline otherwise; hintByValue wins', () => {
   // Rows with a multi-line (long) hint use the wrap layout (control floated right,
   // hint flows around it).
@@ -509,6 +514,28 @@ test('renderBody: empty section card is suppressed', () => {
   assert.equal(html.indexOf('Gone'), -1, 'card with only hidden items is omitted');
 });
 
+test('renderBody: button and sheet rows share ONE chevron, coloured by class not a literal', () => {
+  const SCH = { appName: 'X', versionLabel: 'v0', tabs: [{ id: 't', label: 'T', sections: [
+    { title: 'S', items: [
+      { type: 'button', action: 'doIt', label: 'Do it', hint: 'Runs it.' },
+      { type: 'sheet', sheetId: 'more', label: 'More' }
+    ] },
+    { sheetOnly: true, sheetId: 'more', title: 'More', items: [
+      { type: 'toggle', messageKey: 'f', defaultValue: false } ] }
+  ] }] };
+  const cx = { S: E.hydrate(SCH, {}), ENV: { color: true }, USERDATA: {}, openColor: null,
+    collapsed: {}, evalCtx: Object.assign({}, E.hydrate(SCH, {}), { env: { color: true } }) };
+  const html = E.renderBody(SCH, 't', cx);
+  assert.ok(html.indexOf('data-action="doIt"') >= 0, 'the button row dispatches its action');
+  assert.ok(html.indexOf('data-edit-sheet="more"') >= 0, 'the sheet row opens its sheet');
+  assert.equal(html.split('<span class="chev">&#9656;</span>').length - 1, 2,
+    'both rows emit the same class-based chevron');
+  // A literal here is the light-theme bug: --link is #FF6A52 dark / #D93A24 light, and
+  // only the .chev rule in shell.html follows the flip.
+  assert.equal(html.indexOf('#FF6A52'), -1, 'no hard-coded link colour survives');
+  assert.ok(html.indexOf('Runs it.') >= 0, 'the button row keeps its hint');
+});
+
 test('renderSelectOptions: empty query lists all; current value flagged on', () => {
   const item = { messageKey: 'c', options: [['United States','US'],['Germany','DE'],['Spain','ES']] };
   const all = E.renderSelectOptions(item, 'DE', '');
@@ -577,6 +604,32 @@ test('renderSelectOptions omits group presentation classes and headings while fi
   assert.doesNotMatch(html, /ssel-group|Weather/);
   assert.match(html, /class="ssel-opt"[^>]*data-select-pick="wind"/);
   assert.doesNotMatch(html, /group-child|group-end/);
+});
+
+test('renderSelectOptions: a non-header disabled option renders visible but inert', () => {
+  // A provider-gated slot item (e.g. "Pollen (DWD)" under another provider)
+  // rides the list as {disabled: true} without groupHeader: it must stay
+  // visible, but carry no data-select-pick (the delegated pick handler must
+  // never match it) and be disabled against taps/keyboard.
+  const item = { messageKey: 'slot', options: [
+    ['Empty', 'empty'],
+    ['Pollen (DWD)', 'pollen', { disabled: true }]
+  ] };
+  const html = E.renderSelectOptions(item, 'empty', '');
+  assert.match(html, /class="ssel-opt"[^>]*aria-selected="false" disabled aria-disabled="true"[^>]*><span>Pollen \(DWD\)<\/span>/,
+    'disabled row rendered inert with its label');
+  const rows = html.split('<button');
+  const pollenRow = rows.find(r => r.indexOf('Pollen') >= 0);
+  assert.equal(pollenRow.indexOf('data-select-pick'), -1, 'no pick attribute on the disabled row');
+  assert.match(rows.find(r => r.indexOf('Empty') >= 0), /data-select-pick="empty"/,
+    'sibling enabled row still pickable');
+  // A disabled GROUP CHILD keeps its indentation classes.
+  const grouped = { messageKey: 'slot', options: [
+    ['Weather', '__hdr_weather', { disabled: true, groupHeader: true }],
+    ['Pollen (DWD)', 'pollen', { disabled: true, groupChild: true, groupEnd: true }]
+  ] };
+  assert.match(E.renderSelectOptions(grouped, 'empty', ''),
+    /class="ssel-opt group-child group-end"[^>]*disabled aria-disabled="true"/);
 });
 
 test('renderSelectOptions: case-insensitive label match', () => {
@@ -720,6 +773,9 @@ function bootWithCapturedListeners(schema, env) {
   const BUNDLE = fs.readFileSync(path.join(LIB, 'schema-walk.js'), 'utf8')
     + '\n' + fs.readFileSync(path.join(LIB, 'color.js'), 'utf8')
     + '\n' + fs.readFileSync(path.join(LIB, 'show-when.js'), 'utf8')
+    + '\n' + fs.readFileSync(path.join(LIB, 'html.js'), 'utf8')
+    + '\n' + fs.readFileSync(path.join(LIB, 'date-picker.js'), 'utf8')
+    + '\n' + fs.readFileSync(path.join(LIB, 'range-control.js'), 'utf8')
     + '\n' + fs.readFileSync(path.join(LIB, 'engine.js'), 'utf8')
     + '\nPConf.hooks.onLoad(function (ctx) { module.exports.loadEnv = ctx.env; });'
     + '\nPConf.hooks.onReady(function (ctx) {'
@@ -933,7 +989,7 @@ function closeDateWithX(result) {
   const closeButton = {};
   result.modalListeners.click({
     target: {
-      closest: (selector) => selector === '[data-date-close]' ? closeButton : null
+      closest: (selector) => selector === '[data-select-close]' ? closeButton : null
     }
   });
 }
@@ -944,7 +1000,7 @@ test('boot(): every fast date close path flushes the pending wheel selection', (
       const closeButton = {};
       result.modalListeners.click({
         target: {
-          closest: (selector) => selector === '[data-date-close]' ? closeButton : null
+          closest: (selector) => selector === '[data-select-close]' ? closeButton : null
         }
       });
     }],
@@ -1040,7 +1096,7 @@ test('boot(): closing a date sheet restores focus to its date trigger', () => {
   const closeButton = {};
   result.modalListeners.click({
     target: {
-      closest: (selector) => selector === '[data-date-close]' ? closeButton : null
+      closest: (selector) => selector === '[data-select-close]' ? closeButton : null
     }
   });
   assert.equal(result.focusCounts.date.trip, 1);
@@ -1086,6 +1142,78 @@ test('boot(): external openSheet close skips underlying trigger focus and calls 
   assert.equal(closed, 1);
 });
 
+// One openColor variable serves palettes on BOTH surfaces — the tab body and an edit
+// sheet — so this card deliberately mixes a color row with a select row (the shipped
+// Layout tab does exactly that) and adds a sheet holding a color row of its own.
+const COLOR_SURFACE_SCHEMA = {
+  appName: 'X', versionLabel: 'v0',
+  tabs: [{ id: 't', label: 'T', sections: [
+    { title: 'S', items: [
+      { type: 'color', messageKey: 'tint', label: 'Tint', defaultValue: 0xFF0000,
+        onChange: 'tintPicked' },
+      { type: 'select', messageKey: 'mode', label: 'Mode', defaultValue: 'a',
+        options: [['A', 'a'], ['B', 'b']] },
+      { type: 'sheet', sheetId: 'more', label: 'More colors' }
+    ] },
+    { sheetOnly: true, sheetId: 'more', title: 'More colors', items: [
+      { type: 'color', messageKey: 'accent', label: 'Accent', defaultValue: 0x00FF00 }
+    ] }
+  ] }]
+};
+
+/**
+ * Dispatch one synthetic delegated click whose target matches exactly ONE selector —
+ * the shape the engine's `e.target.closest(sel)` delegation reads.
+ * @param {Function} listener Captured click listener (#scroll or #modal).
+ * @param {string} selector The single selector the target answers to.
+ * @param {Object} attrs getAttribute lookup table for the matched node.
+ * @returns {void}
+ */
+function clickMatching(listener, selector, attrs) {
+  const node = {
+    getAttribute: (n) => (Object.prototype.hasOwnProperty.call(attrs, n) ? attrs[n] : null),
+    closest: (sel) => (sel === selector ? node : null)
+  };
+  listener({ target: { closest: (sel) => (sel === selector ? node : null) } });
+}
+
+test('boot(): closing an unrelated modal leaves a tab-body palette expanded', () => {
+  const r = bootWithCapturedListeners(COLOR_SURFACE_SCHEMA, {});
+  clickMatching(r.listeners.click, '[data-color]', { 'data-color': 'tint' });
+  assert.ok(r.scroll.innerHTML.indexOf('class="palette"') >= 0, 'the palette expands in the tab body');
+  // Open the select sitting in the same card, then dismiss it. The palette behind it
+  // belongs to the tab body, not to the modal, so it must survive the close.
+  clickMatching(r.listeners.click, '[data-select]', { 'data-select': 'mode' });
+  clickMatching(r.modalListeners.click, '[data-select-close]', {});
+  assert.ok(r.scroll.innerHTML.indexOf('class="palette"') >= 0,
+    'closing a select must not collapse a palette in the tab body');
+});
+
+test('boot(): closing an edit sheet collapses a palette expanded inside it', () => {
+  const r = bootWithCapturedListeners(COLOR_SURFACE_SCHEMA, {});
+  clickMatching(r.listeners.click, '[data-edit-sheet]', { 'data-edit-sheet': 'more' });
+  assert.ok(r.modal.innerHTML.indexOf('data-color="accent"') >= 0, 'the sheet renders its color row');
+  clickMatching(r.modalListeners.click, '[data-color]', { 'data-color': 'accent' });
+  assert.ok(r.modal.innerHTML.indexOf('class="palette"') >= 0, 'the palette expands inside the sheet');
+  clickMatching(r.modalListeners.click, '[data-select-close]', {});
+  clickMatching(r.listeners.click, '[data-edit-sheet]', { 'data-edit-sheet': 'more' });
+  assert.equal(r.modal.innerHTML.indexOf('class="palette"'), -1, 'the sheet reopens collapsed');
+});
+
+test('boot(): a color swatch goes through setValue, so it fires the item\'s onChange', () => {
+  const r = bootWithCapturedListeners(COLOR_SURFACE_SCHEMA, {});
+  const calls = [];
+  r.onChange.register('tintPicked', (S, oldV, newV, env, key) => {
+    calls.push({ oldV, newV, key, sValue: S[key] });
+  });
+  clickMatching(r.listeners.click, '[data-color-pick]',
+    { 'data-k': 'tint', 'data-color-pick': '#00AAFF' });
+  assert.deepEqual(calls,
+    [{ oldV: '#FF0000', newV: '#00AAFF', key: 'tint', sValue: '#00AAFF' }],
+    'the hook sees the old and new values, and S is already written');
+  assert.equal(r.getValue('tint'), '#00AAFF', 'the pick is stored');
+});
+
 test('boot(): onLoad hook context exposes the injected platform environment', () => {
   const env = { color: false, round: false, platform: 'aplite', health: false, radar: false, themePolarity: false };
   const result = bootWithCapturedListeners(THEME_SCHEMA, env);
@@ -1106,6 +1234,72 @@ test('boot(): picking a modal option fires the item\'s registered onChange hook 
   assert.equal(captured.newV, 'light', 'new value passed through');
   assert.equal(captured.sTheme, 'light', 'S was updated before the hook ran');
   assert.equal(captured.key, 'theme', 'the changed item messageKey is passed as the 5th onChange arg');
+});
+
+// A text item's onChange fires on COMMIT (change = blur / Enter), never per keystroke:
+// the `input` listener keeps S live while typing, and only `change` dispatches the hook.
+// A reverting hook (WarnWeather's validateThresholdPair) would otherwise be unable to let
+// the user type "999" past an invalid "9". oldValue comes from the focusin sample, because
+// `input` has already overwritten S[key] by commit time.
+const TEXT_SCHEMA = {
+  appName: 'X', versionLabel: 'v0',
+  tabs: [{ id: 't', label: 'T', sections: [{ title: 'S', items: [
+    { type: 'text', messageKey: 'limit', label: 'Limit', defaultValue: '10', onChange: 'clampLimit' },
+    { type: 'text', messageKey: 'note', label: 'Note', defaultValue: '' }
+  ] }] }]
+};
+/** One reusable synthetic text-field event (same node for focusin/input/change).
+ * @param {string} key messageKey (data-k)
+ * @param {string} value initial field text
+ * @returns {{target: Object, input: Object}} event whose .input is the field node
+ */
+function textFieldEvent(key, value) {
+  const inp = {
+    value,
+    getAttribute: (a) => (a === 'data-k' ? key : null),
+    closest: (sel) => (sel === 'input[type=text]' ? inp : null)
+  };
+  return { target: inp, input: inp };
+}
+
+test('boot(): a text item\'s onChange fires on commit (change), not on every keystroke', () => {
+  const { listeners, onChange, getValue, scroll } = bootWithCapturedListeners(TEXT_SCHEMA, {});
+  const calls = [];
+  onChange.register('clampLimit', (S, oldV, newV, env, key) => {
+    calls.push({ oldV, newV, key, sAtCall: S.limit });
+    if (Number(newV) > 100) { S[key] = oldV; }   // reject the edit by reverting it
+  });
+  assert.equal(typeof listeners.focusin, 'function', 'a focusin listener was wired on #scroll');
+  assert.equal(typeof listeners.change, 'function', 'a change listener was wired on #scroll');
+
+  const ev = textFieldEvent('limit', '10');
+  listeners.focusin(ev);
+  ev.input.value = '9';                      // interim keystroke while typing "999"
+  listeners.input(ev);
+  assert.equal(getValue('limit'), '9', 'the input path keeps S live while typing');
+  assert.equal(calls.length, 0, 'no hook dispatch per keystroke');
+  ev.input.value = '999';
+  listeners.input(ev);
+
+  listeners.change(ev);
+  assert.equal(calls.length, 1, 'the commit dispatched the hook exactly once');
+  assert.equal(calls[0].oldV, '10', 'oldValue is the pre-edit value sampled at focusin');
+  assert.equal(calls[0].newV, '999', 'newValue is the committed field text');
+  assert.equal(calls[0].key, 'limit', 'the messageKey is passed as the 5th arg');
+  assert.equal(calls[0].sAtCall, '999', 'S already carries the new value when the hook runs');
+  assert.equal(getValue('limit'), '10', 'the hook reverted the rejected commit');
+  assert.match(scroll.innerHTML, /data-k="limit" value="10"/,
+    'the body was re-rendered so the corrected value is visible again');
+});
+
+test('boot(): committing a text item with no onChange hook keeps the typed value', () => {
+  const { listeners, getValue } = bootWithCapturedListeners(TEXT_SCHEMA, {});
+  const ev = textFieldEvent('note', '');
+  listeners.focusin(ev);
+  ev.input.value = 'hello';
+  listeners.input(ev);
+  listeners.change(ev);
+  assert.equal(getValue('note'), 'hello');
 });
 
 test('boot(): modal live-search on an optionsFrom searchSelect resolves options without throwing (regression: raw item threw)', () => {
@@ -1177,4 +1371,82 @@ test('renderBody: button renders data-action row; hidden renders nothing', () =>
   assert.match(html, /data-action="startWizard"/);
   assert.match(html, /Run setup again/);
   assert.doesNotMatch(html, /onboardingDone/);
+});
+
+// --- segmented: per-option disable ------------------------------------------
+// item.optionDisabledWhen maps an option VALUE to a showWhen-style condition.
+// A matching option renders inert instead of vanishing, so a stored value can
+// never be silently rewritten by the options-snapping path (which would, e.g.,
+// turn a slot's stored "bold on warn" into "never bold" the moment its
+// thresholds were switched off).
+const SEG_ITEM = {
+  type: 'segmented', messageKey: 'bold', label: 'Bold', defaultValue: 'warn',
+  options: [['Off', 'off'], ['Warn', 'warn'], ['Always', 'always']],
+  optionDisabledWhen: { warn: { not: { key: 'threshOn' } } }
+};
+
+const SEG_SCHEMA = { appName: 'X', versionLabel: 'v0', tabs: [{ id: 't', label: 'T',
+  sections: [{ title: 'S', items: [SEG_ITEM] }] }] };
+
+function segBody(S) {
+  return E.renderBody(SEG_SCHEMA, 't', {
+    S: S, ENV: {}, USERDATA: {}, openColor: null, openSelect: null,
+    openDate: null, selectQuery: '', collapsed: {},
+    evalCtx: Object.assign({}, S, { env: {} })
+  });
+}
+
+test('segmented: an option whose condition holds renders disabled, not removed', () => {
+  const html = segBody({ bold: 'warn', threshOn: false });
+  assert.match(html, /data-v="warn"[^>]*disabled/, 'warn pill is inert');
+  assert.match(html, />Warn</, 'warn pill is still shown');
+  assert.match(html, /data-v="always"(?![^>]*disabled)/, 'always stays live');
+  assert.match(html, /data-v="off"(?![^>]*disabled)/, 'off stays live');
+});
+
+test('segmented: no option is disabled once the condition is false', () => {
+  const html = segBody({ bold: 'warn', threshOn: true });
+  assert.equal(html.indexOf('disabled'), -1, 'every pill is live');
+});
+
+test('segmented: a disabled option keeps its stored value selected', () => {
+  // The whole point of disabling rather than removing: 'warn' survives the
+  // round-trip and lights up again when the gate reopens.
+  const S = { bold: 'warn', threshOn: false };
+  const html = segBody(S);
+  assert.match(html, /class="on"[^>]*data-v="warn"/, 'warn is still the selection');
+  assert.equal(S.bold, 'warn', 'stored value untouched');
+});
+
+test('segmented without optionDisabledWhen is unchanged', () => {
+  const plain = E.renderControl(
+    { type: 'segmented', messageKey: 'm', options: [['A', 'a'], ['B', 'b']] },
+    { value: 'a' });
+  assert.equal(plain.indexOf('disabled'), -1);
+});
+
+// A row may legitimately carry no label — the threshold slider's title moved onto
+// its group sub-header, and repeating it on the row read as a stutter. Rendering
+// esc(undefined) put the literal string "undefined" on the page.
+test('a row without a label renders no label text at all', () => {
+  const html = E.renderRow(
+    { type: 'range', messageKey: 'r', min: 0, max: 10, step: 1, minSpan: 1 },
+    { value: '2-8' });
+  assert.equal(html.indexOf('undefined'), -1, 'no literal "undefined" on the page');
+  assert.equal(html.indexOf('class="lbl"'), -1, 'no empty label box either');
+});
+
+test('a row without a label still renders its labelAction', () => {
+  const html = E.renderRow(
+    { type: 'toggle', messageKey: 't',
+      labelAction: { action: 'doIt', arg: 'X', label: 'Reset' } },
+    { value: false });
+  assert.equal(html.indexOf('undefined'), -1);
+  assert.match(html, /data-action="doIt"/);
+});
+
+test('a labelled row is unchanged', () => {
+  const html = E.renderRow({ type: 'toggle', messageKey: 't', label: 'Vibrate' },
+    { value: false });
+  assert.match(html, /<div class="lbl">Vibrate<\/div>/);
 });

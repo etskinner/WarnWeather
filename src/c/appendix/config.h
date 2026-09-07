@@ -92,6 +92,55 @@ typedef struct {
     // append-only persist offsets; older installs without it keep the seeded default.
     // Decoded by view_spec_unpack().
     uint16_t view_spec2[3];
+    // --- health HR scale (v1.10): the user-set BPM window the health graph's HR
+    // line is mapped onto, packed lo | (hi << 8). 0 = never set, which
+    // hr_scale_resolve() turns into HEALTH_HR_LO/HEALTH_HR_HI. Appended at the END
+    // to honour the append-only persist offsets.
+    //
+    // PBL_HEALTH-guarded: aplite has no sensors and compiles the health graph out
+    // entirely, so the field would be dead weight on the platform with the least
+    // room. That makes sizeof(Config) 2 B smaller there, which is safe — a config
+    // blob is written and read by one install on one platform, never shared.
+#if defined(PBL_HEALTH)
+    uint16_t hr_scale;
+#endif
+    // --- larger graph fonts (emery only): step every graph axis label up one Gothic
+    // tier (left axes 18 -> 24, hour labels 14 -> 18). ON by default since the tier
+    // stopped being an opt-in. Appended at the END to honour the append-only persist
+    // offsets -- an upgrader from before the field existed has a shorter stored blob
+    // that does not reach this byte, so config_read_or_default()'s seeded default
+    // applies, which is the same value the phone sends them once seedDefaults
+    // backfills the missing key. An install that stored the field keeps what it
+    // stored, so a deliberate opt-out survives.
+    //
+    // PBL_PLATFORM_EMERY-guarded, for the same reason hr_scale above is PBL_HEALTH-
+    // guarded: no other platform can ever read it (every render-side branch is inside
+    // the same #ifdef -- 144 px screens have no room, and their graph left axis is
+    // already calendar-sized), so elsewhere the field and its dict_find would be dead
+    // weight. That is not academic on aplite: the field plus its wire parse measured
+    // +48 B of image there, and main builds 21788 B against a 21804 B launch-safety
+    // ceiling (scripts/check-aplite-size.sh). Guarding costs every non-emery platform
+    // exactly 0 B. A config blob is written and read by one install on one platform,
+    // never shared, so a per-platform sizeof(Config) is safe.
+#if defined(PBL_PLATFORM_EMERY)
+    bool large_graph_font;
+#endif
+    // --- date slot formats (v1.16): how SLOT_LIVE_DATE prints, one enum per string
+    // (date_format.h DateMonthFormat / DateFullFormat; 0 = Auto = the pre-setting
+    // behavior). Appended at the END to honour the append-only persist offsets;
+    // optional wire tuple CLAY_DATE_FORMAT_UINT8 [month_year, full_date] (older
+    // phone builds omit it, leaving the memset-zeroed Auto).
+    //
+    // !PBL_PLATFORM_APLITE-guarded, the large_graph_font argument above: aplite's
+    // frozen status-row twin keeps the hardcoded formats and its settings screen
+    // never shows the pickers (the Date edit sheet is thresholds-gated), so there
+    // the fields and their wire parse would be dead weight against the launch-size
+    // ceiling. A config blob never crosses installs, so a per-platform
+    // sizeof(Config) is safe.
+#if !defined(PBL_PLATFORM_APLITE)
+    uint8_t date_month_format;
+    uint8_t date_full_format;
+#endif
 } Config;
 
 // Read-only view of the loaded config. Non-NULL from config_load() until
@@ -99,6 +148,19 @@ typedef struct {
 // call it: watchface.c's deinit() unloads config BEFORE main_window_destroy().
 // Only config.c writes the struct; everyone else reads through this pointer.
 const Config *config_get(void);
+
+// The one platform-aware accessor for the emery-only field above: constant false
+// everywhere else, so call-site branches fold away and non-emery platforms still pay
+// exactly 0 B (the aplite ceiling argument above). Call sites need no #ifdef of their
+// own -- this is the single place that knows the field only exists on emery.
+static inline bool config_large_graph_font(void) {
+#if defined(PBL_PLATFORM_EMERY)
+    // emery: the only platform with the field (and the settings-UI row).
+    return config_get()->large_graph_font;
+#else
+    return false;
+#endif
+}
 
 void config_load();
 

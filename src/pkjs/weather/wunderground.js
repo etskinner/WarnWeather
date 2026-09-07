@@ -1,8 +1,12 @@
 var WeatherProvider = require('./provider.js');
+var KEYS = require('../storage-keys');
 var mphToKmh = require('../wire-units.js').mphToKmh;
 var wuCache = require('./wu-current-hour-cache.js');
 var request = WeatherProvider.request;
 var failure = WeatherProvider.failure;
+
+// Shared bearing fold (wire-units.js): null-tolerant, [0, 360).
+var normalizeBearing = require('../wire-units.js').normalizeBearing;
 
 var WundergroundProvider = function() {
     this._super.call(this);
@@ -68,7 +72,11 @@ WundergroundProvider.prototype.withWundergroundCurrent = function(lat, lon, apiK
                 return;
             }
 
-            callback(weatherData.temperature);
+            // units=e → both °F. temperatureFeelsLike may be null on some
+            // station feeds; null → FEELS_CURRENT omitted, temp slot degrades.
+            callback(weatherData.temperature,
+                typeof weatherData.temperatureFeelsLike === 'number'
+                    ? weatherData.temperatureFeelsLike : null);
         }).bind(this),
         function(error) {
             onFailure(failure('provider_data', 'wu_current_' + error.code));
@@ -77,14 +85,14 @@ WundergroundProvider.prototype.withWundergroundCurrent = function(lat, lon, apiK
 };
 
 WundergroundProvider.prototype.clearApiKey = function() {
-    localStorage.removeItem('wundergroundApiKey');
+    localStorage.removeItem(KEYS.WU_API_KEY);
     console.log('Cleared API key');
 };
 
 WundergroundProvider.prototype.withApiKey = function(callback, onFailure) {
     // callback(apiKey)
 
-    var apiKey = localStorage.getItem('wundergroundApiKey');
+    var apiKey = localStorage.getItem(KEYS.WU_API_KEY);
     var url = 'https://www.wunderground.com/';
 
     if (apiKey === null) {
@@ -101,7 +109,7 @@ WundergroundProvider.prototype.withApiKey = function(callback, onFailure) {
                 }
 
                 apiKey = match[1];
-                localStorage.setItem('wundergroundApiKey', apiKey);
+                localStorage.setItem(KEYS.WU_API_KEY, apiKey);
                 console.log('Fetched Weather Underground API key: ' + apiKey);
                 callback(apiKey);
             },
@@ -127,7 +135,7 @@ WundergroundProvider.prototype.withProviderData = function(lat, lon, force, onSu
     }
 
     this.withApiKey((function(apiKey) {
-        this.withWundergroundCurrent(lat, lon, apiKey, (function(currentTemp) {
+        this.withWundergroundCurrent(lat, lon, apiKey, (function(currentTemp, currentFeels) {
             this.withWundergroundForecast(lat, lon, apiKey, (function(rawForecast) {
                 // WU's hourly feed rounds up and drops the in-progress hour;
                 // anchor it to the current wall-clock hour, reusing the real
@@ -159,8 +167,36 @@ WundergroundProvider.prototype.withProviderData = function(lat, lon, force, onSu
                 this.uvTrend = forecast.map(function(entry) {
                     return typeof entry.uv_index === 'number' ? entry.uv_index : 0;
                 });
+                this.pressureTrend = forecast.map(function(entry) {
+                    // WU reports mean sea level pressure in millibars, numerically
+                    // identical to hPa. Absent on some station feeds → 0, which
+                    // forecast-series rejects, so the line stays off rather than
+                    // drawing a spike to the graph floor.
+                    return typeof entry.mslp === 'number' ? entry.mslp : 0;
+                });
+                this.dewTrend = forecast.map(function(entry) {
+                    // v1 hourly dewpt, already °F (the forecast call carries no
+                    // units param, so it defaults to units=e, same as temp).
+                    // Absent on a station feed → null, not 0: 0 °F is a real
+                    // reading, and the dew slot degrades to '--' on null.
+                    return typeof entry.dewpt === 'number' ? entry.dewpt : null;
+                });
+                this.windDirTrend = forecast.map(function(entry) {
+                    // v1 hourly wdir, degrees the wind comes FROM. null on calm
+                    // hours → no arrow for that hour, rather than a bogus north.
+                    return normalizeBearing(entry.wdir);
+                });
+                // API-sourced (no extra request); gated for consistency so "no
+                // feels selection" means no feels data anywhere.
+                this.feelsTrend = this.fetchFeels ? forecast.map(function(entry) {
+                    // v1 hourly feels_like, °F (units=e); the anchored current-hour
+                    // bucket carries it too (wu-current-hour-cache picks it). Absent
+                    // on a station feed → fall back to that hour's temp.
+                    return typeof entry.feels_like === 'number' ? entry.feels_like : entry.temp;
+                }) : [];
                 this.startTime = forecast[0].fcst_valid;
                 this.currentTemp = currentTemp;
+                this.currentFeels = this.fetchFeels ? currentFeels : null;
                 onSuccess();
             }).bind(this), onFailure);
         }).bind(this), onFailure);

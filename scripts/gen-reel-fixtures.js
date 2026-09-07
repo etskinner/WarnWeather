@@ -54,7 +54,20 @@ const THEME_SLOTS = {
   dark:       { statusForecastLeft: 'temp',   statusForecastMid: 'city', statusForecastRight: 'uv' },
   bw:         { statusForecastLeft: 'temp',   statusForecastMid: 'wind', statusForecastRight: 'gust' },
   light:      { statusForecastLeft: 'temp',   statusForecastMid: 'uv',   statusForecastRight: 'aqi' },
-  'bw-light': { statusForecastLeft: 'pollen', statusForecastMid: 'date', statusForecastRight: 'aqi' },
+  'bw-light': { statusForecastLeft: 'pollen', statusForecastMid: 'city', statusForecastRight: 'aqi' },
+};
+// TOP-strip slots per theme step: every frame's upper bar shows a DIFFERENT tuple
+// (no theme repeats another's) so the sweep advertises top-strip variety instead of
+// four identical week/date/sun strips. dark keeps the catalog default as the classic
+// look; light and inverted keep the date in the top-mid slot (user call: the date
+// matters); b&w's top-mid shows gust instead (user call — even though its forecast
+// bar carries gust too, the b&w frame is the gust showcase).
+// bw-light's FORECAST mid moves date->city so the date never shows twice in one frame.
+const THEME_TOPS = {
+  dark:       {},   // catalog default: week / date / sun
+  light:      { statusTopLeft: 'wind', statusTopMid: 'date', statusTopRight: 'battery' },
+  bw:         { statusTopLeft: 'uv',   statusTopMid: 'gust', statusTopRight: 'week' },
+  'bw-light': { statusTopLeft: 'temp', statusTopMid: 'date', statusTopRight: 'sun' },
 };
 
 // Build the theme SEGMENTS from themesFor(), so each theme is one segment with the right
@@ -70,6 +83,7 @@ function themeSegments() {
       // variable (leco previews in the intro, roboto in the status chapter).
       { theme, radarProvider: 'disabled', healthMode: 'off', timeFont: 'bitham' },
       THEME_SLOTS[theme],
+      THEME_TOPS[theme],
       { layoutPreset: THEME_PRESET[theme] },
     );
     if (theme === 'light' || theme === 'bw-light') { clay.colorTime = '#000000'; }
@@ -117,7 +131,7 @@ const GRAPH_SEGMENTS = [
   { id: 'graph-5', group: 'graph', flicks: 1, platforms: 'emery basalt flint',
     clay: { layoutPreset: 'noCal', theme: 'dark', timeFont: 'leco', healthMode: 'all', radarProvider: 'disabled' },
     // emery only: HR needs the sensor; base (basalt/flint) keeps the plain health-graph frame.
-    variants: { emery: { statusTopLeft: 'distance', statusTopMid: 'empty', statusTopRight: 'hr' } } },
+    variants: { emery: { statusTopLeft: 'distance', statusTopMid: 'date', statusTopRight: 'hr' } } },
 ];
 
 // timeFont pinned to roboto across the whole status chapter (see GRAPH_SEGMENTS comment).
@@ -132,12 +146,24 @@ const STATUS_SEGMENTS = [
     // (steps/sleep/hr) that render blank/zero while the health summary cache is off.
     clay: { layoutPreset: 'compactCal', theme: 'dark', timeFont: 'roboto', radarProvider: 'disabled', healthMode: 'status',
       rainBarColor: 'solid',
-      statusForecastLeft: 'temp', statusForecastMid: 'wind', statusForecastRight: 'gust',
-      statusTopLeft: 'steps', statusTopMid: 'empty', statusTopRight: 'sleep' },
+      // Threshold showcase, split across the two bars so the states don't crowd
+      // one row: the FORECAST bar carries the outlined warn slot (wind, 20 km/h
+      // over warn 15, outline on) and the TOP strip carries the danger-filled
+      // slot (gust top-left, 34 over danger 30 -> red fill; the top strip renders
+      // via status_row_draw, so highlights apply there too). Gust is deliberately
+      // NOT in the forecast bar — thresholds are per-kind, so it would fill there
+      // as well and recreate the crowding. Same stored formats as the settings
+      // page (string values, '#RRGGBB'). Aplite keeps its plain frames.
+      statusForecastLeft: 'temp', statusForecastMid: 'wind', statusForecastRight: 'uv',
+      statusTopLeft: 'gust', statusTopMid: 'steps', statusTopRight: 'sleep',
+      threshWindOn: true, threshWindWarn: '15', threshWindDanger: '40',
+      threshWindWarnOutlineOn: true, threshWindWarnColor: '#FFAA00',
+      threshGustOn: true, threshGustWarn: '20', threshGustDanger: '30',
+      threshGustDangerColor: '#FF0000' },
     // emery has the HR sensor; aplite has no health at all -> weather-only top strip.
     variants: {
       emery:  { statusTopRight: 'hr' },
-      aplite: { statusTopLeft: 'wind', statusTopRight: 'battery' },
+      aplite: { statusTopLeft: 'wind', statusTopMid: 'empty', statusTopRight: 'battery' },
     } },
   { id: 'status-3', group: 'status', flicks: 0, platforms: 'emery basalt flint aplite',
     // healthMode 'status' (not 'off'): statusTopRight below is a LIVE health value
@@ -145,7 +171,10 @@ const STATUS_SEGMENTS = [
     clay: { layoutPreset: 'compactCal', theme: 'dark', timeFont: 'roboto', radarProvider: 'dwd', healthMode: 'status',
       rainBarColor: 'solid', btIcons: 'connected',
       statusForecastLeft: 'pollen', statusForecastMid: 'city', statusForecastRight: 'aqi',
-      statusTopLeft: 'empty', statusTopRight: 'sleep' },
+      statusTopLeft: 'empty', statusTopRight: 'sleep',
+      // All-bold showcase (mirrors showcase scene 3): the chapter's third frame
+      // shows every slot value bold via the Bold values master.
+      statusBoldAll: 'all' },
     pollen: POLLEN_BAKED,
     variants: {
       emery:  { statusTopRight: 'hr' },
@@ -166,6 +195,9 @@ const STATUS_SEGMENTS = [
   { id: 'status-5', group: 'status', flicks: 0, platforms: 'basalt flint',
     clay: { layoutPreset: 'compactCal', theme: 'dark', timeFont: 'roboto', radarProvider: 'disabled', healthMode: 'status',
       statusTopLeft: 'distance', statusTopMid: 'empty', statusTopRight: 'steps',
+      // All slot values bold via the Bold values master (user call: the closing
+      // status frame doubles as the bold showcase, like status-3).
+      statusBoldAll: 'all',
       statusForecastRight: 'wind' },
     variants: {
       emery:  { statusTopLeft: 'uv',   statusTopMid: 'date', statusTopRight: 'steps', statusForecastRight: 'hr' },
@@ -235,8 +267,13 @@ function generateReelFixtures(opts = {}) {
   return written;
 }
 
-// Intro scenes reused from the hero capture (showcase/frames/<platform>/scene_N.png).
-const INTRO_SCENES = [1, 2, 3, 5];
+// Intro scenes reused from the hero capture (showcase/frames/<platform>/scene_N.png),
+// in the showcase table's order — gen-showcase-fixtures.js owns the scene set and
+// ordering; scenes it flags `reelIntro: false` (the flick-gated health graph) are
+// skipped here. Reordering the showcase reorders the reel intro with zero edits.
+const INTRO_SCENES = require('./gen-showcase-fixtures').SCENES
+  .filter((s) => s.reelIntro !== false)
+  .map((s) => s.id);
 
 const CHAPTER_ORDER = ['theme', 'graph', 'status'];
 const CARD_BY_GROUP = { theme: 'themes', graph: 'graph', status: 'status' };
@@ -273,7 +310,7 @@ function printManifest(platform, version) {
 }
 
 module.exports = {
-  PLATFORM_CAPS, ALL_PLATFORMS, TIMING, themesFor, SEGMENTS, CARDS,
+  PLATFORM_CAPS, ALL_PLATFORMS, TIMING, themesFor, SEGMENTS, CARDS, INTRO_SCENES,
   segmentPlatforms, fixtureFor, generateReelFixtures,
   buildManifest, printManifest,
 };

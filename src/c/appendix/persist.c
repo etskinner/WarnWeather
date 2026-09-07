@@ -45,7 +45,32 @@ enum key {
     STATUS_LINE_3,                // 39 — top
     STATUS_LINE_4,                // 40 — health
     STATUS_LINE_ENCODING_VERSION, // 41
-    NOTICE_TEXT                   // 42 — phone-pushed overlay string (empty = no notice)
+    NOTICE_TEXT,                  // 42 — phone-pushed overlay string (empty = no notice)
+    // Appended: status-slot threshold highlighting (layouts in status_threshold.h).
+    // aplite never reads or writes these two (WW_THRESHOLD_HIGHLIGHT is undefined
+    // there and the accessors below compile out), but the IDs stay listed on every
+    // platform: the enum is append-only because the numbers are the on-flash slots.
+    STATUS_LEVELS,                // 43 — packed weather-kind levels byte
+    THRESHOLD_SETTINGS,           // 44 — enabled bits + colors + health thresholds blob
+    // Appended: custom radar empty-state text (CLAY_NORAIN_TEXT; absent =
+    // built-in default). aplite never reads or writes it — its only callers
+    // (the WW_RAIN_RADAR-guarded app_message handler and the unreferenced
+    // rain_radar_layer.c) drop out there and --gc-sections reaps the
+    // accessors — but the ID stays listed on every platform: the enum is
+    // append-only because the numbers are the on-flash slots.
+    NORAIN_TEXT,                  // 45 — radar no-rain text, <= 24 B UTF-8 + NUL
+    // Appended: per-series forecast curve insets (CLAY_CURVE_INSET_UINT8 tuple,
+    // [FIRST, SECOND, THIRD] px). aplite never reads or writes it
+    // (WW_CURVE_INSET is undefined there and the accessors below compile out),
+    // but the ID stays listed on every platform: the enum is append-only
+    // because the numbers are the on-flash slots.
+    CURVE_INSETS,                 // 46 — 3 render-ready inset bytes, absent = {7, 0, 0}
+    // Appended: the user-selectable night colours (layout in persist.h). B&W
+    // builds never read or write it (the accessors are PBL_COLOR-guarded and
+    // theme_pick discards the colour arm there), but the ID stays listed on
+    // every platform: the enum is append-only because the numbers are the
+    // on-flash slots.
+    NIGHT_COLORS                  // 47 — 5 GColor8 argb bytes + flags, absent = the built-in defaults
 };
 
 // Setters report whether the stored value actually changed so callers can
@@ -322,6 +347,46 @@ int persist_get_notice_text(char *buffer, size_t buffer_size) {
     return (int) strlen(buffer);
 }
 
+// Unguarded on purpose (see persist.h): rain_radar_layer.c compiles on every
+// platform, so the getter must exist everywhere; on aplite both accessors are
+// unreferenced and --gc-sections reaps them (the notice-text pattern).
+bool persist_set_norain_text(const char *text) {
+    // NORAIN_TEXT_BUF_BYTES bound: the phone pack already truncates to 24
+    // UTF-8 bytes; this is a defensive clamp for a skewed/rogue sender. The
+    // back-off loop drops any UTF-8 continuation bytes (10xxxxxx) left at the
+    // clamp point so a split multi-byte sequence is never persisted.
+    char bounded[NORAIN_TEXT_BUF_BYTES];
+    size_t len = text ? strlen(text) : 0;
+    if (len > sizeof(bounded) - 1) {
+        len = sizeof(bounded) - 1;
+        while (len > 0 && (((const uint8_t *) text)[len] & 0xC0) == 0x80) {
+            len--;
+        }
+    }
+    if (len == 0) {
+        // Empty = use the built-in default. Delete the slot; report a change
+        // only when it existed (mirrors persist_set_notice_text).
+        if (persist_exists(NORAIN_TEXT)) {
+            persist_delete(NORAIN_TEXT);
+            return true;
+        }
+        return false;
+    }
+    memcpy(bounded, text, len);
+    bounded[len] = '\0';
+    return write_sized_data_if_changed(NORAIN_TEXT, bounded, len + 1); // include NUL
+}
+
+int persist_get_norain_text(char *buffer, size_t buffer_size) {
+    if (buffer_size == 0) { return 0; }
+    buffer[0] = '\0';
+    if (!persist_exists(NORAIN_TEXT)) { return 0; }
+    int n = persist_read_data(NORAIN_TEXT, buffer, buffer_size);
+    if (n <= 0) { buffer[0] = '\0'; return 0; }
+    buffer[buffer_size - 1] = '\0';  // guarantee termination
+    return (int) strlen(buffer);
+}
+
 time_t persist_get_rain_radar_start() {
     return (time_t) persist_read_int(RAIN_RADAR_START);
 }
@@ -477,3 +542,72 @@ bool persist_set_health_cache_end_hour(time_t val) {
 time_t persist_get_health_cache_end_hour(void) {
     return (time_t) persist_read_int(HEALTH_CACHE_END_HOUR);
 }
+
+#if defined(WW_THRESHOLD_HIGHLIGHT)
+int persist_get_status_levels(void) {
+    if (!persist_exists(STATUS_LEVELS)) { return 0; }
+    return persist_read_int(STATUS_LEVELS);
+}
+
+bool persist_set_status_levels(int levels) {
+    return write_int_if_changed(STATUS_LEVELS, levels);
+}
+
+int persist_get_threshold_settings(uint8_t *buffer, size_t buffer_size) {
+    if (!persist_exists(THRESHOLD_SETTINGS)) { return 0; }
+    return persist_read_data(THRESHOLD_SETTINGS, buffer, buffer_size);
+}
+
+bool persist_set_threshold_settings(const uint8_t *data, size_t len) {
+    return write_sized_data_if_changed(THRESHOLD_SETTINGS, data, len);
+}
+#endif  // WW_THRESHOLD_HIGHLIGHT
+
+#if defined(WW_CURVE_INSET)
+bool persist_set_curve_insets(const uint8_t insets[3]) {
+    return write_data_if_changed(CURVE_INSETS, insets, CURVE_INSET_BYTES);
+}
+
+void persist_get_curve_insets(uint8_t out[3]) {
+    // Default = the pre-feature look: the temp curve keeps its fixed inset and
+    // the metric channels map full-height.
+    out[0] = BOTTOM_VIEW_PRIMARY_LINE_INSET_Y;
+    out[1] = 0;
+    out[2] = 0;
+    if (!persist_exists(CURVE_INSETS)) { return; }
+    // Read into a scratch first: a short read must not scribble on the
+    // already-defaulted out[] bytes.
+    uint8_t stored[CURVE_INSET_BYTES];
+    if (persist_read_data(CURVE_INSETS, stored, sizeof(stored)) < (int) sizeof(stored)) {
+        return;  // short/corrupt — keep the defaults
+    }
+    memcpy(out, stored, sizeof(stored));
+}
+#endif  // WW_CURVE_INSET
+
+#if defined(PBL_COLOR)
+bool persist_set_night_colors(const uint8_t colors[NIGHT_COLOR_BYTES]) {
+    return write_data_if_changed(NIGHT_COLORS, colors, NIGHT_COLOR_BYTES);
+}
+
+void persist_get_night_colors(uint8_t out[NIGHT_COLOR_BYTES]) {
+    // Default = the pre-feature look for the default metric: DarkGray full-height
+    // hatch and dusk/dawn line, the precip night triple, no explicit tint pick.
+    // (.argb on the SDK's GColor constants, not the GColor*ARGB8 macros — the
+    // field access does not depend on the macro spelling.)
+    out[0] = GColorDarkGray.argb;
+    out[1] = GColorDarkGray.argb;
+    out[2] = GColorDukeBlue.argb;
+    out[3] = GColorBlue.argb;
+    out[4] = GColorVividCerulean.argb;
+    out[5] = 0;
+    if (!persist_exists(NIGHT_COLORS)) { return; }
+    // Read into a scratch first: a short read must not scribble on the
+    // already-defaulted out[] bytes.
+    uint8_t stored[NIGHT_COLOR_BYTES];
+    if (persist_read_data(NIGHT_COLORS, stored, sizeof(stored)) < (int) sizeof(stored)) {
+        return;  // short/corrupt — keep the defaults
+    }
+    memcpy(out, stored, sizeof(stored));
+}
+#endif  // PBL_COLOR

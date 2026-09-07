@@ -105,6 +105,42 @@
   },
   "1.9.3": {
     "title": "Swap clock & status, no flick",
-    "body": "Move the status row next to your forecast with the new swap toggle — or add a Radar or Health row in the dense layout. Both in the Layout tab."
+    "body": "Added swapping clock and status bar in the compact view so the forecast slots can stay close to graph."
+  },
+  "1.10.0": {
+    "title": "Air pressure on the graph",
+    "body": "Pick air pressure as a graph line or dots in the Forecast tab, with a scale to widen or tighten the band, or drop it into any status slot. Also fixes settings changes sometimes not refreshing the forecast right away."
+  },
+  "1.10.1": {
+    "title": "Layout fix",
+    "body": "Fixes a layout bug in the Health and Radar views when the clock and status row are swapped."
+  },
+  "1.11.0": {
+    "title": "Goals & Warnings, HR Scale and UI updates",
+    "body": "Status slots support goals & warnings - set them in the Status slots tab. Also new: a Bold option for every slot, a custom no-rain radar message, a heart-rate graph scale, and a refined settings UI and view layout."
+  },
+  "1.12.0": {
+    "title": "Feels-like temperature & battery slot",
+    "body": "Pick feels-like as a graph line or dots in the Forecast tab, or set the temperature slot to show it instead — or both as 12/10. Also new: a battery percentage slot for the top-right. Fixes the air pressure line not drawing on Weather Underground, and the wind-gust line being hard to see on the Light theme."
+  },
+  "1.13.0": {
+    "title": "Dew point & wind direction",
+    "body": "Status slots: dew point is a new slot, the wind slots can show a wind direction arrow, and slots that print a unit can now hide it. Reset watchface no longer wipes saved API keys or reverts a minute later."
+  },
+  "1.13.1": {
+    "title": "Phone battery slot",
+    "body": "Your phone's battery can go in any status slot, with or without a phone glyph. Android phones only."
+  },
+  "1.14.0": {
+    "title": "Larger graph fonts",
+    "body": "Draw the graph axis labels in bigger type on Pebble Time 2 — turn it on in the Layout tab. Plus a round of bug fixes."
+  },
+  "1.15.0": {
+    "title": "Pick your graph colors",
+    "body": "The Forecast tab has a new Graph colors card: set the line, the fill under it and the night tint for each metric from the full Pebble palette, plus the night hatch and the dusk/dawn line. Colors are kept separately for the Dark and Light themes."
+  },
+  "1.15.2": {
+    "title": "Custom date formats",
+    "body": "The date can now be shown in a custom format. Change it in the date status slot settings."
   }
 }

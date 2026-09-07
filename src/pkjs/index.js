@@ -1,5 +1,5 @@
 
-// ES5-safe polyfills (Object.assign, Array find/findIndex/includes) MUST load
+// ES5-safe polyfills (Object.assign, Math.trunc, Array find/findIndex/includes) MUST load
 // before anything else so the aplite JavaScriptCore runtime can run the bundle.
 require('./polyfills.js');
 
@@ -19,18 +19,25 @@ var pkg = require('../../package.json');
 var activeFixture = require('./active-fixture.generated.js');
 var pebbleColors = require('./pebble-colors.js');
 var releaseNotifications = require('./release-notifications.js');
-var updateCheck = require('./update-check.js');
+var updateCheckRunner = require('./update-check-runner.js');
 var sleepWindow = require('./sleep-window.js');
 var claySettings = require('./clay-settings.js');
+var clayMigrations = require('./clay-migrations.js');
 var fixtureWeather = require('./fixture-weather.js');
 var holidayMask = require('./holidays/holiday-mask.js');
-var registry = require('./holidays/registry.js');
+var nagerSource = require('./holidays/nager-source.js');
 var buildClayPayload = require('./clay-payload.js').buildClayPayload;
+var effectiveHolidayCountry = require('./clay-payload.js').effectiveHolidayCountry;
 var providerFactory = require('./provider-factory.js');
 var previewPalette = require('./settings/preview-palette.js');
 var newsCache = require('./news-cache.js');
 var createChannelScheduler = require('./channel-scheduler.js');
-var statusCatalog = require('./status-line-catalog.js');
+// The render-affecting-settings signature (the force-fetch rule) lives in its own
+// module so the invariant is testable; see the header there.
+var renderSignature = require('./render-signature.js').renderSignature;
+var decideConfigClose = require('./config-close.js').decideConfigClose;
+var phoneBattery = require('./phone-battery.js');
+var statusRebake = require('./status-rebake.js');
 
 /**
  * Full release-notification manifest (dev: force-show by version). Omitted from bundle if missing.
@@ -59,10 +66,9 @@ var releaseNotificationsManifest = loadReleaseNotificationsManifest();
  * }}
  */
 var app = {};  // Namespace for global app variables
-var KEY_MAX_NOTIFIED_VERSION = 'max_notified_version';
+var KEY_MAX_NOTIFIED_VERSION = storageKeys.MAX_NOTIFIED_VERSION_KEY;
 var KEY_UPDATE_NOTIFIED_VERSION = storageKeys.UPDATE_NOTIFIED_VERSION_KEY;
 var KEY_LAST_UPDATE_CHECK = storageKeys.LAST_UPDATE_CHECK_KEY;
-var UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // Public appstore APIs; latest version lives at data[0].latest_release.version.
 // Announce the min across stores so the target is installable from either one.
 var UPDATE_CHECK_STORES = [
@@ -75,12 +81,10 @@ var KEY_LAST_FETCH_ATTEMPT = storageKeys.LAST_FETCH_ATTEMPT_KEY;
 var KEY_NOTICES = storageKeys.NOTICES_KEY;
 var KEY_GEOCODE_CACHE = storageKeys.GEOCODE_CACHE_KEY;
 var KEY_GEOCODE_BACKOFF = storageKeys.GEOCODE_BACKOFF_KEY;
-var KEY_V1_34_0_WEEKEND_HOLIDAY_COLOR_MIGRATION = 'v1.34.0_weekend_holiday_color_migration';
-var KEY_HOLIDAY_WHITE_TO_TOGGLE_MIGRATION = 'v1.4.0_holiday_white_to_toggle_migration';
-var KEY_V1_4_0_HOLIDAY_REGION_KEY_MIGRATION = 'v1.4.0_holiday_region_key_migration';
-var KEY_STATUS_LINE_HEALTH_DEFAULTS_MIGRATION = 'v1.8.0_status_line_health_defaults_migration';
-var KEY_STATUS_TOP_RIGHT_BATTERY_MIGRATION = 'v1.8.0_status_top_right_battery_migration';
-var KEY_RADAR_VIEW_MODE_MIGRATION = 'v1.10.0_radar_view_mode_migration';
+// How long a forced fetch waits out an in-flight fetch before retrying. Long
+// enough to clear the common case (a fetch already past its requests), short
+// enough that a settings change still feels immediate.
+var FORCED_RETRY_MS = 3000;
 var KEY_LAST_IS_SLEEPING = storageKeys.LAST_IS_SLEEPING_KEY;
 var DEFAULT_COLOR_WHITE = pebbleColors.GColorWhite;
 var DEFAULT_COLOR_FOLLY = pebbleColors.GColorFolly;
@@ -107,7 +111,7 @@ var scheduler = createChannelScheduler({
     startFetch: function (force) { fetch(app.provider, force); },
     shouldFetchNow: function () { return needRefresh(); },
     refreshHolidays: refreshHolidays,
-    checkForUpdate: maybeCheckForUpdate,
+    checkForUpdate: onSchedulerTick,
     clearClayCache: outbox.clearClayCache,
     clearWeatherCaches: outbox.clearWeatherCaches,
     clearNoticeOnWatch: function () { outbox.sendWeather({ NOTICE_TEXT: '' }); },
@@ -165,11 +169,24 @@ Pebble.addEventListener('showConfiguration', function(e) {
         newsCache: newsCache.readBody() || ''
     };
     var values = claySettings.read();
+    // Logged, not just passed: false here silently OMITS both phone-battery slot
+    // items from all twelve slot dropdowns, and nothing on the page says why. This
+    // is the only place that verdict is read, so it is the only place it can be
+    // observed at the moment it decides what the user is offered.
+    var phoneBatteryEnv = phoneBattery.isSupported();
+    console.log('Config env: phoneBattery=' + phoneBatteryEnv);
     // Let the library pick the return target: pebblejs://close# on device, or the
     // $$RETURN_TO$$ helper placeholder in the emulator (see settings/index.js options).
     Pebble.openURL(settings.generateUrl({
         values: values,
         watchInfo: app.watchInfo,
+        // Env facts the config-UI library can't derive from watchInfo because they
+        // describe the PHONE, not the watch. Whether this PKJS host exposes a battery
+        // API at all is one: Android's Chromium WebView does, iOS's JavaScriptCore and
+        // the emulator never can. The catalog's needsPhoneBattery gate omits the
+        // phone-battery slot items wherever this is false. Merged over the derived env
+        // by createConfig, so this stays a single key.
+        env: { phoneBattery: phoneBatteryEnv },
         userData: userData
     }));
     console.log('Showing clay: ' + JSON.stringify(values));
@@ -194,7 +211,11 @@ Pebble.addEventListener('webviewclosed', function(e) {
     // detect a change and force a resend. Rain/radar colors are NOT here: they ride the
     // Clay message and the watch persists them, so a color change needs no weather refetch.
     var prevRender = renderSignature(app.settings);
-    claySettings.save(settings.parseResponse(e.response));  // This triggers the update in localStorage
+    // fillFromPreserved: between a "Reset watchface" and the next boot the page
+    // hydrates from an absent blob, so this response carries '' for every API key
+    // the user did not retype — fill those from the parked copies (fill-only; a
+    // typed key wins) or the session fetches on an empty key until the relaunch.
+    claySettings.save(claySettings.fillFromPreserved(settings.parseResponse(e.response)));
     app.settings = claySettings.read();  // This reads from localStorage in sensible format
     if (claySettings.shouldReset(app.settings)) {
         // "Reset watchface" (gated behind its confirm toggle): wipe ALL phone-side
@@ -202,7 +223,28 @@ Pebble.addEventListener('webviewclosed', function(e) {
         // repopulate it. The next launch boots as a fresh install — defaults
         // seeded, migrations run once against those defaults, wizard reopens.
         console.log('Reset watchface requested — clearing all PKJS storage');
-        claySettings.resetAll();
+        // Returns the credentials it deliberately kept (API keys), so the forced
+        // fetch below still has one to fetch with instead of failing on an empty
+        // key the user never actually removed.
+        var preserved = claySettings.resetAll();
+        // Storage stays EMPTY on purpose: the wizard only reopens for a config with
+        // no keys at all (wizard.js shouldShow), so seeding here would silently skip
+        // the first-time setup this reset promises. The next boot's seedDefaults
+        // fills it in, and until then the page's defaultValue hydration shows the
+        // same defaults.
+        //
+        // But the IN-MEMORY copy must not keep the settings we just erased. The
+        // 60-second scheduler tick is still armed, and clearing storage also cleared
+        // the day stamp and the last-fetch marker that gate it — so on its very next
+        // pass it pushed app.settings to the watch and cached them as last-sent,
+        // re-writing exactly what the user had just wiped. Reset appeared to work on
+        // the phone while the watch quietly reverted a minute later. Hand the
+        // scheduler the defaults instead, and push them now rather than waiting for
+        // the tick, so the watch drops to a default face immediately.
+        app.settings = Object.assign(claySettings.getDefaults(DEFAULT_HOLIDAY_COLORS), preserved);
+        refreshProvider();   // the default provider, holding the preserved key
+        outbox.clearWeatherCaches();
+        scheduler.onConfigClosed({ forceFetch: true, clearNotice: false });
         return;
     }
     devStats.setEnabled(Boolean(app.settings.devStatsEnabled));
@@ -213,34 +255,6 @@ Pebble.addEventListener('webviewclosed', function(e) {
     }
     app.telemetry = createTelemetryClient(getRuntimeTelemetryConfig());
     var providerOrLocationChanged = refreshProvider();
-    var radarProviderChanged = oldRadarProvider !== app.settings.radarProvider
-        || oldRadarMode !== app.settings.radarMode;
-    var nextRender = renderSignature(app.settings);
-    var renderSettingsChanged = prevRender !== nextRender;
-    var needsRefetch = providerOrLocationChanged || radarProviderChanged || renderSettingsChanged;
-    if (needsRefetch) {
-        // Location/provider/radar-provider/render-setting change makes the watch's
-        // current data (or chart) wrong; drop the last-sent caches (including radar)
-        // so the next fetch resends every category.
-        outbox.clearWeatherCaches();
-    }
-
-    // Send Clay settings, then (when a refetch is needed) force-fetch after that
-    // send settles. The scheduler chains the fetch into the Clay-send callbacks
-    // and defers it past the webview teardown, so it never rides the half-duplex
-    // channel back-to-back with the Clay send.
-    // Also force when an auth backoff is active: closing the config is an explicit
-    // user action (they likely just fixed the key/subscription), so give the provider
-    // an immediate retry — even if the key STRING didn't change here (e.g. they
-    // activated One Call by Call on OWM with the same key). A forced fetch clears the
-    // backoff; without this they'd have to toggle Force weather fetch by hand.
-    // "Understood": dismiss all shown notices. A pure ack (dismiss with no
-    // render-relevant change and no Force toggle) means "I saw it, I'm not fixing
-    // it now" — so DON'T let the backoff-active branch force a doomed retry that
-    // would just re-raise the notice. Instead push the overlay clear, sequenced
-    // after the Clay send by the scheduler so it never collides on the half-duplex
-    // channel. A real key/provider/location change still force-fetches (and a
-    // successful fetch clears errors + self-heals the overlay).
     var acked = app.settings.fetchNoticeAck === true;
     // Only an error notice puts text on the watch overlay; capture that BEFORE
     // dismissAll() empties the list, so we push the watch clear only when there
@@ -249,12 +263,31 @@ Pebble.addEventListener('webviewclosed', function(e) {
     if (acked) {
         notices.dismissAll();
     }
-    var pureAck = acked && !needsRefetch && app.settings.fetch !== true;
-    var shouldForceFetch = app.settings.fetch === true || needsRefetch
-        || (authBackoff.isActive() && !pureAck);
+    // The WHY of every rule below lives with the decision (config-close.js);
+    // this handler only captures the facts and performs the effects.
+    var decision = decideConfigClose({
+        providerOrLocationChanged: providerOrLocationChanged,
+        radarProviderChanged: oldRadarProvider !== app.settings.radarProvider
+            || oldRadarMode !== app.settings.radarMode,
+        renderSettingsChanged: prevRender !== renderSignature(app.settings),
+        fetchToggle: app.settings.fetch === true,
+        acked: acked,
+        hadWatchNotice: hadWatchNotice,
+        authBackoffActive: authBackoff.isActive()
+    });
+    if (decision.needsRefetch) {
+        // The watch's current data (or chart) is wrong; drop the last-sent caches
+        // (including radar) so the next fetch resends every category.
+        outbox.clearWeatherCaches();
+    }
+    // Send Clay settings, then (when forced) fetch after that send settles. The
+    // scheduler chains the fetch into the Clay-send callbacks and defers it past
+    // the webview teardown, so it never rides the half-duplex channel
+    // back-to-back with the Clay send; it also runs the overlay clear only when
+    // no fetch is forced.
     scheduler.onConfigClosed({
-        forceFetch: shouldForceFetch,
-        clearNotice: hadWatchNotice && !shouldForceFetch
+        forceFetch: decision.forceFetch,
+        clearNotice: decision.clearNotice
     });
     refreshHolidays();
     // app.settings was just reloaded from storage above; log it rather than re-reading.
@@ -283,9 +316,6 @@ function newsCacheOpts() {
 // Listen for when the watchface is opened
 Pebble.addEventListener('ready',
     function (e) {
-        var migratedWeekendHolidayColors;
-        var migratedHolidayWhiteToToggle;
-
         app.devConfig = getDevConfig();
         maybeHandleDevStorageReset(app.devConfig);
         var hadExistingInstall = claySettings.hasStored();
@@ -294,37 +324,20 @@ Pebble.addEventListener('ready',
             app.devConfig.forceShowReleaseNotificationOnBoot
         );
         claySettings.seedDefaults(DEFAULT_HOLIDAY_COLORS);
-        migratedWeekendHolidayColors = claySettings.migrateWeekendHolidayColors(
-            DEFAULT_HOLIDAY_COLORS,
-            function() { return localStorage.getItem(KEY_V1_34_0_WEEKEND_HOLIDAY_COLOR_MIGRATION) !== null; },
-            markWeekendHolidayColorMigrationComplete
-        );
-        migratedHolidayWhiteToToggle = claySettings.migrateHolidayWhiteToToggle(
-            DEFAULT_HOLIDAY_COLORS,
-            function() { return localStorage.getItem(KEY_HOLIDAY_WHITE_TO_TOGGLE_MIGRATION) !== null; },
-            markHolidayWhiteToToggleMigrationComplete
-        );
-        claySettings.migrateHolidayRegionKeys(
-            function() { return localStorage.getItem(KEY_V1_4_0_HOLIDAY_REGION_KEY_MIGRATION) !== null; },
-            function() { localStorage.setItem(KEY_V1_4_0_HOLIDAY_REGION_KEY_MIGRATION, '1'); }
-        );
         var statusMigrationPlatform = 'basalt';
         try {
             var wi = Pebble.getActiveWatchInfo();
             if (wi && wi.platform) { statusMigrationPlatform = wi.platform; }
         }
         catch (ex) { /* keep the safe default */ }
-        claySettings.migrateStatusLineHealthDefaults(
-            statusMigrationPlatform,
-            function() { return localStorage.getItem(KEY_STATUS_LINE_HEALTH_DEFAULTS_MIGRATION) !== null; },
-            function() { localStorage.setItem(KEY_STATUS_LINE_HEALTH_DEFAULTS_MIGRATION, '1'); });
-        claySettings.migrateStatusTopRightBattery(
-            function() { return localStorage.getItem(KEY_STATUS_TOP_RIGHT_BATTERY_MIGRATION) !== null; },
-            function() { localStorage.setItem(KEY_STATUS_TOP_RIGHT_BATTERY_MIGRATION, '1'); });
-        claySettings.migrateRadarProviderToMode(
-            'rainbow',
-            function() { return localStorage.getItem(KEY_RADAR_VIEW_MODE_MIGRATION) !== null; },
-            function() { localStorage.setItem(KEY_RADAR_VIEW_MODE_MIGRATION, '1'); });
+        // Every marker-gated migration runs inside clay-migrations.runMigrations
+        // (bodies, marker keys and gating live together there); the Clay-colour
+        // ones commit their markers only on the Clay ACK below.
+        var migrations = clayMigrations.runMigrations({
+            platform: statusMigrationPlatform,
+            colors: DEFAULT_HOLIDAY_COLORS,
+            defaultRadarProvider: 'rainbow'
+        });
         claySettings.applyDevConfig(app.devConfig);
         claySettings.applyFixtureSettings(activeFixture, pebbleColors);
         console.log('PebbleKit JS ready!');
@@ -338,6 +351,20 @@ Pebble.addEventListener('ready',
             console.log('Unable to read watch info: ' + ex.message);
         }
         app.telemetry = createTelemetryClient(getRuntimeTelemetryConfig());
+        // Phone battery: detect + subscribe once. Inert on iOS and in the
+        // emulator (no battery API there at all), so this is safe to run before
+        // the fixture branch below — which is deliberate, so the dev-config
+        // fake also populates the cache for fixture screenshots.
+        // The rebaker restores its flash backstop FIRST: phoneBattery.init's
+        // subscribe can fire a micro-send synchronously (see status-rebake.js).
+        statusRebake.init({
+            getSettings: function () { return app.settings; }
+        });
+        phoneBattery.init({
+            devConfig: app.devConfig,
+            getSettings: function () { return app.settings; },
+            now: function () { return new Date(); }
+        });
         refreshProvider();
         // 7-day localStorage cache GC: caches are re-derivable, so entries older
         // than a week are dropped instead of building up (stale notices, the
@@ -367,14 +394,10 @@ Pebble.addEventListener('ready',
             return;
         }
         scheduler.onReady({
-            migrationClayRequired: Boolean(migratedWeekendHolidayColors || migratedHolidayWhiteToToggle),
-            onClayAck: function() {
-                // Runs on ACK only, so a NACK leaves the migration markers unset
-                // and the migration retries next boot (matches the original
-                // failure path, which never marked complete on NACK).
-                if (migratedWeekendHolidayColors) { markWeekendHolidayColorMigrationComplete(); }
-                if (migratedHolidayWhiteToToggle) { markHolidayWhiteToToggleMigrationComplete(); }
-            }
+            migrationClayRequired: migrations.clayRequired,
+            // Runs on ACK only, so a NACK leaves the deferred migration markers
+            // unset and the migration retries next boot.
+            onClayAck: migrations.commitDeferredMarkers
         });
         refreshHolidays();
         scheduler.start();
@@ -422,144 +445,42 @@ function maybeShowReleaseNotification(hadExistingInstall, forceVersionSpec) {
     }
     console.log(decision.logLine);
 
-    if (!decision.shouldNotify) {
-        console.log('[release-notification] skip');
-    }
     if (decision.shouldNotify) {
         console.log('[release-notification] showing notification');
         Pebble.showSimpleNotificationOnPebble(decision.title, decision.body);
     }
-
-    if (decision.shouldNotifyUpgrade) {
-        localStorage.setItem(KEY_MAX_NOTIFIED_VERSION, decision.unseenVersion);
-        console.log('[release-notification] set max_notified_version=' + decision.unseenVersion);
-    }
-    else if (!hadExistingInstall && decision.isNewer) {
-        localStorage.setItem(KEY_MAX_NOTIFIED_VERSION, pkg.version);
-        console.log('[release-notification] first install, set max_notified_version=' + pkg.version);
-    }
     else {
-        console.log('[release-notification] keep max_notified_version=' + maxNotified);
+        console.log('[release-notification] skip');
+    }
+    // The decision owns the whole persist policy (release-notifications.js);
+    // this caller only performs the write it names.
+    if (decision.persistMaxNotified !== null) {
+        localStorage.setItem(KEY_MAX_NOTIFIED_VERSION, decision.persistMaxNotified);
+        console.log('[release-notification] set max_notified_version=' + decision.persistMaxNotified);
     }
 }
 
 /**
- * GET each store's latest version sequentially (ES5, no Promise). Calls
- * callback(versions) only when EVERY store returned a parseable version;
- * calls callback(null) on the first network error, non-2xx, or unparseable
- * body so the caller can skip notifying when "available in both" is unconfirmed.
+ * Everything index.js owns that must happen on every 60 s scheduler tick.
  *
- * @param {string[]} urls Store API URLs.
- * @param {Function} callback Receives string[] of versions, or null on any failure.
+ * The scheduler calls this as its `checkForUpdate` dep, which it invokes once
+ * per tick unconditionally — so it is the tick hook, and hanging the
+ * phone-battery post-saver-window push here keeps this at ONE timer instead of
+ * arming a second one. The update check throttles itself to once a day
+ * (update-check-runner.js — the XHR/notify half; update-check.js stays the
+ * pure decision), so the extra work per tick is a flag test.
+ *
  * @returns {void}
  */
-var XHR_TIMEOUT_MS = 5000;
-
-function fetchStoreVersions(urls, callback) {
-    var versions = [];
-
-    function next(i) {
-        var xhr;
-        if (i >= urls.length) {
-            callback(versions);
-            return;
-        }
-        xhr = new XMLHttpRequest();
-        xhr.open('GET', urls[i]);
-        xhr.timeout = XHR_TIMEOUT_MS;
-        xhr.onload = function() {
-            var version;
-            if (xhr.status < 200 || xhr.status >= 300) {
-                console.log('[update-check] store ' + i + ' non-2xx status=' + xhr.status);
-                callback(null);
-                return;
-            }
-            version = updateCheck.parseLatestVersion(xhr.responseText);
-            if (version === null) {
-                console.log('[update-check] store ' + i + ' unparseable response');
-                callback(null);
-                return;
-            }
-            versions.push(version);
-            next(i + 1);
-        };
-        xhr.onerror = function() {
-            console.log('[update-check] store ' + i + ' request error');
-            callback(null);
-        };
-        xhr.ontimeout = function() {
-            console.log('[update-check] store ' + i + ' request timeout');
-            callback(null);
-        };
-        xhr.send();
-    }
-
-    next(0);
-}
-
-/**
- * Decide on the fetched store versions and notify once per newer version.
- *
- * @param {Array<string|null>|null} storeVersions Versions, or null when a fetch failed.
- * @returns {void}
- */
-function finishUpdateCheck(storeVersions) {
-    var decision;
-    if (storeVersions === null) {
-        console.log('[update-check] skipped: a store request failed');
-        return;
-    }
-    decision = updateCheck.decideUpdateNotification({
-        storeVersions: storeVersions,
+function onSchedulerTick() {
+    phoneBattery.onTick();
+    updateCheckRunner.runDailyUpdateCheck({
+        stores: UPDATE_CHECK_STORES,
         appVersion: pkg.version,
-        updateNotifiedVersion: localStorage.getItem(KEY_UPDATE_NOTIFIED_VERSION) || '0.0.0'
+        devConfig: app.devConfig,
+        isWatchConnected: isWatchConnected,
+        notify: function (title, body) { Pebble.showSimpleNotificationOnPebble(title, body); }
     });
-    console.log(decision.logLine);
-    if (decision.shouldNotify) {
-        Pebble.showSimpleNotificationOnPebble(
-            'WarnWeather update',
-            'A new version is available. Open the Pebble app on your phone to install it.'
-        );
-        localStorage.setItem(KEY_UPDATE_NOTIFIED_VERSION, decision.version);
-        console.log('[update-check] notified version=' + decision.version);
-    }
-}
-
-/**
- * Once per day (while a watch is connected), check both appstores for a newer
- * version and notify. The throttle slot is claimed BEFORE fetching, so a
- * persistently failing store cannot trigger a retry every tick. dev-config can
- * force a run and/or inject synthetic store versions for offline testing.
- *
- * @returns {void}
- */
-function maybeCheckForUpdate() {
-    var dev = app.devConfig || {};
-    var force = Boolean(dev.forceUpdateCheckOnBoot);
-    var lastRaw;
-    var last;
-
-    if (!force) {
-        if (!isWatchConnected()) {
-            return;
-        }
-        lastRaw = localStorage.getItem(KEY_LAST_UPDATE_CHECK);
-        last = Number(lastRaw);
-        if (isFinite(last) && last > 0 && (Date.now() - last) < UPDATE_CHECK_INTERVAL_MS) {
-            return;
-        }
-    }
-
-    // Claim the daily slot up front so failures don't retry every tick.
-    localStorage.setItem(KEY_LAST_UPDATE_CHECK, String(Date.now()));
-
-    if (dev.overrideLatestStoreVersions) {
-        console.log('[update-check] using dev override store versions');
-        finishUpdateCheck(dev.overrideLatestStoreVersions);
-        return;
-    }
-
-    fetchStoreVersions(UPDATE_CHECK_STORES, finishUpdateCheck);
 }
 
 /**
@@ -591,12 +512,12 @@ function maybeHandleDevStorageReset(devConfig) {
 
     if (shouldResetV134WeekendHolidayColorMigration) {
         console.log('[dev] resetV134WeekendHolidayColorMigration=true, clearing migration marker');
-        localStorage.removeItem(KEY_V1_34_0_WEEKEND_HOLIDAY_COLOR_MIGRATION);
+        localStorage.removeItem(storageKeys.WEEKEND_HOLIDAY_COLOR_MIGRATION_KEY);
     }
 
     if (Boolean(devConfig && devConfig.resetV140HolidayRegionKeyMigration)) {
         console.log('[dev] resetV140HolidayRegionKeyMigration=true, clearing migration marker');
-        localStorage.removeItem(KEY_V1_4_0_HOLIDAY_REGION_KEY_MIGRATION);
+        localStorage.removeItem(storageKeys.HOLIDAY_REGION_KEY_MIGRATION_KEY);
     }
 
     if (Boolean(devConfig && devConfig.resetUpdateNotifiedVersion)) {
@@ -652,17 +573,17 @@ function resetFetchAttemptCounter() {
  */
 function refreshHolidays() {
     if (!app.settings) { return; }
-    var country = app.settings.hasOwnProperty('holidayCountry') ? app.settings.holidayCountry : 'US';
-    if (country === 'none') { return; }
+    var country = effectiveHolidayCountry(app.settings);
+    // Gate BOTH sentinels here: nagerSource.ensure() has no empty-country
+    // guard of its own (the deleted registry's null used to shield it).
+    if (!country || country === 'none') { return; }
     if (app.settings.holidaysEnabled === false) { return; }
-    var provider = registry.getProvider(country);
-    if (!provider) { return; }
     var compact = (app.settings.topViewMode || 'compact') !== 'full';
     var years = holidayMask.windowYears({
         startMon: app.settings.weekStartDay === 'mon',
         prevWeek: compact ? false : (app.settings.firstWeek === 'prev')
     }, new Date());
-    provider.ensure(years, function () {
+    nagerSource.ensure(country, years, function () {
         sendClaySettings(function () {}, function () {});
     });
 }
@@ -737,24 +658,6 @@ function setProvider(providerId) {
     }
     app.provider = provider;
     console.log('Set provider: ' + app.provider.name);
-}
-
-/**
- * Mark the v1.34.0 weekend/holiday color migration as complete.
- *
- * @returns {void}
- */
-function markWeekendHolidayColorMigrationComplete() {
-    localStorage.setItem(KEY_V1_34_0_WEEKEND_HOLIDAY_COLOR_MIGRATION, '1');
-}
-
-/**
- * Mark the white-holiday-color -> Holiday highlight toggle migration as complete.
- *
- * @returns {void}
- */
-function markHolidayWhiteToToggleMigrationComplete() {
-    localStorage.setItem(KEY_HOLIDAY_WHITE_TO_TOGGLE_MIGRATION, '1');
 }
 
 /**
@@ -838,12 +741,23 @@ function buildWeatherExtras(radarTuples) {
  */
 function fetch(provider, force) {
     if (!isWatchConnected()) {
+        // Nothing to retry against: with no watch there is nowhere to send. The
+        // watchface re-handshakes on reconnect and the startup path refetches a
+        // stale forecast, so this case already heals itself.
         console.log('Skipping weather fetch: no watch connected.');
         return;
     }
 
     if (app.fetchInProgress) {
         console.log('Skipping weather fetch: another fetch is already in progress.');
+        if (force) {
+            // Don't drop a forced fetch: the in-flight one closed over the PREVIOUS
+            // provider, so it can't satisfy a force triggered by a provider or
+            // location change — its result would be the old provider's data. The
+            // in-flight fetch is bounded by the XHR/GPS timeouts, so retry shortly
+            // rather than leaving the change until the next scheduled fetch.
+            setTimeout(function () { fetch(app.provider, true); }, FORCED_RETRY_MS);
+        }
         return;
     }
 
@@ -853,6 +767,14 @@ function fetch(provider, force) {
     // clears the backoff and retries; scheduled fetches are skipped meanwhile.
     if (force) {
         authBackoff.clear();
+        // Same contract for the geocode cooldown: a forced fetch is an explicit user
+        // action (Force toggle, provider/key/location change), so it overrides the
+        // rate-limit backoff too. Without this the guard below silently swallowed
+        // every forced refresh for up to 30 minutes whenever a manual location's
+        // geocode had 429'd — the reported "changing settings doesn't refresh".
+        if (typeof provider.clearGeocodeBackoff === 'function') {
+            provider.clearGeocodeBackoff();
+        }
         // A forced fetch is a genuine refresh: drop the last-sent weather caches so
         // the resulting send re-transmits every category to the watch even when the
         // data is byte-identical. Without this the outbox dedupe suppresses the
@@ -876,6 +798,12 @@ function fetch(provider, force) {
     provider.fetchUv = forecastSeries.needsUv(app.settings);
     provider.fetchAqi = forecastSeries.needsAqi(app.settings);
     provider.fetchPollen = forecastSeries.needsPollen(app.settings);
+    // Apparent temperature: no provider spends an extra REQUEST on it (it always
+    // rides a response already being fetched), but DWD and Met.no compute Steadman
+    // per hour and the rest map a series — all wasted when nothing renders it.
+    // Every input of needsFeels is in renderSignature, so flipping a feels
+    // selection forces a refetch and this gate is re-evaluated immediately.
+    provider.fetchFeels = forecastSeries.needsFeels(app.settings);
     provider.aqiScale = (app.settings && app.settings.aqiScale) || 'european';
     provider.aqiSource = (app.settings && app.settings.aqiSource) || 'waqi';
     provider.aqicnToken = (pkg.waqi && pkg.waqi.token) || '';
@@ -964,32 +892,6 @@ function fetch(provider, force) {
     }
 }
 
-/**
- * Join the render-affecting settings into a change-detection signature.
- *
- * @param {Object} settings Clay settings.
- * @returns {string} Pipe-joined signature, or '' when settings is falsy.
- */
-function renderSignature(settings) {
-    if (!settings) { return ''; }
-    var parts = [settings.secondaryLine, settings.thirdLine, settings.secondaryLineFill,
-        settings.barSource, settings.windScale, settings.theme,
-        // Status-line bake inputs: value formatting...
-        settings.temperatureUnits, settings.axisTimeFormat, settings.timeShowAmPm,
-        settings.timeLeadingZero, settings.healthMode,
-        // ...the unit pickers (change baked/fetched values: wind & distance rebake,
-        // AQI source/scale refetch)...
-        settings.windUnits, settings.distanceUnits, settings.aqiScale, settings.aqiSource,
-        // ...and the night weather-pause window (a change flips whether fetching pauses
-        // and the IS_SLEEPING glyph the forced fetch pushes)...
-        settings.sleepNightEnabled, settings.sleepStartHour, settings.sleepEndHour];
-    // ...and the twelve slot selections themselves.
-    var slotKeys = statusCatalog.allSlotKeys();
-    for (var i = 0; i < slotKeys.length; i++) {
-        parts.push(settings[slotKeys[i]]);
-    }
-    return parts.join('|');
-}
 
 /**
  * Shared fields for both the success and failure weather-fetch telemetry events.
@@ -1084,7 +986,7 @@ function needRefresh() {
         return true;
     }
     var intervalMs = app.settings.fetchIntervalMin * 60 * 1000;
-    if (!sleepWindow.isPastRefreshSlot(lastTimeMs, Date.now(), intervalMs)) { return false; }
+    if (!createChannelScheduler.isPastRefreshSlot(lastTimeMs, Date.now(), intervalMs)) { return false; }
     if (isSleepingNow() && app.lastIsSleeping === true) { return false; }
     return true;
 }

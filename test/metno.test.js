@@ -48,7 +48,9 @@ function forecastBody(hours, startEpoch, overrides) {
       air_temperature: 10,          // 50 °F
       wind_speed: 5,                // 18 km/h
       wind_speed_of_gust: 10,       // 36 km/h
-      ultraviolet_index_clear_sky: 1.4
+      ultraviolet_index_clear_sky: 1.4,
+      dew_point_temperature: 5,     // 41 °F
+      wind_from_direction: 213.7    // comes from the SW
     }, o.instant);
     const next1 = Object.assign({
       precipitation_amount: 0.8,
@@ -170,4 +172,94 @@ test('provider identity: id/name set, inherits the base provider', () => {
   assert.equal(p.id, 'metno');
   assert.equal(p.name, 'Met.no');
   assert.ok(p instanceof WeatherProvider);
+});
+
+const feelsLikeF = require('../src/pkjs/weather/feels-like.js').feelsLikeF;
+
+test('metno computes feelsTrend via Steadman from instant.details (unrounded m/s→km/h)', () => {
+  const body = forecastBody(26, HOUR0, { 0: { instant: { relative_humidity: 70 } } });
+  const mapped = metno.mapResponse(body, NOW);
+  // 10 °C → 50 °F, 70 % RH, 5 m/s → 18 km/h (exact ×3.6, not msToKmh's round).
+  assert.equal(mapped.feelsTrend[0], feelsLikeF(50, 70, 18));
+  assert.equal(mapped.currentFeels, mapped.feelsTrend[0], 'anchor bucket doubles as "now"');
+  assert.equal(mapped.feelsTrend[1], 50, 'no relative_humidity → the hour reads the actual temp');
+  assert.equal(mapped.feelsTrend.length, 24);
+});
+
+test('metno leaves currentFeels null when the anchor bucket lacks relative_humidity', () => {
+  const mapped = metno.mapResponse(forecastBody(26, HOUR0), NOW); // fixture default has no rh
+  assert.equal(mapped.currentFeels, null, 'null → FEELS_CURRENT omitted, temp slot degrades');
+  assert.deepEqual(mapped.feelsTrend, mapped.tempTrend, 'trend degrades to the temp series');
+});
+
+test('metno maps air_pressure_at_sea_level into pressureTrend', () => {
+  const body = forecastBody(26, HOUR0, { 0: { instant: { air_pressure_at_sea_level: 1008.3 } } });
+  const mapped = metno.mapResponse(body, NOW);
+  assert.equal(mapped.pressureTrend[0], 1008.3);
+  // The fixture's other hours omit the field -> 0, which forecast-series rejects.
+  assert.equal(mapped.pressureTrend[1], 0);
+  assert.equal(mapped.pressureTrend.length, 24);
+});
+
+// Dew point and wind bearing both come from instant.details on the /complete
+// endpoint already in use — no request change. Dew converts °C → °F (the repo's
+// internal temperature unit, matching currentTemp/feelsTrend); the bearing stays
+// in the meteorological "comes from" degrees every provider reports, and is
+// flipped downwind once, later, at bake time.
+
+test('metno maps dew_point_temperature into dewTrend in °F', () => {
+  const body = forecastBody(26, HOUR0, { 0: { instant: { dew_point_temperature: 6.5 } } });
+  const mapped = metno.mapResponse(body, NOW);
+  assert.ok(Math.abs(mapped.dewTrend[0] - 43.7) < 1e-9, '6.5 °C → 43.7 °F');
+  assert.equal(mapped.dewTrend[1], 41, 'fixture default 5 °C → 41 °F');
+  assert.equal(mapped.dewTrend.length, 24, 'one entry per hourly slot');
+});
+
+test('metno maps wind_from_direction into windDirTrend, normalized to [0, 360)', () => {
+  const body = forecastBody(26, HOUR0, {
+    0: { instant: { wind_from_direction: 0 } },      // due north, a valid bearing
+    1: { instant: { wind_from_direction: 360 } },    // wraps to 0, never 360
+    2: { instant: { wind_from_direction: 359.9 } }
+  });
+  const mapped = metno.mapResponse(body, NOW);
+  assert.equal(mapped.windDirTrend[0], 0);
+  assert.equal(mapped.windDirTrend[1], 0, '360 wraps to 0');
+  assert.equal(mapped.windDirTrend[2], 359.9);
+  assert.equal(mapped.windDirTrend[3], 213.7, 'fixture default passes through');
+  assert.equal(mapped.windDirTrend.length, 24);
+  mapped.windDirTrend.forEach((d) => {
+    assert.ok(d >= 0 && d < 360, `${d} is outside [0, 360)`);
+  });
+});
+
+test('metno degrades a missing dew point / bearing to null, keeping the series aligned', () => {
+  const body = forecastBody(26, HOUR0, {
+    0: { dropInstantFields: ['dew_point_temperature', 'wind_from_direction'] }
+  });
+  const mapped = metno.mapResponse(body, NOW);
+  // null, not 0: 0 is a valid bearing (due north) and 0 °F a plausible dew point,
+  // so a fabricated zero would render as a lie. null → '--' / no arrow.
+  assert.equal(mapped.dewTrend[0], null);
+  assert.equal(mapped.windDirTrend[0], null);
+  assert.equal(mapped.dewTrend.length, 24, 'the hole keeps its slot');
+  assert.equal(mapped.windDirTrend.length, 24);
+  assert.equal(mapped.dewTrend[1], 41, 'the rest of the mapping is unaffected');
+});
+
+test('withProviderData populates dewTrend and windDirTrend, numEntries long', () => {
+  responder = function(url, type, onSuccess) { onSuccess(JSON.stringify(forecastBody(26, HOUR0))); };
+  const p = new metno.MetnoProvider();
+  withMockedNow(NOW, () => {
+    p.withProviderData(59.91, 10.75, true, () => {}, () => { throw new Error('must not fail'); });
+  });
+  assert.equal(p.dewTrend.length, p.numEntries);
+  assert.equal(p.windDirTrend.length, p.numEntries);
+  p.dewTrend.forEach((v) => {
+    assert.equal(typeof v, 'number');
+    assert.ok(v > -100 && v < 150, `${v} is not a plausible °F dew point`);
+  });
+  p.windDirTrend.forEach((d) => {
+    assert.equal(typeof d, 'number');
+    assert.ok(d >= 0 && d < 360, `${d} is outside [0, 360)`);
+  });
 });

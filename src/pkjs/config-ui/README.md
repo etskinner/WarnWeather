@@ -26,6 +26,9 @@ each consuming app supplies its schema, custom blocks, and hooks.
    - [Hidden-item serialization rule](#hidden-item-serialization-rule)
 5. [Registries and hooks](#registries-and-hooks)
    - [Block registry — PConf.blocks](#block-registry--pconfblocks)
+   - [Options-resolver registry — PConf.optionsResolvers](#options-resolver-registry--pconfoptionsresolvers)
+   - [Display-resolver registry — PConf.displayResolvers](#display-resolver-registry--pconfdisplayresolvers)
+   - [Action registry — PConf.actions](#action-registry--pconfactions)
    - [Hook registry — PConf.hooks](#hook-registry--pconfhooks)
 6. [Build step — buildPage](#build-step--buildpage)
 7. [Clay compatibility](#clay-compatibility)
@@ -88,7 +91,7 @@ Register your custom blocks and hooks in browser-side files (concatenated into t
 time — see [Build step](#build-step--buildpage)):
 
 ```js
-// src/pkjs/settings/blocks.js  (runs in the phone WebView)
+// src/pkjs/settings/preview-forecast.js  (runs in the phone WebView)
 PConf.blocks.register('forecastPreview', function (state, env, userData) {
   return '<svg …>' + /* render from state */ + '</svg>';
 });
@@ -138,6 +141,7 @@ var instance = configUi.createConfig({ schema, page, options });
 |-------|---------|-------------|
 | `storage` | ambient `localStorage` | Storage object implementing `getItem`/`setItem`. Override for testing or non-browser hosts. |
 | `storageKey` | `'clay-settings'` | localStorage key for the settings blob. Matches Clay's default. |
+| `emulatorConfigUrl` | `null` | Hosted helper URL for emulator testing. When set and running under the pypkjs emulator, `generateUrl` routes through it (page in the URL `#hash`, `$$RETURN_TO$$` placeholder) instead of a `data:` URL, since a desktop browser blocks navigating the top frame to `data:`. See `test/emulator-url.test.js`. |
 
 **Returns** an instance object:
 
@@ -162,7 +166,7 @@ var instance = configUi.createConfig({ schema, page, options });
 | `watchInfo` | `Pebble.getActiveWatchInfo()` | Raw watch info; the library computes `env` from it. |
 | `userData` | `instance.meta.userData` | Passed to block renderers and hooks. |
 | `returnTo` | `'pebblejs://close#'` | URL the page navigates to on save. |
-| `env` | computed from `watchInfo` | Override the computed env (testing only). |
+| `env` | computed from `watchInfo` | Extra env facts, **merged over** the computed env. For facts the library cannot derive from `watchInfo` (phone-runtime capabilities), and for test overrides. |
 
 Color conversion (`int ↔ hex`) is handled internally. The app always works in int-valued blobs;
 the page always works in hex strings; the library converts at the boundary.
@@ -176,8 +180,9 @@ that needs them without creating a full config instance.
 var configUi = require('../config-ui');
 
 // Platform facts
-configUi.isColorPlatform(platform)   // boolean — false for aplite/diorite/flint
-configUi.computeEnv(watchInfo)       // { color, round, platform } — null-safe
+configUi.isColorPlatform(platform)          // boolean — false for aplite/diorite/flint
+configUi.isThemePolarityPlatform(platform)  // boolean — false for aplite (no light/B&W-Inv theme)
+configUi.computeEnv(watchInfo)              // { color, round, platform, … } — null-safe
 
 // Color conversion (ES5-safe; no padStart)
 configUi.intToHex(n)                 // 0xFFFFFF → '#FFFFFF'
@@ -219,7 +224,8 @@ Schema
        └─ sections[]
             ├─ title        string
             ├─ intro        string  (HTML — displayed above items)
-            ├─ block        string  (custom-block id — see Registries)
+            ├─ blockBefore  string  (custom-block id — rendered above the items)
+            ├─ block        string  (custom-block id — rendered below the items)
             ├─ collapsible  boolean (renders section as a collapsible card)
             └─ items[]
                  └─ (see Item fields below)
@@ -233,15 +239,47 @@ Schema
 | `select` | Dropdown | string | `select` |
 | `segmented` | Pill-row (new) | string | `select` (visual variant) |
 | `radio` | Stacked radio buttons | string | `radiogroup` |
-| `color` | 64-swatch color palette | hex string on wire; **int** in the persisted blob | `color` |
+| `color` | Color palette — the 64 Pebble swatches | hex string on wire; **int** in the persisted blob | `color` |
 | `text` | Text input | string | `input` |
 | `staticText` | Static HTML block; no key | — (not serialized) | `text` |
+| `searchSelect` | Dropdown sheet with a search box | string | — |
+| `range` | Dual-thumb slider | `"lo-hi"` string | — |
+| `date` | Date-wheel sheet (day/month/year) | `"YYYY-MM-DD"` string | — |
+| `hidden` | none — never rendered | any (serialized like any keyed item) | — |
+| `button` | Tappable action row; no key | — (not serialized) | — |
+| `subheader` | In-section group header; no key | — (not serialized) | — |
+| `sheet` | Tappable row that opens a `sheetOnly` section; no key | — (not serialized) | — |
 
-The seven types above are the complete built-in set. Anything bespoke belongs in a custom block
-registered via `PConf.blocks.register` — there are no pluggable control types.
+A `sheet` item is a whole-row chevron target by default. Give it an
+`editBadgeFrom: { resolver, args }` — a named resolver `fn(S, env, args)` returning `null` or
+`{label?, ariaNote?, dots: [{color, ring?}]}`, registered on `PConf.badgeResolvers` — and it
+renders as an ordinary row instead: label on the left, then the badge's colour dots (outlined
+when `ring`, filled otherwise) and an **Edit** button on the right, with nothing between them
+(there is no control to draw for a `sheet`). Use that shape for a row that only leads to a
+sheet but should still show what is configured in there. Because the row has no `messageKey`,
+whatever the resolver needs to identify the row must be passed in `editBadgeFrom.args`.
+
+The fourteen types above are the complete built-in set. Anything bespoke belongs in a custom block
+registered via `PConf.blocks.register` — the control-type dispatch itself is not pluggable from
+app code.
+
+`subheader` items split ONE section into several visually-titled groups — use them when a
+section holds rows that answer to different scopes (the threshold sheets keep a slot-level
+`Bold` row outside the thresholds group). Fields: `text` (the heading), optional `intro`
+(HTML shown under the heading, like a section `intro`), optional `labelAction`, and optional
+`toggleKey`. `toggleKey` names a `toggle` item **in the same section**, which then renders as a
+switch on the header instead of as a row of its own — while keeping its normal place in
+`items`, so hydrate/serialize/`onChange` are unaffected.
 
 `staticText` items carry their HTML in a `text` field and are emitted verbatim without control
 chrome. They are not serialized (no `messageKey`).
+
+`color` items offer all 64 Pebble swatches; `excludeColors` subtracts specific ones (e.g.
+white from the holiday picker, where white means "no highlight" rather than a real color). A
+`color` item may also take its DISPLAYED value from a named
+[display resolver](#display-resolver-registry--pconfdisplayresolvers) (`displayFrom`) — the chip
+and the palette's current-swatch marker both follow it, the stored value is untouched, and
+picking the shown swatch is what writes it.
 
 ### Section and item fields
 
@@ -251,7 +289,9 @@ chrome. They are not serialized (no `messageKey`).
 |-------|------|-------------|
 | `title` | string | Section heading |
 | `intro` | string | HTML rendered above items |
-| `block` | string | Custom-block id (see [Registries](#registries-and-hooks)) |
+| `blockBefore` | string | Custom-block id rendered ABOVE the items (below the intro) — the mirror of `block`. Use it for a preview that heads the whole card, instead of hanging one off whichever item happens to be first. |
+| `blockBeforeSticky` | boolean | Pins the `blockBefore` block below the topbar while the rows scroll under it (same as the item-level flag) |
+| `block` | string | Custom-block id rendered BELOW the items (see [Registries](#registries-and-hooks)) |
 | `collapsible` | boolean | Collapses the section into an expandable card |
 | `items` | Item[] | The items to render |
 
@@ -259,10 +299,12 @@ chrome. They are not serialized (no `messageKey`).
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `type` | string | One of the seven types above |
+| `type` | string | One of the fourteen types above |
 | `messageKey` | string | Serialization key — must match the AppMessage/C key |
 | `defaultValue` | any | Default value. Color defaults are ints (e.g. `0xFFFFFF`). |
 | `options` | `[label, value][]` | Choices for `select`, `segmented`, `radio` |
+| `optionDisabledWhen` | `{ value: showWhen }` | Renders individual `segmented`/`radio` options inert while their condition holds. Prefer this over gating the list itself with `optionsFrom`: an option that disappears is snapped away, silently rewriting a stored value the user never touched. |
+| `displayFrom` | `{ resolver, args }` | Paints a DERIVED value from a named [display resolver](#display-resolver-registry--pconfdisplayresolvers) while the stored value stays untouched. Read by `color` only; ignored on an `inline` item. |
 | `description` | string | HTML description rendered below the label |
 | `hint` | string | HTML hint rendered below the control |
 | `hintByValue` | `{ value: string }` | Per-value hints; overrides `hint` for the current value |
@@ -302,18 +344,32 @@ Populated by the library from `Pebble.getActiveWatchInfo()` at `generateUrl` tim
 
 ```js
 env = {
-  color:    true,       // false for aplite, diorite, flint (known 1-bit platforms)
-  round:    false,      // true only for chalk
-  platform: "basalt",   // raw platform string
-  health:   true        // false for aplite (no PBL_HEALTH sensors)
+  color:         true,       // false for aplite, diorite, flint (known 1-bit platforms)
+  round:         false,      // true only for chalk
+  platform:      "basalt",   // raw platform string
+  health:        true,       // false for aplite (no PBL_HEALTH sensors)
+  radar:         true,       // false for aplite (no WW_RAIN_RADAR)
+  themePolarity: true,       // false for aplite (no WW_THEME_POLARITY — light/B&W-Inv theme)
+  hr:            false,      // true only for emery, diorite (heart-rate sensor)
+  thresholds:    true        // false for aplite (no WW_THRESHOLD_HIGHLIGHT)
 }
-// Fallback when watchInfo is unavailable: { color: true, round: false, platform: '', health: true }
+// Fallback when watchInfo is unavailable:
+// { color: true, round: false, platform: '', health: true, radar: true,
+//   themePolarity: true, hr: false, thresholds: true }
 ```
 
-The set of known 1-bit platforms (`aplite`, `diorite`, `flint`) and the no-health platform
-(`aplite`) are Pebble facts owned by the library in `lib/platform.js`. The `color = true` and
-`health = true` fallbacks are conservative (show the controls if the platform is unknown). `env.round`
-is exposed for forward-compatibility; `env.color` and `env.health` are the load-bearing values.
+The host app may contribute additional facts by passing them as `generateUrl`'s `env`: the
+value is merged **over** the computed env, so the app supplies only the keys the library cannot
+know. That is the seam for *phone*-runtime capabilities — WarnWeather passes `phoneBattery`
+(whether this PKJS host exposes the Battery Status API, which only Android's Chromium WebView
+does) — because the library derives env from `watchInfo` alone and never reads app storage.
+
+The set of known 1-bit platforms (`aplite`, `diorite`, `flint`), the no-health/no-radar/
+no-theme-polarity/no-threshold platform (`aplite`), and the heart-rate-capable platforms
+(`emery`, `diorite`) are Pebble facts owned by the library in `lib/platform.js`. Every fallback
+except `hr` is conservative (show the controls if the platform is unknown); `hr` defaults to
+`false` so an unrecognized watch isn't offered a permanently-empty slot. `env.round` is exposed
+for forward-compatibility; the rest are load-bearing values gating real shipped features.
 
 ### Hidden-item serialization rule
 
@@ -349,6 +405,54 @@ Registering to the same `id` twice overwrites the first registration. Requesting
 
 `userData` carries whatever the app puts there — typically last-fetch timestamps, connection stats,
 or any other data that must travel from PKJS into the page without going through settings storage.
+
+### Options-resolver registry — PConf.optionsResolvers
+
+A `select`, `searchSelect`, or `radio` item with an `optionsFrom: { resolver: id, args }` field
+resolves its option list dynamically instead of using a static `options` array — mirrors the block
+registry above:
+
+```js
+// Returns [[label, value], …]
+PConf.optionsResolvers.register('statusSlot', function (state, env, args) {
+  return [['None', ''], ['Temperature', 'temp'], /* … */];
+});
+```
+
+### Display-resolver registry — PConf.displayResolvers
+
+An item with a `displayFrom: { resolver: id, args }` field PAINTS a derived value while its
+stored value stays untouched — for a key whose effective value is computed elsewhere (a colour
+that cascades from a sibling key until the user pins it). `color` is the only type that reads
+it today.
+
+```js
+// Returns the value to display; return null/undefined for "use the stored value".
+PConf.displayResolvers.register('graphNightTint', function (state, env, args) {
+  // args carries the item's own messageKey, merged UNDER displayFrom.args
+  return cascadedHexFor(state, args.scope);   // '#RRGGBB'
+});
+```
+
+The write path is unaffected: the control still stores under its own `messageKey`, so picking
+the shown value is what pins it. An unregistered resolver id falls back to the stored value.
+
+### Action registry — PConf.actions
+
+A `button` item dispatches to the registered action by its `action` id when tapped. Actions are
+assigned directly (no `.register()` helper):
+
+```js
+// Receives (arg, state, env, defaultOf). Return true to trigger a re-render; anything
+// else no-ops. `defaultOf(key)` is the engine's stored-shape schema-default resolver
+// (env-aware defaultFrom resolution, number color defaults as '#RRGGBB'; undefined for
+// a key with no schema item) — use it for reset-style actions instead of mirroring
+// schema defaults as literals, which drift when the schema changes.
+PConf.actions.resetThresholds = function (arg, state, env, defaultOf) {
+  // mutate state …
+  return true;
+};
+```
 
 ### Hook registry — PConf.hooks
 
@@ -391,28 +495,39 @@ concatenates the library's WebView files and the app's own browser-side files in
 
 ```js
 // scripts/build-config-page.js  (app-side wrapper; no new dependencies)
-var buildPage = require('./src/pkjs/config-ui/scripts/build-page.js');
+var build = require('../src/pkjs/config-ui/scripts/build-page.js');
 
-buildPage({
-  appFiles: [
-    'src/pkjs/settings/blocks.js',
-    'src/pkjs/settings/onbuild.js'
-  ],
-  out: 'src/pkjs/settings/page.generated.js'
-});
+function run() {
+  assertScreenshots();   // app-specific guard: fails if required screenshots are missing
+  return build.writeGenerated({
+    appFiles: [
+      'src/pkjs/settings/blocks.js',
+      'src/pkjs/settings/onbuild.js'
+    ],
+    out: 'src/pkjs/settings/page.generated.js'
+  });
+}
 ```
 
-`buildPage({ appFiles, out })`:
+`writeGenerated({ appFiles, out })` calls `buildPage({ appFiles })` (below), writes the result to
+`out` as `module.exports = <JSON-stringified HTML string>` (via a per-process temp file + atomic
+rename, so a concurrent reader never sees a half-written file), and returns `out`.
+
+`buildPage({ appFiles })`:
 
 1. Reads `lib/shell.html` (page skeleton, `Object.assign` polyfill, `INJECTED_*` variable
    declarations, and two markers).
 2. At the `/*__PCONF_CONCAT__*/` marker, concatenates in order:
+   - `lib/schema-walk.js` — single-source schema traversal (`PConf.schemaWalk`)
+   - `lib/color.js` — int↔hex color conversion (`PConf.color`)
    - `lib/show-when.js` — predicate evaluator (`PConf.showWhen`)
-   - `lib/engine.js` — render engine, block registry, hook registry
+   - `lib/html.js` — the escape helper + shared sheet header (`PConf.html`)
+   - `lib/date-picker.js` — the date control: value helpers, wheel renderers, scroll-settle wiring (`PConf.datePicker`)
+   - `lib/range-control.js` — the dual-thumb/threshold slider: numeric rules, renderers, drag wiring (`PConf.rangeControl`)
+   - `lib/engine.js` — render engine, registries, hooks, modal shell, event wiring
    - each file in `appFiles` — the app's blocks and hooks
    - `PConf.engine.boot();` — boot runs last, after all registrations
 3. Preserves the `/*__PCONF_INJECT__*/` marker for runtime injection inside `generateUrl`.
-4. Writes `out` as `module.exports = <JSON-stringified HTML string>`.
 
 Run this step (wired into `scripts/build.sh` before `pebble build`) whenever `blocks.js`,
 `onbuild.js`, or any library WebView file changes. `page.generated.js` is a build artifact;
@@ -429,7 +544,7 @@ documented future adapter, Layer 3 declined** — plus the data layer, which is 
 
 The persisted blob (`clay-settings` localStorage key), the `CLAY_*` AppMessage mapping, and int
 color values are byte-for-byte identical to what Clay produced. The C side cannot distinguish the
-library from Clay. Pinned by the golden-blob acceptance test.
+library from Clay.
 
 ### Layer 1 — Clay-shaped instance API (built)
 
@@ -502,9 +617,11 @@ hooks should translate them to `showWhen` predicates and hook callbacks.
 `src/pkjs/config-ui/` is the self-contained lift-out unit. It is structured so that extraction to
 the `pebble-config-ui` npm package is a folder move, not a rewrite:
 
-- **Self-contained:** own `package.json`, `README.md`, `test/` with zero WarnWeather references.
+- **Self-contained:** own `package.json`, `README.md`, `test/` with only incidental WarnWeather
+  references (a fixture URL in `emulator-url.test.js`, a code comment in `engine.test.js`) — worth
+  a scrub before extraction, not a blocker.
 - **No inbound app coupling:** the library never `require`s `../settings` or any app module. It
-  receives the schema and the built page as arguments. A grep check enforces this.
+  receives the schema and the built page as arguments.
 - **Shared polyfill:** the library currently leans on `../polyfills.js` (the repo's shared
   `Object.assign` / `Array.find/findIndex/includes` guards). On extraction, inline those guards
   into the library's own `index.js` or a `lib/polyfills.js` — the package becomes dependency-free.

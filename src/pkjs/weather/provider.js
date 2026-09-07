@@ -1,182 +1,30 @@
 var SunCalc = require('suncalc');
 var pickNext24hSunEvents = require('./sun-events.js').pickNext24hSunEvents;
-var storageKeys = require('../storage-keys.js');
 var outbox = require('../outbox.js');
 var wireUnits = require('../wire-units.js');
 var clampByte = wireUnits.clampByte;
 var zeroFilledArray = wireUnits.zeroFilledArray;
-var forecastSeries = require('../forecast-series');
 var airQuality = require('./air-quality.js');
 var pollen = require('./pollen.js');
 
-var XHR_TIMEOUT_MS = 5000;
-var GPS_CACHE_KEY = 'gpsCache';
-var GPS_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-var GEOCODE_CACHE_KEY = storageKeys.GEOCODE_CACHE_KEY;
-var RATE_LIMIT_BACKOFF_KEY = storageKeys.GEOCODE_BACKOFF_KEY;
+// The XHR helper + failure shape live in http.js (a leaf, so the auxiliary
+// fetches can require them without the old provider-cycle lazy-require hack);
+// the WeatherProvider.request/.failure statics below stay the adapters' (and
+// the tests') seam.
+var http = require('./http.js');
+var request = http.request;
+var failure = http.failure;
+// Location storage/parse helpers (GPS cache, geocode cache + backoff, override
+// parser) live in location.js; the orchestration below keeps their names.
+var locationLib = require('./location.js');
+var readStoredJson = locationLib.readStoredJson;
+var parseLocationOverride = locationLib.parseLocationOverride;
+var readGeocodeCache = locationLib.readGeocodeCache;
+var writeGeocodeCache = locationLib.writeGeocodeCache;
+var writeGeocodeBackoff = locationLib.writeGeocodeBackoff;
+var readGpsCache = locationLib.readGpsCache;
+var GPS_CACHE_MAX_AGE_MS = locationLib.GPS_CACHE_MAX_AGE_MS;
 
-/**
- * Perform an HTTP request and return response text.
- *
- * @param {string} url Request URL.
- * @param {string} type HTTP method.
- * @param {Function} onSuccess Callback with response text.
- * @param {Function} onFailure Callback with error details.
- * @param {Object} [headers] Optional request headers ({name: value}). Each one
- *   is set individually in try/catch: some runtimes forbid certain headers
- *   (e.g. User-Agent) and must not abort the request.
- * @param {string} [body] Optional request body (e.g. a GraphQL POST payload).
- *   Omitted/empty → sent as a bodyless request, identical to the prior behavior.
- * @returns {void}
- */
-function request(url, type, onSuccess, onFailure, headers, body) {
-    var xhr = new XMLHttpRequest();
-    xhr.timeout = XHR_TIMEOUT_MS;
-    xhr.onload = function() {
-        if (xhr.status >= 200 && xhr.status < 300) {
-            onSuccess(this.responseText);
-            return;
-        }
-        onFailure({
-            code: 'status_' + xhr.status,
-            detail: 'http_status'
-        });
-    };
-    xhr.onerror = function() {
-        onFailure({
-            code: 'network_error',
-            detail: 'xhr_error'
-        });
-    };
-    xhr.ontimeout = function() {
-        onFailure({
-            code: 'timeout',
-            detail: 'xhr_timeout'
-        });
-    };
-    xhr.open(type, url);
-    if (headers) {
-        for (var name in headers) {
-            if (Object.prototype.hasOwnProperty.call(headers, name)) {
-                try {
-                    xhr.setRequestHeader(name, headers[name]);
-                }
-                catch (ex) {
-                    // Runtime forbids this header — the others still identify us.
-                }
-            }
-        }
-    }
-    xhr.send(body || undefined);
-}
-
-/**
- * Build a normalized fetch failure payload.
- *
- * @param {string} stage Failure stage identifier.
- * @param {string} code Failure code identifier.
- * @returns {{stage: string, code: string}} Normalized failure object.
- */
-function failure(stage, code) {
-    return {
-        stage: stage,
-        code: code
-    };
-}
-
-/**
- * Parse stored JSON and clear invalid values.
- *
- * @param {string} key localStorage key.
- * @returns {*} Parsed value or null when missing/invalid.
- */
-function readStoredJson(key) {
-    var raw = localStorage.getItem(key);
-
-    if (raw === null) {
-        return null;
-    }
-
-    try {
-        return JSON.parse(raw);
-    }
-    catch (ex) {
-        localStorage.removeItem(key);
-        return null;
-    }
-}
-
-/**
- * Normalize a location query for cache lookups.
- *
- * @param {string} location Query string.
- * @returns {string} Normalized query string.
- */
-function normalizeLocationQuery(location) {
-    return location.trim();
-}
-
-/**
- * Read the cached geocode result for the active location.
- *
- * @param {string} location Query string.
- * @returns {{query: string, lat: string, lon: string, time: number}|null}
- */
-function readGeocodeCache(location) {
-    var cachedGeocode = readStoredJson(GEOCODE_CACHE_KEY);
-    var normalizedLocation = normalizeLocationQuery(location);
-    var cachedQuery;
-
-    if (cachedGeocode && typeof cachedGeocode.query === 'string') {
-        cachedQuery = normalizeLocationQuery(cachedGeocode.query);
-        if (cachedQuery === normalizedLocation) {
-            return cachedGeocode;
-        }
-    }
-
-    if (cachedGeocode && typeof cachedGeocode.query !== 'string') {
-        localStorage.removeItem(GEOCODE_CACHE_KEY);
-    }
-
-    return null;
-}
-
-/**
- * Persist a successful geocode lookup.
- *
- * @param {string} location Query string.
- * @param {string} lat Latitude.
- * @param {string} lon Longitude.
- * @returns {void}
- */
-function writeGeocodeCache(location, lat, lon) {
-    localStorage.setItem(GEOCODE_CACHE_KEY, JSON.stringify({
-        query: normalizeLocationQuery(location),
-        lat: lat,
-        lon: lon,
-        time: Date.now()
-    }));
-}
-
-/**
- * Record a LocationIQ 429 backoff window.
- *
- * @returns {number} Backoff duration in milliseconds.
- */
-function writeGeocodeBackoff() {
-    var currentBackoff = readStoredJson(RATE_LIMIT_BACKOFF_KEY);
-    var attempts = currentBackoff && currentBackoff.attempts ? currentBackoff.attempts : 0;
-    var backoffMs = attempts > 0
-        ? Math.min(30000 * Math.pow(2, attempts), 1800000)
-        : 60000;
-
-    localStorage.setItem(RATE_LIMIT_BACKOFF_KEY, JSON.stringify({
-        until: Date.now() + backoffMs,
-        attempts: attempts + 1
-    }));
-
-    return backoffMs;
-}
 
 var WeatherProvider = function() {
     this.numEntries = 24;
@@ -199,6 +47,35 @@ var WeatherProvider = function() {
     // Pollen is opt-in and DWD-only; null renders as '--' unless the auxiliary
     // fetch fills it. Transient: consumed by formatValue, never wired.
     this.pollenToday = null;
+    // Pressure is sea-level (MSL) hPa and not every provider exposes it; empty →
+    // the pressure line stays off and the status slot shows '--'. Transient:
+    // consumed by forecast-series + formatValue, never wired.
+    this.pressureTrend = [];
+    // Feels-like (apparent temperature, °F) — API-sourced or Steadman-computed
+    // (feels-like.js). Empty/null → the feels line stays off and the temp slot
+    // renders the actual temp alone. Transient: consumed by forecast-series +
+    // formatValue, never wired.
+    this.feelsTrend = [];
+    this.currentFeels = null;
+    // Dew point in °F — the same internal temperature unit as currentTemp and
+    // feelsTrend, so each adapter converts at its own boundary. One entry per
+    // hourly slot. Empty → degrade: the dew slot renders '--', as it does on
+    // Yandex, which does not source it. Transient: consumed by formatValue,
+    // never wired.
+    this.dewTrend = [];
+    // Wind bearing in degrees 0-359, the meteorological "comes from" convention
+    // every provider reports; the downwind flip the arrow draws happens once, at
+    // bake time, in status-lines.js. One entry per hourly slot. Empty → degrade:
+    // the wind and gust slots simply draw no arrow. Transient: consumed by
+    // formatValue/packLine, never wired.
+    this.windDirTrend = [];
+    // Whether to do the apparent-temperature work at all (index.js sets it from
+    // forecastSeries.needsFeels before each fetch). Unlike fetchUv/fetchAqi/
+    // fetchPollen this defaults to TRUE, because it gates no request — only
+    // per-hour arithmetic on a response already in hand. Fail-safe direction:
+    // a caller that forgets to set it wastes a few hundred multiplications,
+    // where the fail-closed default would silently blank the feels curve.
+    this.fetchFeels = true;
 };
 
 /**
@@ -221,6 +98,19 @@ WeatherProvider.prototype.gpsOverride = function(location) {
 };
 
 /**
+ * Drop any armed geocode rate-limit backoff. Called for a user-initiated refresh
+ * (Force-fetch toggle, provider/key change) — the same contract authBackoff.clear()
+ * has: an explicit user action overrides a self-healing cooldown. Without this a
+ * manual location whose geocode 429'd would silently swallow every forced fetch for
+ * up to the 30-minute ceiling, with only a console line to show for it.
+ *
+ * @returns {void}
+ */
+WeatherProvider.prototype.clearGeocodeBackoff = function() {
+    locationLib.clearGeocodeBackoff();
+};
+
+/**
  * Determine whether the provider is currently rate-limited for geocoding.
  *
  * @returns {boolean} True when forward geocoding should be skipped.
@@ -237,7 +127,7 @@ WeatherProvider.prototype.isGeocodeBackoffActive = function() {
         return false;
     }
 
-    backoffData = readStoredJson(RATE_LIMIT_BACKOFF_KEY);
+    backoffData = locationLib.readGeocodeBackoff();
     if (!backoffData) {
         return false;
     }
@@ -246,7 +136,7 @@ WeatherProvider.prototype.isGeocodeBackoffActive = function() {
         return true;
     }
 
-    localStorage.removeItem(RATE_LIMIT_BACKOFF_KEY);
+    locationLib.clearGeocodeBackoff();
     return false;
 };
 
@@ -302,6 +192,7 @@ WeatherProvider.prototype.withSunEvents = function(lat, lon, callback, onFailure
     callback(next24HourSunEvents);
 };
 
+
 /**
  * Reverse-geocode coordinates to a display city name + country code via ArcGIS.
  *
@@ -345,45 +236,6 @@ WeatherProvider.prototype.withCityName = function(lat, lon, callback, onFailure)
 };
 
 // https://github.com/Toasbi/WarnWeather/issues/59#issue-1317582743
-var LAT_LON_PATTERN = /^([-+]?\d*\.?\d+)\s*,\s*([-+]?\d*\.?\d+)$/;
-
-/**
- * Parse a location override into GPS, manual coordinates, or an address.
- *
- * @param {*} location Location override value.
- * @returns {{ type: 'gps'|'manual_coordinates'|'manual_address', query: string|null, latitude: string|null, longitude: string|null }} Parsed override state.
- */
-function parseLocationOverride(location) {
-    var trimmedLocation;
-    var match;
-
-    trimmedLocation = typeof location === 'string' ? normalizeLocationQuery(location) : null;
-    if (trimmedLocation === null || trimmedLocation.length === 0) {
-        return {
-            type: 'gps',
-            query: null,
-            latitude: null,
-            longitude: null
-        };
-    }
-
-    match = trimmedLocation.match(LAT_LON_PATTERN);
-    if (match !== null) {
-        return {
-            type: 'manual_coordinates',
-            query: trimmedLocation,
-            latitude: match[1],
-            longitude: match[2]
-        };
-    }
-
-    return {
-        type: 'manual_address',
-        query: trimmedLocation,
-        latitude: null,
-        longitude: null
-    };
-}
 
 /**
  * Resolve coordinates from the location override: pass through manual lat/lon,
@@ -476,41 +328,13 @@ WeatherProvider.prototype.withGeocodeCoordinates = function(callback, onFailure)
             }
             else {
                 // Clear backoff on non-429 errors (e.g. network issues)
-                localStorage.removeItem(RATE_LIMIT_BACKOFF_KEY);
+                locationLib.clearGeocodeBackoff();
             }
             onFailure(failure('forward_geocode', error.code));
         }).bind(this)
     );
 };
 
-/**
- * Read and validate the cached GPS fix from localStorage.
- *
- * @returns {?{lat: number, lon: number, time: number}} The parsed fix, or null
- *   when it is absent, corrupt, or missing a required numeric field.
- */
-function readGpsCache() {
-    var raw = localStorage.getItem(GPS_CACHE_KEY);
-    var parsed;
-    if (raw === null) {
-        return null;
-    }
-    try {
-        parsed = JSON.parse(raw);
-    }
-    catch (ex) {
-        return null;
-    }
-    if (
-        parsed &&
-        typeof parsed.lat === 'number' &&
-        typeof parsed.lon === 'number' &&
-        typeof parsed.time === 'number'
-    ) {
-        return parsed;
-    }
-    return null;
-}
 
 /**
  * Resolve coordinates from device GPS, falling back to a fresh-enough cached
@@ -552,11 +376,7 @@ WeatherProvider.prototype.withGpsCoordinates = function(callback, onFailure) {
         var lat = pos.coords.latitude;
         var lon = pos.coords.longitude;
         console.log('FOUND LOCATION: lat= ' + lat + ' lon= ' + lon);
-        localStorage.setItem(GPS_CACHE_KEY, JSON.stringify({
-            lat: lat,
-            lon: lon,
-            time: Date.now()
-        }));
+        locationLib.writeGpsCache(lat, lon);
         provider.usedGpsCache = false;
         provider.gpsErrorCode = null;
         callback(lat, lon);
@@ -657,28 +477,6 @@ WeatherProvider.prototype.composeWeatherPayload = function(extraPayload, payload
         payload = payloadTransform(payload);
     }
     return payload;
-};
-
-/**
- * Orchestrate a full weather fetch: resolve coordinates, reverse-geocode the
- * city, compute sun events, populate provider data, then compose and send the
- * payload via the deduping outbox. Each stage routes its own failure to
- * onFailure with a stage-appropriate code.
- *
- * @param {Function} onSuccess Called after the payload is ACKed (or no-op send).
- * @param {Function} onFailure Called with a failure object on any stage error.
- * @param {boolean} force Whether this is a forced refresh.
- * @param {Object} extraPayload Extra AppMessage tuples (radar/sleep) to merge.
- * @param {Function} [payloadTransform] Optional PKJS render transform.
- * @returns {void}
- */
-WeatherProvider.prototype.fetch = function(onSuccess, onFailure, force, extraPayload, payloadTransform) {
-    var self = this;
-    this.withCoordinates(function(lat, lon) {
-        self.fetchWithCoordinates(lat, lon, onSuccess, onFailure, force, extraPayload, payloadTransform);
-    }, function(coordinateFailure) {
-        onFailure(coordinateFailure || failure('coordinates', 'unknown_error'));
-    });
 };
 
 /**
@@ -831,11 +629,22 @@ WeatherProvider.prototype.getPayload = function() {
     var uvs = (this.uvTrend && this.uvTrend.length)
         ? scaleTrendToBytes(this.uvTrend, numEntries, 10) // UV index ×10 (tenths); forecast-series scales vs UV 11.0
         : [];
-    var tempEnc = forecastSeries.tempTrendToBytes(temps);
-    return {
-        TEMP_TREND_UINT8: tempEnc.bytes,
-        TEMP_MIN: tempEnc.min,
-        TEMP_MAX: tempEnc.max,
+    // Whole-degree temps ride as a TRANSIENT series: applyForecastSeries encodes
+    // them ONCE, where settings are in hand — against temp's own band, or the
+    // padded joint temp-and-feels band when the feels line is selected. (An
+    // early encode here forced a decode-and-re-encode round trip downstream.)
+    // TEMP_MIN/TEMP_MAX carry the ACTUAL air range either way: the watch reads
+    // them only for the hi/lo labels; the scaling band travels in the bytes.
+    var tempMin = Infinity, tempMax = -Infinity, ti;
+    for (ti = 0; ti < temps.length; ti += 1) {
+        if (temps[ti] < tempMin) { tempMin = temps[ti]; }
+        if (temps[ti] > tempMax) { tempMax = temps[ti]; }
+    }
+    if (!isFinite(tempMin)) { tempMin = 0; tempMax = 0; }
+    var payload = {
+        TEMP_RAW_TREND: temps, // Transient PKJS-only: whole-degree temps; forecast-series encodes + deletes before send
+        TEMP_MIN: tempMin,
+        TEMP_MAX: tempMax,
         PRECIP_TREND_UINT8: precips, // Holds values within [0,100]
         RAIN_TREND_UINT8: rains, // Holds values within [0,255], representing 0.0..25.5 mm/h (5 mm cap on the watch; >5 mm signals overflow)
         WIND_TREND_UINT8: winds, // Transient PKJS-only: km/h integers; forecast-series consumes + deletes this before send
@@ -843,6 +652,7 @@ WeatherProvider.prototype.getPayload = function() {
         UV_TREND_UINT8: uvs, // Transient PKJS-only: UV tenths; forecast-series consumes + deletes before send
         AQI_TREND: (this.aqiTrend && this.aqiTrend.length) ? this.aqiTrend.slice(0, numEntries) : [], // Transient PKJS-only: current-window AQI ints; forecast-series consumes + deletes before send
         POLLEN_TODAY: this.pollenToday, // Transient PKJS-only: native DWD severity; forecast-series consumes + deletes before send
+        PRESSURE_TREND: (this.pressureTrend && this.pressureTrend.length) ? this.pressureTrend.slice(0, numEntries) : [], // Transient PKJS-only: sea-level hPa (no _UINT8 — 950..1050 doesn't fit a byte); forecast-series consumes + deletes before send
         FORECAST_START: this.startTime,
         NUM_ENTRIES: numEntries,
         CURRENT_TEMP: Math.round(this.currentTemp),
@@ -850,10 +660,103 @@ WeatherProvider.prototype.getPayload = function() {
         // First byte flags whether the event list starts on a sunrise (0) or sunset (1).
         SUN_EVENTS: encodeSunEvents(this.sunEvents)
     };
+    // Feels-like keys are emitted only when sourced (unlike PRESSURE_TREND's
+    // always-present empty array) so a feels-less payload has no keys to strip.
+    // Transient PKJS-only: forecast-series/formatValue consume + delete before send.
+    if (this.feelsTrend && this.feelsTrend.length) {
+        // °F, whole degrees: Steadman/apparent values are fractional, but the joint
+        // band they widen lands in the int32 TEMP_MIN/TEMP_MAX wire keys.
+        payload.FEELS_TREND = this.feelsTrend.slice(0, numEntries).map(function (v) {
+            return Math.round(v);
+        });
+    }
+    if (typeof this.currentFeels === 'number') {
+        payload.FEELS_CURRENT = Math.round(this.currentFeels); // °F, rounded like CURRENT_TEMP
+    }
+    // Dew point and wind bearing follow the same conditional-emit rule as the
+    // feels-like keys: absent rather than empty, so a provider that does not
+    // source them leaves no key to strip. Transient PKJS-only — buildStatusLines
+    // bakes both into slot text and forecast-series deletes them before send.
+    if (this.dewTrend && this.dewTrend.length) {
+        payload.DEW_TREND = this.dewTrend.slice(0, numEntries); // °F, unrounded: formatTemp rounds per unit
+    }
+    if (this.windDirTrend && this.windDirTrend.length) {
+        payload.WIND_DIR_TREND = this.windDirTrend.slice(0, numEntries); // degrees 0-359, "comes from"
+    }
+    return payload;
 };
 
 WeatherProvider.request = request;
 WeatherProvider.failure = failure;
+
+/**
+ * Shared request -> parse -> map skeleton for a provider's withProviderData:
+ * one XHR, JSON.parse guarded as '<id>_parse_error', a null map result as
+ * '<id>_missing_fields', and a transport error as '<id>_<code>' — THE
+ * failure-code grammar every provider speaks, structural instead of
+ * conventional. Providers keep only their URL/body/precheck and mapResponse.
+ *
+ * @param {Object} opts {url, method ('GET'), headers, body, id (failure-code
+ *   prefix), label (log name), map (parsed json -> mapped object or null)}.
+ * @param {Function} onMapped Receives the non-null mapped object.
+ * @param {Function} onFailure Receives a failure() object.
+ * @returns {void}
+ */
+WeatherProvider.requestMapped = function(opts, onMapped, onFailure) {
+    // Through the STATIC, not the local closure: tests stub
+    // WeatherProvider.request at runtime, and that seam must keep working.
+    WeatherProvider.request(opts.url, opts.method || 'GET', function(response) {
+        var json;
+        var mapped;
+        try {
+            json = JSON.parse(response);
+        }
+        catch (ex) {
+            onFailure(failure('provider_data', opts.id + '_parse_error'));
+            return;
+        }
+        mapped = opts.map(json);
+        if (mapped === null) {
+            onFailure(failure('provider_data', opts.id + '_missing_fields'));
+            return;
+        }
+        onMapped(mapped);
+    }, function(error) {
+        console.log('[!] ' + (opts.label || opts.id) + ' request failed: ' + JSON.stringify(error));
+        onFailure(failure('provider_data', opts.id + '_' + error.code));
+    }, opts.headers, opts.body);
+};
+
+/**
+ * Adopt a mapped forecast onto the provider: assigns only the keys PRESENT on
+ * `mapped` (providers differ in which optional series their API carries), and
+ * applies the two aux gates in ONE place — with two deliberately different
+ * semantics. feels RESETS to []/null when fetchFeels is off: the value is
+ * parsed from the main response, and on a reused provider instance a stale
+ * window must never ship against a new startTime. uv is adopted only when
+ * fetchUv is on and left UNTOUCHED otherwise: for providers whose uv rides a
+ * separate aux fetch (Open-Meteo), that fetch owns the field.
+ *
+ * @param {Object} mapped mapResponse result.
+ * @returns {void}
+ */
+WeatherProvider.prototype.adoptMapped = function(mapped) {
+    var direct = ['tempTrend', 'precipTrend', 'rainTrend', 'windTrend',
+        'gustTrend', 'pressureTrend', 'dewTrend', 'windDirTrend',
+        'startTime', 'currentTemp'];
+    for (var i = 0; i < direct.length; i++) {
+        if (Object.prototype.hasOwnProperty.call(mapped, direct[i])) {
+            this[direct[i]] = mapped[direct[i]];
+        }
+    }
+    if (Object.prototype.hasOwnProperty.call(mapped, 'feelsTrend')) {
+        this.feelsTrend = this.fetchFeels ? mapped.feelsTrend : [];
+        this.currentFeels = this.fetchFeels ? mapped.currentFeels : null;
+    }
+    if (this.fetchUv && Object.prototype.hasOwnProperty.call(mapped, 'uvTrend')) {
+        this.uvTrend = mapped.uvTrend;
+    }
+};
 
 /**
  * Compute the geolocation maximumAge (ms) from the GPS-cache and update-interval settings.

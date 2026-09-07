@@ -9,9 +9,10 @@ global.localStorage = {
   removeItem: function(k) {}
 };
 
-const { buildClayPayload } = require('../src/pkjs/clay-payload');
+const { buildClayPayload, truncateUtf8Bytes } = require('../src/pkjs/clay-payload');
 const holidayMask = require('../src/pkjs/holidays/holiday-mask');
 const viewCycle = require('../src/pkjs/view-cycle');
+const lineStyle = require('../src/pkjs/line-style');
 
 const NOW = new Date('2026-06-26T00:00:00Z');
 
@@ -182,4 +183,168 @@ test('configTheme is a settings-only key and never rides the Clay AppMessage', f
   s.configTheme = 'light';
   const p = buildClayPayload(s, { platform: 'emery' }, NOW);
   assert.equal(Object.prototype.hasOwnProperty.call(p, 'configTheme'), false);
+});
+
+test('CLAY_HR_SCALE packs the hrScale pair as lo | (hi << 8)', function() {
+  const s = baseSettings();
+  s.healthMode = 'all';
+  s.hrScale = '50-100';   // >= minSpan (50) apart, so the UI can actually produce it
+  const p = buildClayPayload(s, { platform: 'diorite' }, NOW);
+  assert.equal(p.CLAY_HR_SCALE, 50 | (100 << 8));
+  // Both operands must survive the round trip as bytes.
+  assert.equal(p.CLAY_HR_SCALE & 0xFF, 50);
+  assert.equal((p.CLAY_HR_SCALE >> 8) & 0xFF, 100);
+});
+
+test('CLAY_NORAIN_TEXT packs the trimmed radarNoRainText', function() {
+  const s = baseSettings();
+  s.radarNoRainText = '  Dry skies today  ';
+  const p = buildClayPayload(s, { platform: 'basalt' }, NOW);
+  assert.equal(p.CLAY_NORAIN_TEXT, 'Dry skies today');
+});
+
+test('CLAY_NORAIN_TEXT sends an empty string for unset or whitespace-only text (watch falls back to its built-in)', function() {
+  // Unset (pre-seed upgrade blob): the key must still ride so the watch can
+  // clear a previously-stored custom text.
+  assert.equal(buildClayPayload(baseSettings(), { platform: 'basalt' }, NOW).CLAY_NORAIN_TEXT, '');
+  const s = baseSettings();
+  s.radarNoRainText = '   ';
+  assert.equal(buildClayPayload(s, { platform: 'basalt' }, NOW).CLAY_NORAIN_TEXT, '');
+});
+
+test('CLAY_NORAIN_TEXT truncates to 24 UTF-8 bytes, not 24 chars', function() {
+  const s = baseSettings();
+  s.radarNoRainText = 'ÄÄÄÄÄÄÄÄÄÄÄÄÄ';   // 13 chars x 2 bytes = 26 bytes
+  const p = buildClayPayload(s, { platform: 'basalt' }, NOW);
+  assert.equal(p.CLAY_NORAIN_TEXT, 'ÄÄÄÄÄÄÄÄÄÄÄÄ');   // 12 chars = 24 bytes
+  assert.equal(Buffer.byteLength(p.CLAY_NORAIN_TEXT, 'utf8'), 24);
+});
+
+test('CLAY_NORAIN_TEXT never splits a multi-byte sequence at the 24-byte boundary', function() {
+  const s = baseSettings();
+  // 23 ASCII bytes + a 2-byte umlaut would land on 25 — the umlaut must be
+  // dropped whole, never emitted as half a sequence.
+  s.radarNoRainText = 'aaaaaaaaaaaaaaaaaaaaaaaü';
+  const p = buildClayPayload(s, { platform: 'basalt' }, NOW);
+  assert.equal(p.CLAY_NORAIN_TEXT, 'aaaaaaaaaaaaaaaaaaaaaaa');
+  assert.equal(Buffer.byteLength(p.CLAY_NORAIN_TEXT, 'utf8'), 23);
+});
+
+test('CLAY_NORAIN_TEXT is omitted for a radar-less watch (aplite) but kept for unknown platforms', function() {
+  const s = baseSettings();
+  s.radarNoRainText = 'Dry';
+  const aplite = buildClayPayload(s, { platform: 'aplite' }, NOW);
+  assert.equal(Object.prototype.hasOwnProperty.call(aplite, 'CLAY_NORAIN_TEXT'), false);
+  // Unknown watchInfo must never drop a real feature (computeEnv convention).
+  const unknown = buildClayPayload(s, null, NOW);
+  assert.equal(unknown.CLAY_NORAIN_TEXT, 'Dry');
+});
+
+test('truncateUtf8Bytes keeps or drops a surrogate pair whole (4-byte emoji)', function() {
+  // 21 ASCII bytes + a 4-byte emoji = 25 bytes -> the emoji is dropped whole.
+  const emoji = '🌧';   // 🌧 (U+1F327), 4 UTF-8 bytes
+  const over = 'aaaaaaaaaaaaaaaaaaaaa' + emoji;
+  assert.equal(truncateUtf8Bytes(over, 24), 'aaaaaaaaaaaaaaaaaaaaa');
+  // 20 ASCII bytes + the emoji = 24 bytes -> fits exactly, pair intact.
+  const fits = 'aaaaaaaaaaaaaaaaaaaa' + emoji;
+  assert.equal(truncateUtf8Bytes(fits, 24), fits);
+  assert.equal(Buffer.byteLength(truncateUtf8Bytes(fits, 24), 'utf8'), 24);
+});
+
+test('truncateUtf8Bytes passes short strings through untouched', function() {
+  assert.equal(truncateUtf8Bytes('No rain ahead', 24), 'No rain ahead');
+  assert.equal(truncateUtf8Bytes('', 24), '');
+});
+
+test('CLAY_CURVE_INSET_UINT8 sends the fixed [7,0,0] when feels is not selected', function() {
+  // The inset is deliberately NOT a user setting — a fixed 7 px (the watch's
+  // BOTTOM_VIEW_PRIMARY_LINE_INSET_Y), with the per-series triple only marking
+  // which metric channel carries feels-like.
+  const p = buildClayPayload(baseSettings(), { platform: 'emery' }, NOW);
+  assert.deepEqual(p.CLAY_CURVE_INSET_UINT8, [7, 0, 0]);
+});
+
+test('CLAY_CURVE_INSET_UINT8: feels on the secondary line shares the temp inset', function() {
+  const s = baseSettings();
+  s.secondaryLine = 'feels';
+  s.thirdLine = 'uv';
+  const p = buildClayPayload(s, { platform: 'basalt' }, NOW);
+  assert.deepEqual(p.CLAY_CURVE_INSET_UINT8, [7, 7, 0]);
+});
+
+test('CLAY_CURVE_INSET_UINT8: feels on the third line shares the temp inset', function() {
+  const s = baseSettings();
+  s.secondaryLine = 'precip_prob';
+  s.thirdLine = 'feels';
+  const p = buildClayPayload(s, { platform: 'basalt' }, NOW);
+  assert.deepEqual(p.CLAY_CURVE_INSET_UINT8, [7, 0, 7]);
+});
+
+test('CLAY_CURVE_INSET_UINT8 is omitted for aplite (WW_CURVE_INSET compiled out) but kept for unknown platforms', function() {
+  const s = baseSettings();
+  const aplite = buildClayPayload(s, { platform: 'aplite' }, NOW);
+  assert.equal(Object.prototype.hasOwnProperty.call(aplite, 'CLAY_CURVE_INSET_UINT8'), false);
+  // Unknown watchInfo must never drop a real feature (computeEnv convention).
+  const unknown = buildClayPayload(s, null, NOW);
+  assert.deepEqual(unknown.CLAY_CURVE_INSET_UINT8, [7, 0, 0]);
+});
+
+test('the Clay message carries the graph line styling', function() {
+  const s = Object.assign(baseSettings(), {
+    secondaryLine: 'wind', thirdLine: 'gust', theme: 'dark'
+  });
+  const p = buildClayPayload(s, { platform: 'emery' }, NOW);
+  assert.ok(Array.isArray(p.CLAY_LINE_STYLE_UINT8));
+  assert.equal(p.CLAY_LINE_STYLE_UINT8.length, 10);
+  // Packed by the one resolver both the wire and the render read (line-style.js),
+  // so the Clay tuple can't drift from what the graph builder assumes.
+  assert.deepEqual(p.CLAY_LINE_STYLE_UINT8,
+    lineStyle.buildLineStyleBytes(s, { platform: 'emery' }));
+});
+
+test('aplite gets the line styling too (it has the forecast graph)', function() {
+  // Unlike the threshold blob / no-rain text / curve insets, nothing about the
+  // graph's line colours is compiled out on aplite — it draws the same two metric
+  // lines — so this tuple is NOT platform-gated.
+  const s = Object.assign(baseSettings(), {
+    secondaryLine: 'wind', thirdLine: 'off', theme: 'dark'
+  });
+  assert.equal(buildClayPayload(s, { platform: 'aplite' }, NOW).CLAY_LINE_STYLE_UINT8.length, 10);
+  // ... and an unknown watchInfo never drops it either.
+  assert.equal(buildClayPayload(s, null, NOW).CLAY_LINE_STYLE_UINT8.length, 10);
+});
+
+test('CLAY_HR_SCALE falls back to 40-150 when unset or malformed', function() {
+  const expected = 40 | (150 << 8);
+  const s = baseSettings();
+  assert.equal(buildClayPayload(s, { platform: 'diorite' }, NOW).CLAY_HR_SCALE, expected,
+    'unset');
+  s.hrScale = 'nonsense';
+  assert.equal(buildClayPayload(s, { platform: 'diorite' }, NOW).CLAY_HR_SCALE, expected,
+    'malformed');
+  s.hrScale = '95-55';
+  assert.equal(buildClayPayload(s, { platform: 'diorite' }, NOW).CLAY_HR_SCALE, expected,
+    'inverted');
+  s.hrScale = '300-400';
+  assert.equal(buildClayPayload(s, { platform: 'diorite' }, NOW).CLAY_HR_SCALE, expected,
+    'out of byte range');
+});
+
+// The schema ships the setting ON (schema.js), so the absent case here is not the
+// shipped default -- it is what a settings blob that never carried the key sends.
+test('CLAY_LARGE_GRAPH_FONT reflects the largeGraphFont setting (absent reads as off)', () => {
+  assert.equal(buildClayPayload(baseSettings(), { platform: 'emery' }, NOW).CLAY_LARGE_GRAPH_FONT, false);
+  const on = baseSettings();
+  on.largeGraphFont = true;
+  assert.equal(buildClayPayload(on, { platform: 'emery' }, NOW).CLAY_LARGE_GRAPH_FONT, true);
+});
+
+test('CLAY_LARGE_GRAPH_FONT rides every platform (only the WATCH gates it)', () => {
+  // Unlike CLAY_NORAIN_TEXT / CLAY_CURVE_INSET_UINT8 / CLAY_THRESHOLDS_UINT8, this key is
+  // NOT platform-gated on the phone: it is 11 B, every non-emery Clay bundle has room, and
+  // sending it unconditionally means an emery watch can't be starved of the setting by a
+  // watchInfo hiccup. The watch does the skipping -- config_wire.c only spends a dict_find
+  // on it under PBL_PLATFORM_EMERY (config.h's field carries the same guard).
+  const p = buildClayPayload(baseSettings(), { platform: 'aplite' }, NOW);
+  assert.equal(Object.prototype.hasOwnProperty.call(p, 'CLAY_LARGE_GRAPH_FONT'), true);
 });

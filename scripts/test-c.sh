@@ -6,10 +6,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p build/host
 CFLAGS="-std=c11 -Wall -Wextra -Werror -DPBL_HEALTH -Itest/c/stub -Isrc"
-# WW_QUICK_VIEW is defined for every non-aplite platform (wscript); the host layout test
-# represents that evolving-platform build, so it exercises the peek view/layout.
-cc $CFLAGS -DWW_QUICK_VIEW -DWW_VIEW_CYCLE test/c/layout_test.c src/c/windows/layout.c -o build/host/layout_test
-cc $CFLAGS -DWW_QUICK_VIEW -DWW_VIEW_CYCLE -DPBL_PLATFORM_EMERY test/c/layout_test.c src/c/windows/layout.c -o build/host/layout_test_emery
+# WW_QUICK_VIEW / WW_CLOCK_INK are defined for every non-aplite platform (wscript); the host
+# layout test represents that evolving-platform build, so it exercises the peek view/layout and
+# the clock ink centring. The aplite twin build below deliberately defines neither.
+cc $CFLAGS -DWW_QUICK_VIEW -DWW_VIEW_CYCLE -DWW_CLOCK_INK test/c/layout_test.c src/c/windows/layout.c -o build/host/layout_test
+cc $CFLAGS -DWW_QUICK_VIEW -DWW_VIEW_CYCLE -DWW_CLOCK_INK -DPBL_PLATFORM_EMERY test/c/layout_test.c src/c/windows/layout.c -o build/host/layout_test_emery
 build/host/layout_test "${1:-}"
 build/host/layout_test_emery "${1:-}"
 # Aplite lean twin: compiled exactly as the aplite platform build (no PBL_HEALTH,
@@ -31,13 +32,50 @@ cc $CFLAGS test/c/radar_axis_test.c src/c/appendix/radar_axis.c -o build/host/ra
 build/host/radar_axis_test
 cc $CFLAGS test/c/status_line_test.c src/c/appendix/status_line.c -o build/host/status_line_test
 build/host/status_line_test
+cc $CFLAGS test/c/status_threshold_test.c src/c/appendix/status_threshold.c -o build/host/status_threshold_test
+build/host/status_threshold_test
+cc $CFLAGS test/c/hr_scale_test.c src/c/appendix/hr_scale.c -o build/host/hr_scale_test
+build/host/hr_scale_test
+# Compiled twice like layout_test: status_highlight_extent's strip floor depends on the
+# per-platform STATUS_STRIP_CAL_GAP.
 cc $CFLAGS test/c/status_row_layout_test.c src/c/layers/status_row_layout.c -o build/host/status_row_layout_test
 build/host/status_row_layout_test
+cc $CFLAGS -DPBL_PLATFORM_EMERY test/c/status_row_layout_test.c src/c/layers/status_row_layout.c -o build/host/status_row_layout_test_emery
+build/host/status_row_layout_test_emery
+# status_icon_weight.h is header-only (a table + pure integer arithmetic), so the
+# test needs no companion .c — that is also why the weight math lives in a header
+# rather than inside the SDK-bound status_row.c. Built twice: the weight table is
+# selected by #ifdef PBL_PLATFORM_EMERY (the tiers, and so the rounding plateaus,
+# differ), so both initialisers need a run to be pinned.
+cc $CFLAGS test/c/status_icon_weight_test.c -o build/host/status_icon_weight_test
+build/host/status_icon_weight_test
+cc $CFLAGS -DPBL_PLATFORM_EMERY test/c/status_icon_weight_test.c -o build/host/status_icon_weight_test_emery
+build/host/status_icon_weight_test_emery
 cc $CFLAGS test/c/status_row_alloc_test.c src/c/appendix/status_row_alloc.c -o build/host/status_row_alloc_test
 build/host/status_row_alloc_test
+# Header-only pure date-slot formatters (static inline in date_format.h, no .c file —
+# the status_icon_weight pattern). Built once: no platform #ifdefs inside; aplite
+# never compiles the caller (its status_row twin keeps the hardcoded formats).
+cc $CFLAGS test/c/date_format_test.c -o build/host/date_format_test
+build/host/date_format_test
 cc $CFLAGS test/c/top_status_indicators_test.c -o build/host/top_status_indicators_test
 build/host/top_status_indicators_test
-cc $CFLAGS test/c/weather_status_layer_test.c src/c/layers/weather_status_layer.c -o build/host/weather_status_layer_test
-build/host/weather_status_layer_test
-cc $CFLAGS test/c/health_status_layer_test.c src/c/layers/health_status_layer.c -o build/host/health_status_layer_test
-build/host/health_status_layer_test
+# Header-only pure curve (static inline in hatch.h, no .c file — same pattern as
+# top_status_indicators_test above). Compiled twice so both arms of
+# HATCH_BASE_PLOT_H's emery #ifdef are covered.
+cc $CFLAGS test/c/hatch_stride_test.c -o build/host/hatch_stride_test
+build/host/hatch_stride_test
+cc $CFLAGS -DPBL_PLATFORM_EMERY test/c/hatch_stride_test.c -o build/host/hatch_stride_test_emery
+build/host/hatch_stride_test_emery
+# The band status rows (forecast / radar / health) share ONE owner, so one test
+# covers all three — including the radar row, which had no test of its own before
+# and was the one carrying the missing-live-health bug. Built TWICE: the evolving
+# build (all three bars) and an aplite-flavoured one with neither WW_RAIN_RADAR nor
+# PBL_HEALTH, which is the only place STATUS_BAR_COUNT == 1 and a stray unguarded
+# STATUS_BAR_RADAR / STATUS_BAR_HEALTH becomes a compile error — the shared CFLAGS
+# force -DPBL_HEALTH everywhere else.
+cc $CFLAGS -DWW_RAIN_RADAR test/c/status_bar_test.c src/c/layers/status_bar.c -o build/host/status_bar_test
+build/host/status_bar_test
+cc -std=c11 -Wall -Wextra -Werror -Itest/c/stub -Isrc -DPBL_PLATFORM_APLITE \
+   test/c/status_bar_test.c src/c/layers/status_bar.c -o build/host/status_bar_test_aplite
+build/host/status_bar_test_aplite

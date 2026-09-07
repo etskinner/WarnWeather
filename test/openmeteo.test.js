@@ -85,15 +85,34 @@ test('buildForecastUrl pins the ecmwf_ifs025 model for region-robust precipitati
   assert.match(url, /&models=ecmwf_ifs025(&|$)/);
 });
 
-test('buildGustUrl requests only gusts and avoids the gust-less ECMWF pin', () => {
-  // ECMWF IFS (the main forecast's pinned model) returns windgusts_10m as
-  // all-null, so the dedicated gust call must NOT pin an ecmwf_* model.
+/**
+ * Split an Open-Meteo URL's `hourly=` list into its field names.
+ * Asserting membership rather than the exact list keeps this test from breaking
+ * every time another derived field joins the always-fetched aux call.
+ * @param {string} url An Open-Meteo request URL.
+ * @returns {string[]} The requested hourly field names (empty when absent).
+ */
+function hourlyFields(url) {
+  const m = /[?&]hourly=([^&]*)/.exec(url);
+  return m ? m[1].split(',') : [];
+}
+
+test('buildGustUrl requests gusts + feels and avoids the derived-field-less ECMWF pin', () => {
+  // ECMWF IFS (the main forecast's pinned model) returns windgusts_10m and
+  // apparent_temperature as all-null, so the aux call must NOT pin an ecmwf_*
+  // model — both derived fields ride this always-fetched best_match call.
   const url = openmeteo.buildGustUrl(52.52, 13.41);
-  assert.match(url, /[?&]hourly=windgusts_10m(&|$)/);
+  const fields = hourlyFields(url);
+  ['windgusts_10m', 'apparent_temperature'].forEach((f) => {
+    assert.ok(fields.includes(f), 'the aux call must request ' + f);
+  });
+  assert.match(url, /&current=apparent_temperature(&|$)/);
   assert.doesNotMatch(url, /models=ecmwf/);
   assert.match(url, /&forecast_days=2(&|$)/);
   assert.match(url, /&timeformat=unixtime(&|$)/);
   assert.match(url, /&windspeed_unit=kmh(&|$)/);
+  // temperature_unit applies per-request — without it the feels come back °C.
+  assert.match(url, /&temperature_unit=fahrenheit(&|$)/);
 });
 
 test('mapGusts aligns gusts to the forecast start time by timestamp', () => {
@@ -173,4 +192,191 @@ test('OpenMeteoProvider has the expected identity and inherits the base class', 
   assert.equal(typeof p.withProviderData, 'function');
   // Sun events are inherited (no override), like dwd.js.
   assert.equal(p.withSunEvents, WeatherProvider.prototype.withSunEvents);
+});
+
+// ---- Sea-level pressure --------------------------------------------------
+test('open-meteo requests pressure_msl', () => {
+  assert.ok(openmeteo.buildForecastUrl(52.52, 13.41).includes('pressure_msl'),
+    'forecast URL must request pressure_msl');
+});
+
+test('open-meteo maps hourly pressure_msl into pressureTrend', () => {
+  const json = sampleResponse();
+  json.hourly.pressure_msl = json.hourly.time.map((_, i) => 1010 + i);
+  const mapped = mapResponse(json, BASE);
+  assert.equal(mapped.pressureTrend.length, 24);
+  assert.equal(mapped.pressureTrend[0], 1010);
+});
+
+// pressure_msl must NOT join the hard field guard: a response missing it should
+// still yield a usable forecast, with pressure degrading to line-off.
+test('open-meteo tolerates a response with no pressure_msl', () => {
+  const json = sampleResponse();
+  const mapped = mapResponse(json, BASE);
+  assert.notEqual(mapped, null);
+  assert.deepEqual(mapped.pressureTrend, []);
+});
+
+// ---- Feels-like (apparent temperature) -----------------------------------
+test('mapFeels aligns apparent_temperature to the forecast start by timestamp', () => {
+  const time = [], apparent_temperature = [];
+  for (let i = 0; i < 26; i += 1) { time.push(BASE + i * 3600); apparent_temperature.push(60 + i); }
+  const out = openmeteo.mapFeels({ hourly: { time, apparent_temperature } }, BASE + 3600);
+  assert.equal(out.length, 24);
+  assert.equal(out[0], 61);   // bucket at start
+  assert.equal(out[23], 84);
+});
+
+test('mapFeels: missing/non-numeric buckets become null; malformed → null', () => {
+  const out = openmeteo.mapFeels({ hourly: { time: [BASE, BASE + 3600], apparent_temperature: [null, 55] } }, BASE);
+  assert.equal(out[0], null);
+  assert.equal(out[1], 55);
+  assert.equal(out[2], null); // beyond the feed
+  assert.equal(openmeteo.mapFeels({ hourly: { time: [BASE] } }, BASE), null); // no series
+  assert.equal(openmeteo.mapFeels(null, BASE), null);
+});
+
+test('adoptFeels fills feelsTrend/currentFeels, temp-backfilling null buckets', () => {
+  const p = new OpenMeteoProvider();
+  p.startTime = BASE;
+  p.tempTrend = new Array(24).fill(0).map((_, i) => 50 + i);
+  const time = [], apparent_temperature = [];
+  for (let i = 0; i < 26; i += 1) { time.push(BASE + i * 3600); apparent_temperature.push(i === 2 ? null : 40 + i); }
+  openmeteo.adoptFeels(p, {
+    hourly: { time, apparent_temperature },
+    current: { apparent_temperature: 41.5 }
+  });
+  assert.equal(p.feelsTrend.length, 24);
+  assert.equal(p.feelsTrend[0], 40);
+  assert.equal(p.feelsTrend[2], 52, 'null bucket backfills from tempTrend (50 + 2)');
+  assert.equal(p.currentFeels, 41.5);
+});
+
+test('adoptFeels leaves the defaults on a malformed/absent response', () => {
+  const p = new OpenMeteoProvider();
+  p.startTime = BASE;
+  p.tempTrend = new Array(24).fill(50);
+  openmeteo.adoptFeels(p, null);                    // parse failure upstream
+  assert.deepEqual(p.feelsTrend, []);
+  assert.equal(p.currentFeels, null);
+  openmeteo.adoptFeels(p, { hourly: { time: [BASE] } }); // no apparent_temperature
+  assert.deepEqual(p.feelsTrend, []);
+  assert.equal(p.currentFeels, null);
+});
+
+// ---- Dew point + wind bearing --------------------------------------------
+// Both ride the always-fetched gust/feels aux call, never the main forecast:
+// that one pins models=ecmwf_ifs025, which returns derived fields all-null.
+
+/**
+ * Build a synthetic aux (gust/feels) response carrying dew point and bearing.
+ * @param {number} [count] Number of hourly buckets to emit.
+ * @returns {Object} A response shaped like the buildGustUrl call's payload.
+ */
+function auxResponse(count = 48) {
+  const time = [], windgusts_10m = [], apparent_temperature = [],
+    dew_point_2m = [], wind_direction_10m = [];
+  for (let i = 0; i < count; i += 1) {
+    time.push(BASE + i * 3600);
+    windgusts_10m.push(i + 5);
+    apparent_temperature.push(60 + i);
+    dew_point_2m.push(45 + (i % 20));        // plausible °F (the aux call asks for °F)
+    wind_direction_10m.push((i * 15) % 360); // walks the compass, 15° a bucket
+  }
+  return {
+    hourly: { time, windgusts_10m, apparent_temperature, dew_point_2m, wind_direction_10m },
+    current: { apparent_temperature: 61 }
+  };
+}
+
+test('buildGustUrl also carries dew point and wind bearing (no extra request)', () => {
+  const fields = hourlyFields(openmeteo.buildGustUrl(52.52, 13.41));
+  ['dew_point_2m', 'wind_direction_10m'].forEach((f) => {
+    assert.ok(fields.includes(f), 'the aux call must request ' + f);
+  });
+  // The main call must NOT grow them: ecmwf_ifs025 returns derived fields null.
+  const main = hourlyFields(openmeteo.buildForecastUrl(52.52, 13.41));
+  assert.ok(!main.includes('dew_point_2m'));
+  assert.ok(!main.includes('wind_direction_10m'));
+  // Dew point is a temperature, so it needs the per-request °F ask (already
+  // asserted above for feels) — restated here because dew depends on it too.
+  assert.match(openmeteo.buildGustUrl(52.52, 13.41), /&temperature_unit=fahrenheit(&|$)/);
+});
+
+test('mapDew aligns dew_point_2m to the forecast start by timestamp', () => {
+  const out = openmeteo.mapDew(auxResponse(), BASE + 3600); // start one hour in
+  assert.equal(out.length, 24);
+  assert.equal(out[0], 46);  // 45 + (1 % 20)
+  assert.equal(out[23], 49); // 45 + (24 % 20)
+});
+
+test('mapDew: missing/non-numeric buckets become null; malformed → null', () => {
+  const out = openmeteo.mapDew(
+    { hourly: { time: [BASE, BASE + 3600], dew_point_2m: [null, 51.8] } }, BASE);
+  assert.equal(out[0], null);
+  assert.equal(out[1], 51.8);
+  assert.equal(out[2], null); // beyond the feed
+  assert.equal(openmeteo.mapDew({ hourly: { time: [BASE] } }, BASE), null); // no series
+  assert.equal(openmeteo.mapDew(null, BASE), null);
+});
+
+test('mapWindDirection aligns wind_direction_10m by timestamp', () => {
+  const out = openmeteo.mapWindDirection(auxResponse(), BASE + 2 * 3600);
+  assert.equal(out.length, 24);
+  assert.equal(out[0], 30); // bucket 2 -> 2 * 15
+  assert.ok(out.every((v) => v >= 0 && v < 360), 'every bearing sits in [0, 360)');
+});
+
+test('mapWindDirection normalizes a bearing into [0, 360)', () => {
+  // 360 is "north" in some feeds; the sector maths downstream assumes [0, 360).
+  const out = openmeteo.mapWindDirection(
+    { hourly: { time: [BASE, BASE + 3600, BASE + 7200], wind_direction_10m: [360, 725, -90] } },
+    BASE);
+  assert.equal(out[0], 0);
+  assert.equal(out[1], 5);
+  assert.equal(out[2], 270);
+});
+
+test('mapWindDirection: missing buckets become null; malformed → null', () => {
+  const out = openmeteo.mapWindDirection(
+    { hourly: { time: [BASE, BASE + 3600], wind_direction_10m: [null, 180] } }, BASE);
+  assert.equal(out[0], null);
+  assert.equal(out[1], 180);
+  assert.equal(out[2], null);
+  assert.equal(openmeteo.mapWindDirection({ hourly: { time: [BASE] } }, BASE), null);
+  assert.equal(openmeteo.mapWindDirection(null, BASE), null);
+});
+
+test('adoptDewAndDirection fills a full window of °F dew points and bearings', () => {
+  const p = new OpenMeteoProvider();
+  p.startTime = BASE;
+  openmeteo.adoptDewAndDirection(p, auxResponse());
+
+  assert.equal(p.dewTrend.length, p.numEntries);
+  assert.ok(p.dewTrend.every((v) => typeof v === 'number' && v > -80 && v < 120),
+    'dew points are plausible °F numbers: ' + JSON.stringify(p.dewTrend));
+
+  assert.equal(p.windDirTrend.length, p.numEntries);
+  assert.ok(p.windDirTrend.every((v) => typeof v === 'number' && v >= 0 && v < 360),
+    'bearings sit in [0, 360): ' + JSON.stringify(p.windDirTrend));
+});
+
+test('adoptDewAndDirection leaves the empty defaults on a malformed/absent response', () => {
+  const p = new OpenMeteoProvider();
+  p.startTime = BASE;
+  openmeteo.adoptDewAndDirection(p, null);                    // parse failure upstream
+  assert.deepEqual(p.dewTrend, []);
+  assert.deepEqual(p.windDirTrend, []);
+  openmeteo.adoptDewAndDirection(p, { hourly: { time: [BASE] } }); // neither series present
+  assert.deepEqual(p.dewTrend, []);
+  assert.deepEqual(p.windDirTrend, []);
+});
+
+test('adoptDewAndDirection adopts each series independently', () => {
+  // A feed carrying only one of the two must not block the other.
+  const p = new OpenMeteoProvider();
+  p.startTime = BASE;
+  openmeteo.adoptDewAndDirection(p, { hourly: { time: [BASE], dew_point_2m: [50] } });
+  assert.equal(p.dewTrend.length, 24);
+  assert.deepEqual(p.windDirTrend, [], 'no bearing series -> no bearings');
 });

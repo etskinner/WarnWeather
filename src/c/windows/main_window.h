@@ -10,15 +10,28 @@ void main_window_refresh();
 // the calendar when radar data is unavailable; does not auto-switch to radar.
 void main_window_apply_top_view();
 
-// Reframe the calendar/radar, status, forecast/health, and loading bands after
-// a compact-top-view setting change. Layers are never destroyed/recreated —
-// this only calls layer_set_frame() on the bands that move.
-void main_window_relayout(void);
-
 // Re-apply the window background color for the current theme. Called at load
 // and again whenever a settings change may have flipped the theme (config_dirty
 // in app_message.c) so the background repaints immediately, not just on the
 // next full redraw.
 void main_window_apply_theme(void);
+
+// Radar data present? — the ONE availability predicate the ViewSpec resolves
+// against (view_spec_resolve / view_slot_available), exported so app_message.c's
+// availability-flip bracket can never drift from the definition the view
+// actually uses. Constant-false on aplite (radar is compiled out).
+bool main_window_radar_has_data(void);
+
+#if defined(PBL_HEALTH)
+// Re-derive the health graph from the cache + repaint. Call after a settings save
+// that can change the graph's compute (e.g. the HR scale or the label font) so it
+// re-derives instead of rendering stale statics until the next minute tick. Runs
+// whenever the graph is REACHABLE (health renderable AND a graph view in the
+// configured cycle) — hidden view included, on purpose: the compute also
+// re-reports the left-axis label width feeding the SHARED strip (bottom_view.h
+// "wider of both"), and the repaint half is free while hidden (a mark_dirty on a
+// hidden layer is a no-op).
+void main_window_refresh_health_graph(void);
+#endif
 
 void main_window_destroy();

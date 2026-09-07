@@ -9,6 +9,7 @@ var WeatherProvider = require('./weather/provider.js');
 var forecastSeries = require('./forecast-series.js');
 var wireUnits = require('./wire-units.js');
 var paletteWire = require('./weather/palette-wire.js');
+var lineStyle = require('./line-style.js');
 
 /**
  * Convert a fixture weather object into the real watch weather AppMessage payload.
@@ -55,6 +56,23 @@ function getFixtureWeatherPayload(fixture, settings, watchInfo) {
     provider.windTrend = Array.isArray(weather.windKmh) ? weather.windKmh.slice(0) : wireUnits.zeroFilledArray(provider.numEntries);
     provider.gustTrend = Array.isArray(weather.gustKmh) ? weather.gustKmh.slice(0) : wireUnits.zeroFilledArray(provider.numEntries);
     provider.uvTrend = Array.isArray(weather.uvIndex) ? weather.uvIndex.slice(0) : [];
+    // Sea-level pressure (hPa) is a status-slot value AND a forecast-line metric, not a
+    // scalar like AQI: accept the fixture's hourly array, or leave [] so the line/slot
+    // render as off/'--' (same graceful-degrade as the other transient trends above).
+    provider.pressureTrend = Array.isArray(weather.pressureHpa) ? weather.pressureHpa.slice(0) : [];
+    // Feels-like (°F, same internal unit as temps) is a forecast-line metric AND the
+    // temp slot's feels/both display source: accept an hourly array + scalar current,
+    // or leave the provider defaults ([] / null) so the line stays off and the temp
+    // slot renders the actual temp alone (same graceful-degrade as a live provider gap).
+    provider.feelsTrend = Array.isArray(weather.feelsTemps) ? weather.feelsTemps.slice(0) : [];
+    provider.currentFeels = (typeof weather.currentFeels === 'number') ? weather.currentFeels : null;
+    // Dew point (°F, same internal unit as temps) and the wind bearing (degrees the
+    // wind comes FROM) are status-slot values, not forecast lines: accept an hourly
+    // array each, or leave the provider defaults ([]) so the dew slot renders '--'
+    // and the wind/gust slots draw no arrow (the same graceful-degrade a provider
+    // that does not source them gets).
+    provider.dewTrend = Array.isArray(weather.dewPoint) ? weather.dewPoint.slice(0) : [];
+    provider.windDirTrend = Array.isArray(weather.windDirection) ? weather.windDirection.slice(0) : [];
     // AQI is a status-slot value, not a forecast line: accept a scalar current
     // index (weather.aqi) — wrapped as a one-element trend, like the WAQI source —
     // or an explicit array. Absent -> [] and the slot renders '--'.
@@ -147,6 +165,17 @@ function sendFixtureWeather(fixture, deps) {
 
     // Bundle the rain palette too, so fixture bars honor rainBarColor.
     Object.assign(payload, paletteWire.buildPaletteTuples(deps.watchInfo, deps.settings));
+
+    // Same reason, same trick for the graph's line styling: it rides the Clay
+    // settings message in production, and a fixture send bypasses that path
+    // entirely, so bundle it here or the fixture renders its lines in whatever
+    // colours the last real settings send happened to leave on the watch. The
+    // inbox handlers each dict_find their own key, so a Clay tuple is read just
+    // as happily off the weather message. Ten bytes — the fixture's claySettings
+    // block drives the night colours and their flag (bytes 4..9) too; the layout
+    // lives on buildLineStyleBytes in line-style.js.
+    payload.CLAY_LINE_STYLE_UINT8 = lineStyle.buildLineStyleBytes(
+        deps.settings, deps.watchInfo);
 
     // Dev: let a fixture exercise sleep mode (the snooze indicator + frozen
     // weather slots). The live path derives IS_SLEEPING from the sleep window;

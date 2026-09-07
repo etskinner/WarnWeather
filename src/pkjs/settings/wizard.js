@@ -1,7 +1,7 @@
 // src/pkjs/settings/wizard.js — ES5, WebView. First-run onboarding wizard.
 // Pure helpers (top) are unit-tested via module.exports; the DOM controller (added later)
 // registers onReady + PConf.actions.startWizard and is exercised via `mise preview-config`.
-/* global PConf, Intl, navigator, document, INJECTED_SCHEMA, VIEW_CYCLE, COUNTRY_DEFAULTS */
+/* global PConf, Intl, navigator, document, console, INJECTED_SCHEMA, VIEW_CYCLE, COUNTRY_DEFAULTS */
 var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
     : (typeof window !== 'undefined' && window.PConf) ? window.PConf
     : (typeof PConf !== 'undefined' && PConf) ? PConf
@@ -103,7 +103,7 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
 
     /**
      * The flick-demo stop list for the current settings: the REAL view cycle
-     * (view-cycle.js — the same call blocks.js's presetContents makes) mapped to
+     * (view-cycle.js — the same call preview-layout.js's presetContents makes) mapped to
      * stop descriptors. 1–3 entries; radar, when present, is always last.
      * @param {Object} state Wizard/Clay settings state.
      * @param {boolean} hasHeartRate Whether the platform has a heart-rate sensor (emery).
@@ -152,15 +152,24 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
     };
     // status/all default to the no-heart-rate copy; openWizard upgrades them to the
     // heart-rate variant on emery (the only platform with a heart-rate sensor).
-    var HEALTH_DESC = {
-        off: 'no health information on the watchface.',
-        status: healthStatusItems(false) + ' on the Health Status Bar.',
-        all: 'Health Status Bar plus an hourly graph: ' + healthGraphItems(false) + '.'
-    };
+    /**
+     * healthMode captions, built at READ time so the heart-rate variant follows
+     * the live env (a module-level constant used to be patched in place by
+     * openWizard — a mutated "constant" footgun).
+     * @param {boolean} hasHr Whether the platform has a heart-rate sensor.
+     * @returns {{off: string, status: string, all: string}} Per-mode captions.
+     */
+    function healthDesc(hasHr) {
+        return {
+            off: 'no health information on the watchface.',
+            status: healthStatusItems(hasHr) + ' on the Health Status Bar.',
+            all: 'Health Status Bar plus an hourly graph: ' + healthGraphItems(hasHr) + '.'
+        };
+    }
     // Watchface theme (messageKey 'theme'). Mirrors schema.js's two theme selects: color watches get
     // 4 options, B&W hardware only dark/light. Chosen by env.color at render time.
-    var THEME_OPTS_COLOR = [['Dark', 'dark'], ['Light (Alpha)', 'light'], ['B&W', 'bw'], ['B&W Inverted', 'bw-light']];
-    var THEME_OPTS_BW = [['Dark', 'dark'], ['Light (Alpha)', 'light']];
+    var THEME_OPTS_COLOR = [['Dark', 'dark'], ['Light', 'light'], ['B&W', 'bw'], ['B&W Inverted', 'bw-light']];
+    var THEME_OPTS_BW = [['Dark', 'dark'], ['Light', 'light']];
     var THEME_DESC = {
         dark: 'black background, white text and lines — the default, and the most tuned theme.',
         light: 'white background, black text and lines.',
@@ -272,6 +281,7 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
         S.windUnits = m.windUnits;
         S.distanceUnits = m.distanceUnits;
         S.weekStartDay = m.weekStartDay;
+        S.dateSlotFullFormat = m.dateSlotFullFormat;
     }
 
     // --- screen 1: reuse the real settings searchSelect for country/region ---
@@ -328,14 +338,29 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
     }
     function descFor(group) {
         if (group === 'layoutPreset') { return LAYOUT_DESC; }
-        if (group === 'healthMode') { return HEALTH_DESC; }
+        if (group === 'healthMode') { return healthDesc(hasHeartRate()); }
         return THEME_DESC;   // 'theme'
     }
     // Scroll the selected card to the horizontal center (offsetParent is the position:relative .wiz-car).
+    // The programmatic scroll must not COMMIT a selection: wireCar's snap handler would
+    // otherwise write the highlighted card's value into state on mere render — and when
+    // the highlight is only the carousel's nearest approximation of the stored value
+    // (compactDense -> compactCal), that silently replaces the user's setting. One-shot
+    // flag, armed only when the assignment will actually fire a scroll event; a real
+    // swipe fires a stream of events, so consuming one changes nothing for user scrolls.
     function centerCar() {
         var car = W.overlay.querySelector('.wiz-car'); if (!car) { return; }
         var on = car.querySelector('.wiz-card.on'); if (!on) { return; }
-        car.scrollLeft = on.offsetLeft + on.offsetWidth / 2 - car.clientWidth / 2;
+        var target = on.offsetLeft + on.offsetWidth / 2 - car.clientWidth / 2;
+        var before = car.scrollLeft;
+        // Armed BEFORE the assignment: engines may dispatch the scroll event
+        // synchronously from the setter, and the handler must already see it.
+        W.suppressCarSnap = (target !== before);
+        car.scrollLeft = target;
+        // A clamped or rounded-back assignment moves nothing and fires no
+        // scroll event — disarm, or the stale flag would eat the first event
+        // of the user's next real swipe.
+        if (car.scrollLeft === before) { W.suppressCarSnap = false; }
     }
     // Commit a carousel selection: update state, the .on highlight, and the description text in place
     // (no full re-render, so a swipe isn't interrupted). recenter=true also scrolls it to center.
@@ -372,6 +397,8 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
         var car = W.overlay.querySelector('.wiz-car'); if (!car) { return; }
         var group = car.getAttribute('data-wiz-car'), pending = false;
         car.addEventListener('scroll', function () {
+            // centerCar's render-time centering is not a user selection — see there.
+            if (W.suppressCarSnap) { W.suppressCarSnap = false; return; }
             if (pending) { return; }
             pending = true;
             setTimeout(function () { pending = false; selectCar(group, nearestCard(car), false); }, 90);
@@ -466,7 +493,14 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
         return h;
     }
     function stepLayout() {
-        return carousel('layoutPreset', LAYOUT_OPTS, W.ctx.S.layoutPreset, LAYOUT_DESC)
+        // compactDense isn't offered in this carousel (LAYOUT_OPTS) — a persisted
+        // compactDense (set in full Settings) can't be represented here, so highlight
+        // compactCal (the nearest, same 2-row calendar) WITHOUT mutating the stored
+        // value (stepHealth's pattern below): the preset changes only on a real pick,
+        // and the flick demo clamps compactDense to the compactCal screenshot itself
+        // (flickStop), so the demo works against the untouched stored value too.
+        var sel = labelFor(LAYOUT_OPTS, W.ctx.S.layoutPreset) ? W.ctx.S.layoutPreset : 'compactCal';
+        return carousel('layoutPreset', LAYOUT_OPTS, sel, LAYOUT_DESC)
             + '<div>'
             + '<p><b>Forecast Status Bar</b> — shows your location, current temperature and air quality.</p>'
             + '<p><b>Forecast</b> — a 24-hour graph: temperature, the precipitation-% line, UV dots and rain bars.</p></div>';
@@ -476,7 +510,7 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
         // 'off' rather than leave the carousel unhighlighted — without mutating the stored value, which
         // only changes if the user actually picks a card.
         var sel = labelFor(HEALTH_OPTS, W.ctx.S.healthMode) ? W.ctx.S.healthMode : 'off';
-        return carousel('healthMode', HEALTH_OPTS, sel, HEALTH_DESC);
+        return carousel('healthMode', HEALTH_OPTS, sel, healthDesc(hasHeartRate()));
     }
     function stepFlick() {
         // Render always opens on stop 0 (the default view), so re-entering the step resets
@@ -559,6 +593,136 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
         centerCar();
     }
 
+    // --- finishing: the situational defaults (settings/defaults-policy.js) ---
+    //
+    // applyDerived above answers "what suits this COUNTRY"; this answers "what suits a watch
+    // whose owner just finished setup". The rules — which slots, which bold modes and why —
+    // live in the policy table, not here; this code only decides whether a value may land on
+    // the live state, and writes it the way the settings page would.
+
+    // "Save & close" and "Continue tweaking" are the two buttons of the LAST step, so both
+    // mean the wizard was walked to the end. "Skip" (welcome step) means the user answered
+    // nothing, so nothing is derived for them.
+    var COMPLETING_NAVS = {save: true, tweak: true};
+
+    /**
+     * The conditional-defaults table. Resolved lazily so the flat settings page's file order
+     * never matters (same dual-context pattern as blocks.js's status-thresholds lookup).
+     * WEBVIEW REQUIREMENT: the flat page has no require(), so settings/defaults-policy.js must
+     * be listed in scripts/build-config-page.js's APP_FILES for window.DefaultsPolicy to exist
+     * at all. Without it the wizard simply derives nothing — Node tests take the require()
+     * branch and would not notice, hence the log line in applyWizardDefaults.
+     * @returns {?Object} The defaults-policy module, or null when it isn't on the page.
+     */
+    function defaultsPolicy() {
+        return (typeof require !== 'undefined')
+            ? require('./defaults-policy.js')
+            : (typeof window !== 'undefined' ? window.DefaultsPolicy : null);
+    }
+    /**
+     * The status-line catalog, resolved the same lazy dual-context way.
+     * @returns {?Object} The catalog module, or null when it isn't on the page.
+     */
+    function statusCatalog() {
+        return (typeof require !== 'undefined')
+            ? require('../status-line-catalog.js')
+            : (typeof window !== 'undefined' ? window.StatusLineCatalog : null);
+    }
+
+    /**
+     * Whether another slot of `key`'s own status row already shows `value` —
+     * the catalog's canonical siblingHolds, resolved dual-context.
+     * @param {Object} S Live settings state.
+     * @param {string} key Setting messageKey.
+     * @param {*} value The value the policy wants to write.
+     * @returns {boolean} True when a sibling slot of the same row already holds it.
+     */
+    function rowSiblingHolds(S, key, value) {
+        var cat = statusCatalog();
+        return Boolean(cat && cat.siblingHolds && cat.siblingHolds(S, key, value));
+    }
+
+    /**
+     * Whether the policy may write `key` — two conservative clauses, both spelling out
+     * "the user has not spoken here":
+     *   1. the stored value is still the one a fresh install of THIS watch resolves (the
+     *      schema's defaultValue, or its env-aware defaultFrom resolver). Anything else is
+     *      a deliberate choice — made in the wizard, or in Settings before re-running it —
+     *      and a first-run default must never overrule it. EXCEPT a key its rule declares
+     *      in `overrules`: there, finishing the wizard is itself the consent (the
+     *      health-slot promotion — see the rule), so the customized value gives way.
+     *   2. for a status slot, no sibling slot of the same row already shows the value. The
+     *      row already carries what the rule wanted to put there, so writing it would either
+     *      duplicate the reading or (through the page's dedupe hook) blank the slot the user
+     *      chose. Skipping is both safe and what the rule was after. This clause has no
+     *      overrules exemption — a duplicate reading is never what a rule was after.
+     * @param {Object} ctx onReady ctx ({S, ENV, schema}).
+     * @param {string} key Setting messageKey.
+     * @param {Object} meta The key's flattened rule meta from applyDefaults
+     *     ({value, seedVia, dependsOn, overrules}).
+     * @returns {boolean} True when writing is safe.
+     */
+    function policyMayWrite(ctx, key, meta) {
+        var item = findItem(ctx.schema, key);
+        if (!item) { return false; }   // not a setting on this page — never invent one
+        if (!meta.overrules && ctx.S[key] !== resolvedDefaultAsStored(item, ctx.ENV)) { return false; }
+        return !rowSiblingHolds(ctx.S, key, meta.value);
+    }
+
+    /**
+     * A schema item's default in the SAME representation hydrate() stores it in. Colour items
+     * declare a number but are stored as '#RRGGBB', so comparing the raw default against the
+     * stored value would report "the user changed this" on a completely untouched install --
+     * and a policy rule setting a colour would then silently never fire, with no test failing
+     * (no rule writes a colour today). Normalising here keeps the guard honest for the rules
+     * this table is meant to grow.
+     * @param {Object} item Schema item.
+     * @param {Object} env Platform env.
+     * @returns {*} The default, as it would be stored.
+     */
+    function resolvedDefaultAsStored(item, env) {
+        var dv = PConf.engine.resolveDefaultFrom(item, env);
+        return (item.type === 'color' && typeof dv === 'number') ? PConf.color.intToHex(dv) : dv;
+    }
+
+    /**
+     * Write the situational defaults a FINISHED wizard earns onto the live state, so the
+     * existing save path persists them alongside everything else the wizard derived. A nav
+     * that doesn't finish the wizard (Skip, Back, Next) writes nothing.
+     *
+     * A key the rule marks `seedVia` is written THROUGH that same onChange hook the settings
+     * page uses, so its companions — a threshold pair, an outline colour — come out identical
+     * to flipping the control by hand. No threshold numbers are picked here.
+     *
+     * The execution semantics — flattening, `set` order, dependsOn anchoring, the seedVia
+     * write-through — live in the policy module's applyDefaults, its one interpreter; this
+     * caller only contributes the guard deciding whether a value may land (policyMayWrite).
+     *
+     * @param {Object} ctx onReady ctx ({S, ENV, schema}).
+     * @param {string} nav The footer button pressed ('save'|'tweak'|'skip'|'next'|'back').
+     * @returns {Object} The messageKey -> value pairs actually written (empty when none).
+     */
+    function applyWizardDefaults(ctx, nav) {
+        if (!COMPLETING_NAVS[nav] || !ctx) { return {}; }
+        var policy = defaultsPolicy();
+        if (!policy) {
+            // Guarded: no other settings-page file assumes a console, and a missing one must
+            // not turn "no defaults derived" into a thrown error on the finish button.
+            if (typeof console !== 'undefined' && console.log) {
+                console.log('wizard: defaults-policy missing from the page — no setup defaults derived');
+            }
+            return {};
+        }
+        // The whole live state doubles as `choices`: every wizard pick and every stored
+        // setting is already in it, so a future rule keyed on any of them just works.
+        return policy.applyDefaults({wizard: true, env: ctx.ENV, choices: ctx.S}, {
+            mayWrite: function (key, meta) { return policyMayWrite(ctx, key, meta); },
+            getHook: function (name) {
+                return PConf.onChange && PConf.onChange.get ? PConf.onChange.get(name) : null;
+            }
+        });
+    }
+
     function closeWizard() {
         if (W.overlay && W.overlay.parentNode) { W.overlay.parentNode.removeChild(W.overlay); }
         W.overlay = null;
@@ -569,6 +733,11 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
     function finishTweak() { W.ctx.set('onboardingDone', true); closeWizard(); W.ctx.render(); }
 
     function onNav(nav) {
+        // Every exit runs the situational defaults first — applyWizardDefaults itself decides
+        // which navs count as finishing the wizard, so the rule lives in one place — and does
+        // it BEFORE the exit, so the values ride the save (or show up on the settings page the
+        // user is dropped onto).
+        applyWizardDefaults(W.ctx, nav);
         if (nav === 'back') { W.idx = Math.max(0, W.idx - 1); renderStep(); }
         else if (nav === 'next') { W.idx = Math.min(W.steps.length - 1, W.idx + 1); renderStep(); }
         else if (nav === 'save') { finishSave(); }
@@ -642,13 +811,6 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
 
     function openWizard(ctx, fresh) {
         W.ctx = ctx; W.steps = buildSteps(ctx.ENV); W.idx = 0;
-        // compactDense isn't offered in the wizard's layout carousel (LAYOUT_OPTS) — a persisted
-        // compactDense (set in full Settings) can't be represented here, so fall back to compactCal
-        // (the nearest, same 2-row calendar) for the carousel selection and the flick demo alike.
-        if (ctx.S.layoutPreset === 'compactDense') { ctx.S.layoutPreset = 'compactCal'; }
-        // Heart rate exists on emery + diorite; upgrade the health copy to the HR variant there.
-        HEALTH_DESC.status = healthStatusItems(hasHeartRate()) + ' on the Health Status Bar.';
-        HEALTH_DESC.all = 'Health Status Bar plus an hourly graph: ' + healthGraphItems(hasHeartRate()) + '.';
         if (fresh) {
             var cc = inferCountry();
             var cOpts = optionsFor(ctx.schema, 'holidayCountry');
@@ -683,6 +845,7 @@ var PConf = (typeof global !== 'undefined' && global.PConf) ? global.PConf
         module.exports = {
             countryFromTimezone: countryFromTimezone, countryFromLocale: countryFromLocale,
             inferCountry: inferCountry, mapCountry: mapCountry, applyDerived: applyDerived,
+            applyWizardDefaults: applyWizardDefaults,
             buildSteps: buildSteps, shouldShow: shouldShow,
             flickStops: flickStops
         };

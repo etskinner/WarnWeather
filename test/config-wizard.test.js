@@ -1,15 +1,19 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const onChangeHandlers = {};
-global.PConf = {
-  onChange: {
-    register: function (name, fn) { onChangeHandlers[name] = fn; },
-    get: function (name) { return onChangeHandlers[name]; }
-  },
-  actions: {}
-};
+
+// The wizard's completion path reads each key's schema default through the engine and seeds
+// AQI through the settings page's own onChange hooks, so this suite boots the REAL registries
+// (same require order as test/config-schema.test.js) rather than a stub PConf.
+global.PConf = {};
+require('../src/pkjs/config-ui/lib/schema-walk.js');
+require('../src/pkjs/config-ui/lib/color.js');
+require('../src/pkjs/config-ui/lib/engine.js');
+require('../src/pkjs/settings/blocks.js');
 require('../src/pkjs/settings/reset-status-defaults.js');
+const schema = require('../src/pkjs/settings/schema.js');
+const eng = require('../src/pkjs/config-ui/lib/engine.js');
+const platform = require('../src/pkjs/config-ui/lib/platform.js');
 const W = require('../src/pkjs/settings/wizard.js');
 
 test('countryFromTimezone: known zones map, unknown -> null', () => {
@@ -28,27 +32,29 @@ test('countryFromLocale: region subtag or null', () => {
   assert.equal(W.countryFromLocale(null), null);
 });
 
-test('mapCountry: providers + units + week-start by country (US imperial, else metric)', () => {
-  assert.deepEqual(W.mapCountry('DE'), { provider: 'dwd', radarProvider: 'dwd', temperatureUnits: 'c', windUnits: 'kph', distanceUnits: 'metric', weekStartDay: 'mon' });
-  assert.deepEqual(W.mapCountry('NO'), { provider: 'metno', radarProvider: 'metno', temperatureUnits: 'c', windUnits: 'kph', distanceUnits: 'metric', weekStartDay: 'mon' });
-  assert.deepEqual(W.mapCountry('SE'), { provider: 'metno', radarProvider: 'metno', temperatureUnits: 'c', windUnits: 'kph', distanceUnits: 'metric', weekStartDay: 'mon' });
-  assert.deepEqual(W.mapCountry('US'), { provider: 'openmeteo', radarProvider: 'rainbow', temperatureUnits: 'f', windUnits: 'mph', distanceUnits: 'imperial', weekStartDay: 'sun' });
-  assert.deepEqual(W.mapCountry('GB'), { provider: 'openmeteo', radarProvider: 'rainbow', temperatureUnits: 'c', windUnits: 'kph', distanceUnits: 'metric', weekStartDay: 'mon' });
-  assert.deepEqual(W.mapCountry(null), { provider: 'openmeteo', radarProvider: 'rainbow', temperatureUnits: 'c', windUnits: 'kph', distanceUnits: 'metric', weekStartDay: 'mon' });
+test('mapCountry: providers + units + week-start + date format by country (US imperial, else metric)', () => {
+  assert.deepEqual(W.mapCountry('DE'), { provider: 'dwd', radarProvider: 'dwd', temperatureUnits: 'c', windUnits: 'kph', distanceUnits: 'metric', weekStartDay: 'mon', dateSlotFullFormat: 'auto' });
+  assert.deepEqual(W.mapCountry('NO'), { provider: 'metno', radarProvider: 'metno', temperatureUnits: 'c', windUnits: 'kph', distanceUnits: 'metric', weekStartDay: 'mon', dateSlotFullFormat: 'auto' });
+  assert.deepEqual(W.mapCountry('SE'), { provider: 'metno', radarProvider: 'metno', temperatureUnits: 'c', windUnits: 'kph', distanceUnits: 'metric', weekStartDay: 'mon', dateSlotFullFormat: 'auto' });
+  assert.deepEqual(W.mapCountry('US'), { provider: 'openmeteo', radarProvider: 'rainbow', temperatureUnits: 'f', windUnits: 'mph', distanceUnits: 'imperial', weekStartDay: 'sun', dateSlotFullFormat: 'slash' });
+  assert.deepEqual(W.mapCountry('GB'), { provider: 'openmeteo', radarProvider: 'rainbow', temperatureUnits: 'c', windUnits: 'kph', distanceUnits: 'metric', weekStartDay: 'mon', dateSlotFullFormat: 'auto' });
+  assert.deepEqual(W.mapCountry(null), { provider: 'openmeteo', radarProvider: 'rainbow', temperatureUnits: 'c', windUnits: 'kph', distanceUnits: 'metric', weekStartDay: 'mon', dateSlotFullFormat: 'auto' });
 });
 
-test('applyDerived sets wind/distance units and week-start from the country', () => {
+test('applyDerived sets wind/distance units, week-start and date format from the country', () => {
   const us = { holidayCountry: 'US', provider: 'openmeteo' };
   W.applyDerived(us);
   assert.equal(us.windUnits, 'mph');
   assert.equal(us.distanceUnits, 'imperial');
   assert.equal(us.weekStartDay, 'sun');
   assert.equal(us.temperatureUnits, 'f');
+  assert.equal(us.dateSlotFullFormat, 'slash', 'US installs get the 9/7/26 date slot');
   const de = { holidayCountry: 'DE', provider: 'openmeteo' };
   W.applyDerived(de);
   assert.equal(de.windUnits, 'kph');
   assert.equal(de.distanceUnits, 'metric');
   assert.equal(de.weekStartDay, 'mon');
+  assert.equal(de.dateSlotFullFormat, 'auto', 'everyone else keeps the dotted dd.mm.yy');
 });
 
 test('applyDerived clears pollen when the wizard derives a non-DWD provider', () => {
@@ -165,4 +171,318 @@ test("flickStops: 'slot' health mode adds no health flick stop (matches off)", (
   const off = W.flickStops({ layoutPreset: 'compactCal', healthMode: 'off', radarMode: 'graph' });
   const slot = W.flickStops({ layoutPreset: 'compactCal', healthMode: 'slot', radarMode: 'graph' });
   assert.deepEqual(slot.map((s) => s.label), off.map((s) => s.label));
+});
+
+// --- finishing the wizard applies the situational defaults (settings/defaults-policy.js) ---
+//
+// The table itself is tested in test/defaults-policy.test.js; these tests cover the WIRING:
+// which navigations count as finishing, what lands on the live state, and the two clauses
+// that keep the policy off a value the user placed themselves.
+
+// The Forecast row is bolded everywhere; the strip beside the clock only on emery,
+// the one display whose strip ships three readings (status-line-catalog.js). The
+// table itself pins that split — here it decides which keys each context expects.
+const BOLD_FORECAST_KEYS = ['threshTempBoldMode', 'threshCityBoldMode', 'threshAqiBoldMode'];
+const BOLD_TOP_KEYS = ['threshWeekBoldMode', 'threshDateBoldMode', 'threshSunBoldMode'];
+const BOLD_KEYS = BOLD_FORECAST_KEYS.concat(BOLD_TOP_KEYS);
+
+/**
+ * A stand-in for the engine's onReady ctx: the real schema, hydrated the way boot() does.
+ * @param {Object} [over] {platform: string, saved: Object} — watch platform and stored settings.
+ * @returns {{S: Object, ENV: Object, schema: Object}} Wizard context.
+ */
+function wizCtx(over) {
+  const o = over || {};
+  const ENV = platform.computeEnv({ platform: o.platform || 'basalt' });
+  return { S: eng.hydrate(schema, o.saved || {}, ENV), ENV, schema };
+}
+
+test('finishing the wizard on emery bolds the Watch + Forecast rows and hands AQI a warn signal', () => {
+  const ctx = wizCtx({ platform: 'emery' });
+  BOLD_KEYS.forEach((k) => assert.notEqual(ctx.S[k], 'always', k + ' starts at its schema default'));
+
+  const written = W.applyWizardDefaults(ctx, 'save');
+
+  BOLD_KEYS.forEach((k) => assert.equal(ctx.S[k], 'always', k));
+  assert.equal(ctx.S.threshAqiOn, true, 'AQI highlighting on');
+  assert.equal(ctx.S.threshAqiWarnOutlineOn, true, 'AQI warn outline on');
+  // threshStepsBoldMode rides with the slot swap: steps replaces sunrise/sunset in
+  // the top row, so it has to be bold like the rest of that row.
+  assert.equal(ctx.S.threshStepsBoldMode, 'always', 'the promoted steps slot is bold too');
+  assert.deepEqual(Object.keys(written).sort(),
+    BOLD_KEYS.concat(['threshAqiOn', 'threshAqiWarnOutlineOn', 'statusTopRight',
+      'statusHealthLeft', 'threshStepsBoldMode']).sort(),
+    'the report names exactly the keys it wrote');
+});
+
+test('finishing the wizard on a narrow watch bolds the Forecast row and fills the free left slot', () => {
+  // The strip beside the clock ships date + battery here, so nothing in it is bolded
+  // and steps is promoted into its EMPTY left slot rather than into the battery corner.
+  const ctx = wizCtx();
+  assert.equal(ctx.S.statusTopLeft, 'empty', 'guard: the narrow strip ships that slot free');
+  assert.equal(ctx.S.statusTopRight, 'battery', 'guard: and the battery in the corner');
+
+  const written = W.applyWizardDefaults(ctx, 'save');
+
+  BOLD_FORECAST_KEYS.forEach((k) => assert.equal(ctx.S[k], 'always', k));
+  BOLD_TOP_KEYS.forEach((k) => assert.notEqual(ctx.S[k], 'always', k + ' stays light'));
+  assert.equal(ctx.S.statusTopLeft, 'steps');
+  assert.equal(ctx.S.statusTopRight, 'battery', 'the battery keeps its corner');
+  assert.equal(ctx.S.statusHealthLeft, 'distance', 'the eviction rides along');
+  assert.notEqual(ctx.S.threshStepsBoldMode, 'always',
+    'and no bold rides along — it would be the only heavy value in that strip');
+  assert.deepEqual(Object.keys(written).sort(),
+    BOLD_FORECAST_KEYS.concat(['threshAqiOn', 'threshAqiWarnOutlineOn', 'statusTopLeft',
+      'statusHealthLeft']).sort(),
+    'the report names exactly the keys it wrote');
+});
+
+test('the AQI seeding runs through the settings page\'s own hooks, not hand-picked numbers', () => {
+  const ctx = wizCtx();
+  W.applyWizardDefaults(ctx, 'save');
+
+  // What flipping the two toggles by hand on the settings page produces.
+  const hand = wizCtx();
+  hand.S.threshAqiOn = true;
+  PConf.onChange.get('thresholdToggle')(hand.S, false, true, hand.ENV, 'threshAqiOn');
+  hand.S.threshAqiWarnOutlineOn = true;
+  PConf.onChange.get('thresholdOutlineToggle')(hand.S, false, true, hand.ENV, 'threshAqiWarnOutlineOn');
+
+  assert.notEqual(hand.S.threshAqiWarn, '', 'guard: the hook really seeds a pair');
+  assert.notEqual(hand.S.threshAqiWarnColor, '', 'guard: the hook really seeds an outline color');
+  assert.equal(ctx.S.threshAqiWarn, hand.S.threshAqiWarn);
+  assert.equal(ctx.S.threshAqiDanger, hand.S.threshAqiDanger);
+  assert.equal(ctx.S.threshAqiWarnColor, hand.S.threshAqiWarnColor);
+});
+
+test('the health slots move only where health can actually report', () => {
+  ['all', 'status', 'slot'].forEach((mode) => {
+    const ctx = wizCtx({ saved: { healthMode: mode } });
+    W.applyWizardDefaults(ctx, 'save');
+    assert.equal(ctx.S.statusTopLeft, 'steps', mode);
+    assert.equal(ctx.S.statusHealthLeft, 'distance', mode);
+
+    const emery = wizCtx({ platform: 'emery', saved: { healthMode: mode } });
+    W.applyWizardDefaults(emery, 'save');
+    assert.equal(emery.S.statusTopRight, 'steps', 'emery: ' + mode);
+    assert.equal(emery.S.statusHealthLeft, 'distance', 'emery: ' + mode);
+  });
+
+  const off = wizCtx({ saved: { healthMode: 'off' } });
+  W.applyWizardDefaults(off, 'save');
+  assert.equal(off.S.statusTopLeft, 'empty', 'health off leaves the top row alone');
+  assert.equal(off.S.statusHealthLeft, 'steps', 'health off leaves the health row alone');
+  assert.equal(off.S.threshTempBoldMode, 'always', 'the bold rules still apply with health off');
+
+  // aplite has no health at all; the bold/AQI keys are still written (inert there by design).
+  const aplite = wizCtx({ platform: 'aplite' });
+  W.applyWizardDefaults(aplite, 'save');
+  assert.equal(aplite.S.statusTopLeft, 'empty');
+  assert.equal(aplite.S.statusHealthLeft, 'steps');
+  assert.equal(aplite.S.threshAqiBoldMode, 'always');
+});
+
+test('"Continue tweaking" finishes the wizard too — Skip and the step buttons do not', () => {
+  const tweak = wizCtx();
+  assert.notEqual(Object.keys(W.applyWizardDefaults(tweak, 'tweak')).length, 0);
+  assert.equal(tweak.S.threshTempBoldMode, 'always');
+
+  ['skip', 'next', 'back'].forEach((nav) => {
+    const ctx = wizCtx();
+    const before = JSON.stringify(ctx.S);
+    assert.deepEqual(W.applyWizardDefaults(ctx, nav), {}, nav + ' writes nothing');
+    assert.equal(JSON.stringify(ctx.S), before, nav + ' leaves the state untouched');
+  });
+});
+
+test('a key the user changed by hand survives the policy', () => {
+  // threshAqiBoldMode ships 'warn'; 'off' below is therefore a real choice, not a
+  // default that happens to match. (The steps promotion is the ONE declared
+  // exception to this clause — the next test.)
+  const ctx = wizCtx({ saved: { threshAqiBoldMode: 'off' } });
+
+  const written = W.applyWizardDefaults(ctx, 'save');
+
+  assert.equal(ctx.S.threshAqiBoldMode, 'off', 'an explicit Bold choice is not overwritten');
+  assert.ok(!Object.prototype.hasOwnProperty.call(written, 'threshAqiBoldMode'));
+  assert.equal(ctx.S.threshCityBoldMode, 'always', 'the untouched keys still get their default');
+  assert.equal(ctx.S.threshAqiOn, true, 'a sibling key of the same rule is unaffected');
+});
+
+test('the steps promotion overrules even a hand-picked slot', () => {
+  // emery: statusTopRight ships 'sun', so 'battery' is a real choice — a user parked
+  // another slot top-right, then completed setup with health on. Completing setup IS
+  // the consent to the promised health layout (the rule declares the promotion in
+  // `overrules`), so steps takes the slot anyway, and the eviction and bold ride
+  // along — the swap stays all-or-nothing.
+  const ctx = wizCtx({ platform: 'emery', saved: { statusTopRight: 'battery' } });
+
+  const written = W.applyWizardDefaults(ctx, 'save');
+
+  assert.equal(ctx.S.statusTopRight, 'steps', 'the promotion wins over the custom slot');
+  assert.equal(written.statusTopRight, 'steps');
+  assert.equal(ctx.S.statusHealthLeft, 'distance', 'the eviction rides along');
+  assert.equal(ctx.S.threshStepsBoldMode, 'always', 'so does the promoted slot\'s bold');
+
+  // The narrow sibling rule overrules its own slot the same way. It bites far less
+  // often: that slot ships EMPTY, so only a value parked there before re-running
+  // setup is replaced.
+  const narrow = wizCtx({ saved: { statusTopLeft: 'week' } });
+  W.applyWizardDefaults(narrow, 'save');
+  assert.equal(narrow.S.statusTopLeft, 'steps');
+  assert.equal(narrow.S.statusHealthLeft, 'distance');
+});
+
+test('the overrule stops at the promotion: a customized health row still survives', () => {
+  // Only the promotion is declared an overrule. A hand-emptied health-left slot
+  // stays as the user left it; steps simply lives in the top row now, and no
+  // reading is lost — it was not in the health row to begin with.
+  const ctx = wizCtx({ platform: 'emery', saved: { statusTopRight: 'battery', statusHealthLeft: 'empty' } });
+
+  const written = W.applyWizardDefaults(ctx, 'save');
+
+  assert.equal(ctx.S.statusTopRight, 'steps');
+  assert.equal(ctx.S.statusHealthLeft, 'empty', 'the hand-picked health slot survives');
+  assert.ok(!Object.prototype.hasOwnProperty.call(written, 'statusHealthLeft'));
+  assert.equal(ctx.S.threshStepsBoldMode, 'always',
+    'the bold hangs off the promotion, not the eviction');
+
+  const narrow = wizCtx({ saved: { statusTopLeft: 'week', statusHealthLeft: 'empty' } });
+  W.applyWizardDefaults(narrow, 'save');
+  assert.equal(narrow.S.statusTopLeft, 'steps');
+  assert.equal(narrow.S.statusHealthLeft, 'empty', 'same on the narrow rule');
+});
+
+test('the whole health-slot swap is skipped when steps does not reach the top row', () => {
+  // statusTopMid='steps' is the user doing the promotion themselves — the rule's
+  // anchor slot keeps its default (dedupe guard), steps is NOT in the promoted slot,
+  // and the dependent writes stand down with it.
+  const ctx = wizCtx({ saved: { statusTopMid: 'steps' } });
+  const written = W.applyWizardDefaults(ctx, 'save');
+  assert.equal(ctx.S.statusTopLeft, 'empty');
+  assert.equal(ctx.S.statusHealthLeft, 'steps', 'no eviction without the promotion');
+  assert.ok(!Object.prototype.hasOwnProperty.call(written, 'statusHealthLeft'));
+
+  const emery = wizCtx({ platform: 'emery', saved: { statusTopMid: 'steps' } });
+  W.applyWizardDefaults(emery, 'save');
+  assert.equal(emery.S.statusTopRight, 'sun');
+  assert.equal(emery.S.statusHealthLeft, 'steps');
+
+  // And when the promotion DOES land (default install), the swap completes —
+  // pinned here as the counterpart so the dependency cannot overshoot.
+  const clean = wizCtx();
+  W.applyWizardDefaults(clean, 'save');
+  assert.equal(clean.S.statusTopLeft, 'steps');
+  assert.equal(clean.S.statusHealthLeft, 'distance');
+});
+
+test('the policy never duplicates a code the user already placed in that row', () => {
+  const ctx = wizCtx({ saved: { statusTopMid: 'steps' } });
+
+  W.applyWizardDefaults(ctx, 'save');
+
+  assert.equal(ctx.S.statusTopMid, 'steps', 'the slot the user filled stays filled');
+  assert.equal(ctx.S.statusTopLeft, 'empty', 'steps is already in that row, so the slot is left alone');
+});
+
+// --- the wizard DOM controller: opening must never rewrite stored settings ------------
+// A minimal fake DOM: just enough surface for openWizard/renderStep/wireCar/centerCar.
+// scrollLeft assignment fires 'scroll' listeners synchronously here (real browsers fire
+// async, which only makes the shipped debounce MORE likely to commit).
+function fakeWizardDom() {
+  const listeners = { click: [] };
+  let car = null;
+
+  function makeCar(html) {
+    const cards = [];
+    const re = /class="wiz-card( on)?" data-wiz-idx-val="([^"]+)"/g;
+    let m;
+    while ((m = re.exec(html))) {
+      cards.push({ className: 'wiz-card' + (m[1] || ''), offsetLeft: cards.length * 162, offsetWidth: 150, val: m[2] });
+    }
+    const scrollFns = [];
+    let scrollLeft = 0;
+    const el = {
+      cards,
+      clientWidth: 178,
+      getAttribute: (n) => (n === 'data-wiz-car' ? 'layoutPreset' : null),
+      addEventListener: (ev, fn) => { if (ev === 'scroll') { scrollFns.push(fn); } },
+      querySelector: (sel) => (sel === '.wiz-card.on'
+        ? cards.find((c) => c.className.indexOf(' on') >= 0) || null : null),
+      querySelectorAll: (sel) => (sel === '.wiz-card' ? cards : []),
+      parentNode: { querySelector: () => null }
+    };
+    Object.defineProperty(el, 'scrollLeft', {
+      get: () => scrollLeft,
+      set: (v) => { const moved = v !== scrollLeft; scrollLeft = v; if (moved) { scrollFns.forEach((fn) => fn()); } }
+    });
+    return el;
+  }
+
+  const title = { textContent: '' };
+  const foot = { innerHTML: '' };
+  const body = {};
+  let bodyHtml = '';
+  Object.defineProperty(body, 'innerHTML', {
+    get: () => bodyHtml,
+    set: (h) => { bodyHtml = h; car = h.indexOf('data-wiz-car="') >= 0 ? makeCar(h) : null; }
+  });
+
+  const overlay = {
+    id: '',
+    innerHTML: '',
+    addEventListener: (ev, fn) => { (listeners[ev] = listeners[ev] || []).push(fn); },
+    querySelector: (sel) => {
+      if (sel === '[data-wiz-title]') { return title; }
+      if (sel === '[data-wiz-body]') { return body; }
+      if (sel === '[data-wiz-foot]') { return foot; }
+      if (sel === '.wiz-car' || sel.indexOf('data-wiz-car=') >= 0) { return car; }
+      return null;
+    },
+    querySelectorAll: () => [],
+    parentNode: null,
+    click: (closest) => (listeners.click || []).forEach((fn) => fn({ target: { closest } }))
+  };
+
+  global.document = {
+    getElementById: () => null,
+    createElement: (tag) => (tag === 'div' ? overlay : { id: '', textContent: '' }),
+    head: { appendChild: () => {} },
+    body: { appendChild: () => {} }
+  };
+  return { overlay, getCar: () => car };
+}
+
+test('opening the wizard never rewrites a stored compactDense preset', async () => {
+  // compactDense isn't offered in the wizard's layout carousel; re-running setup (the
+  // only way an existing preset meets the wizard) must highlight the nearest card
+  // WITHOUT mutating stored state — the value changes only on a real pick. Regression:
+  // openWizard used to rewrite S.layoutPreset on entry, and the carousel's programmatic
+  // centering scroll used to commit the coerced card through the snap handler.
+  const dom = fakeWizardDom();
+  const ctx = Object.assign(wizCtx({ saved: { layoutPreset: 'compactDense', onboardingDone: true } }),
+    { cfg: { onboardingDone: true } });
+  PConf.hooks.runReady(ctx);          // seeds the wizard's ctx; onboardingDone stops auto-open
+  assert.equal(ctx.S.layoutPreset, 'compactDense', 'precondition');
+
+  PConf.actions.startWizard();        // "Run setup again"
+  assert.equal(ctx.S.layoutPreset, 'compactDense',
+    'opening the wizard must not rewrite the stored preset');
+
+  // Step forward to the layout carousel: its render centers the highlighted card, and
+  // that programmatic scroll must not commit a selection either.
+  dom.overlay.click((sel) => (sel === '[data-wiz-nav]' ? { getAttribute: () => 'next' } : null));
+  const car = dom.getCar();
+  assert.ok(car, 'the layout carousel rendered');
+  assert.equal((car.querySelector('.wiz-card.on') || {}).val, 'compactCal',
+    'the carousel highlights the nearest offered card');
+  await new Promise((r) => setTimeout(r, 150));   // ride out the snap debounce (90ms)
+  assert.equal(ctx.S.layoutPreset, 'compactDense',
+    'the centering scroll must not commit the coerced card');
+
+  // A real pick still lands: tap the fullCal card.
+  dom.overlay.click((sel) => (sel === '[data-wiz-idx-val]'
+    ? { getAttribute: () => 'fullCal', parentNode: { getAttribute: () => 'layoutPreset' } } : null));
+  assert.equal(ctx.S.layoutPreset, 'fullCal', 'an actual card tap commits normally');
+  await new Promise((r) => setTimeout(r, 150));   // let the recenter scroll's debounce drain
 });

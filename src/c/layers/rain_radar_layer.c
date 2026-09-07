@@ -15,8 +15,21 @@
 // share a single vertical strip with the tick row: at hour-aligned slot
 // positions the tick is suppressed and the hour digit is drawn centred
 // on that column instead.
-#define RADAR_AXIS_H            12
+//
+// The strip grows with the label tier. chart.c seats the hour label's box against the
+// PLOT top (`outer.origin.y - top_raise`), not against the strip, so the taller emery
+// tier lifts the box by exactly its content-height step (14 -> 18 px) — out of the strip
+// and into whatever sits above the radar, which in the compact views is a status row.
+// Adding the same step back keeps the label's clearance identical at both tiers, at the
+// cost of 4 px of plot height on emery's large tier. config_large_graph_font() is
+// constant false off emery, so every other platform folds this to the plain 12.
+#define RADAR_AXIS_H_BASE       12
+#define RADAR_AXIS_H_LARGE_STEP 4
 #define RADAR_NUM_SLOTS         24
+
+static inline int radar_axis_h(void) {
+    return RADAR_AXIS_H_BASE + (config_large_graph_font() ? RADAR_AXIS_H_LARGE_STEP : 0);
+}
 // RADAR_SLOT_SECONDS comes from radar_axis.h (shared with the axis maths).
 // Grace after a grid fetch boundary before the watch synthesizes an advance,
 // giving PKJS time to deliver the real frame. 55s (not 60) so the gate clears
@@ -35,9 +48,15 @@
     #define RADAR_PAD   1
 #endif
 
-// Hatch line spacing for the 1km background bars. Matches the night-shading
-// stride for visual consistency.
-#define RADAR_HATCH_SPACING (theme_is_bw() ? 7 : 6)
+// Hatch line spacing for the 1km background bars: same base + height scaling as the
+// forecast night hatch (see hatch.h), but NOT the same stride at a given band height —
+// the radar's axis is 12px at the TOP (16 on emery's large label tier — radar_axis_h())
+// versus the forecast's 10px at the bottom (plus emery's 10px bottom pad), so the radar
+// plot is shorter than the forecast plot in the same band and scales marginally more
+// gently off the shared baseline. That is accepted: they are different plots, and the gap
+// is under one stride step (band 65 → forecast 8, radar 7).
+#define RADAR_HATCH_SPACING(plot_h) \
+    hatch_stride_scaled(theme_is_bw() ? 7 : 6, HATCH_BASE_PLOT_H, (plot_h))
 
 // Hatch fill colour for the 1km nearby-rain shape. Matches the
 // night-region hatch (DarkGray on colour, theme_fg() on B&W) so the fill
@@ -165,6 +184,10 @@ static void draw_radar_area_bars(GContext *ctx, GRect bar_plot_rect,
 
     graphics_context_set_stroke_width(ctx, 1);
 
+    // Hoisted out of the slot loop: one division per redraw, not one per bar. Every slot
+    // in the plot shares a stride so the hatch reads as one texture across the band.
+    const int hatch_spacing = RADAR_HATCH_SPACING(bar_h);
+
     int i = 0;
     while (i < slots.num_slots) {
         // Skip zero-area runs.
@@ -184,7 +207,7 @@ static void draw_radar_area_bars(GContext *ctx, GRect bar_plot_rect,
             const int16_t x_b = slot_geometry_tick_x(slots, s + 1, plot_x);
             const int16_t slot_w = x_b - x_a;
             const GRect r = GRect(x_a, plot_bottom - slot_h, slot_w, slot_h);
-            hatch_fill_rect(ctx, r, RADAR_AREA_HATCH_COLOR, RADAR_HATCH_SPACING);
+            hatch_fill_rect(ctx, r, RADAR_AREA_HATCH_COLOR, hatch_spacing);
         }
 
         // Left vertical outline at the run's left edge.
@@ -250,10 +273,11 @@ static void radar_update_proc(Layer *layer, GContext *ctx) {
     persist_get_rain_radar_trend(exact_tenths, RADAR_NUM_SLOTS);
     persist_get_rain_radar_trend_area(area_tenths, RADAR_NUM_SLOTS);
 
+    const int axis_h = radar_axis_h();
     const GRect outer = GRect(bounds.origin.x,
-                              bounds.origin.y + RADAR_AXIS_H,
+                              bounds.origin.y + axis_h,
                               bounds.size.w,
-                              bounds.size.h - RADAR_AXIS_H);
+                              bounds.size.h - axis_h);
 
     // Module-static scratch (not stack): aplite's small app stack overflows
     // otherwise (PC=0/LR=0). Safe — single layer instance, single-threaded,
@@ -283,6 +307,56 @@ static void radar_update_proc(Layer *layer, GContext *ctx) {
     };
     chart_draw(ctx, &RADAR_DEF, outer, layers,
                (int)(sizeof(layers) / sizeof(layers[0])));
+
+    // Empty-state text: a RECEIVED radar window (start > 0 — never the blank
+    // fresh-install state) whose slots are all dry would otherwise render as a bare
+    // axis over nothing. Say so instead, centred in the plot under the axis. The
+    // wording deliberately claims only what ~90 minutes of radar can know.
+    bool any_rain = false;
+    for (int i = 0; i < RADAR_NUM_SLOTS; i++) {
+        if (exact_tenths[i] > 0 || area_tenths[i] > 0) { any_rain = true; break; }
+    }
+    if (!any_rain && persist_get_rain_radar_start() > 0) {
+#ifdef PBL_PLATFORM_EMERY
+        // emery: the taller plot swallows 18px text — step up a font tier.
+        GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_24);
+        const int text_h = 24;
+#else
+        GFont font = fonts_get_system_font(FONT_KEY_GOTHIC_18);
+        const int text_h = 18;
+#endif
+        // A configured text (CLAY_NORAIN_TEXT, Radar settings) replaces the
+        // built-in line; persist absent (never set, or cleared) = the default.
+        char custom[NORAIN_TEXT_BUF_BYTES];
+        const char *text = (persist_get_norain_text(custom, sizeof(custom)) > 0)
+            ? custom : "No rain ahead";
+        // A custom text can run to 24 UTF-8 bytes — wider than a 144 px plot at
+        // this font — so the box grows to TWO lines when the plot affords them
+        // (the dense/none radar bands; the compact top band's plot is exactly
+        // one 18 px line tall, so it keeps the old single-line box).
+        // TrailingEllipsis word-wraps inside the box and ellipsizes only the
+        // last visible line: short text renders exactly as before, a long one
+        // wraps, an overlong second line still ellipsizes. The box centres on
+        // the MEASURED height so one line keeps its old seat; -text_h/4
+        // optically lifts over Gothic's blank top padding, clamped so a full
+        // two-line block never rises into the axis strip.
+        int content_h = text_h;
+        if (outer.size.h >= 2 * text_h) {
+            content_h = graphics_text_layout_get_content_size(text, font,
+                GRect(0, 0, outer.size.w, 2 * text_h + 4),
+                GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter).h;
+            if (content_h < text_h)     { content_h = text_h; }
+            if (content_h > 2 * text_h) { content_h = 2 * text_h; }
+        }
+        int text_y = outer.origin.y + (outer.size.h - content_h) / 2 - text_h / 4;
+        if (content_h > text_h && text_y < outer.origin.y) {
+            text_y = outer.origin.y;   // keep a wrapped block below the axis strip
+        }
+        graphics_context_set_text_color(ctx, theme_fg());
+        graphics_draw_text(ctx, text, font,
+            GRect(outer.origin.x, text_y, outer.size.w, content_h + 4),
+            GTextOverflowModeTrailingEllipsis, GTextAlignmentCenter, NULL);
+    }
 
     MEMORY_LOG_HEAP("radar_update:exit");
 }

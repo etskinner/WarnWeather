@@ -41,6 +41,15 @@ struct StatusRow {
 static uint8_t s_blob_scratch[STATUS_LINE_MAX_BYTES];
 static char s_text_scratch[STATUS_TEXT_MID_MAX + 1];
 
+// Seat this row's line in its band. Ported from status_row.c: every row cap-centres EXCEPT
+// the top strip, which rides STATUS_TOP_STRIP_LIFT rows higher inside an unchanged band
+// (its top edge is the screen edge, so only the gap below it is visible). One seat plus a
+// conditional subtract, not a choice between two inline seaters — see the base file.
+static int row_text_y(const StatusRow *row, GFont font) {
+    int y = status_text_y(row->bounds.size.h, font);
+    return (row->line_id == STATUS_LINE_TOP) ? y - STATUS_TOP_STRIP_LIFT : y;
+}
+
 static GFont row_font(uint8_t tier, uint8_t line_id) {
     if (line_id == STATUS_LINE_TOP) {
         return fonts_get_system_font(STATUS_TOP_TIER_FONT_KEY);
@@ -125,10 +134,17 @@ static uint16_t sig_fold(uint16_t sig, const uint8_t *data, size_t len) {
     return sig;
 }
 
-static int load_blob(uint8_t line_id) {
+// Read the line's packed blob into the shared scratch and walk it ONCE, filling
+// `out` with all three slot views. Returns the blob length, or 0 when there is
+// nothing renderable — `out` is then indeterminate. Ported from status_row.c
+// when status_line_slot() (which re-validated the whole blob per call) was
+// replaced by the single-walk status_line_slots(); see status_line.h for the
+// view-lifetime contract this relies on.
+static int load_blob(uint8_t line_id, StatusSlotView out[STATUS_SLOT_COUNT]) {
     int len = persist_get_status_line(line_id, s_blob_scratch,
                                       sizeof(s_blob_scratch));
-    if (len <= 0 || !status_line_validate(s_blob_scratch, (size_t)len)) {
+    if (len <= 0) { return 0; }
+    if (status_line_slots(s_blob_scratch, (size_t)len, out) != STATUS_SLOT_COUNT) {
         return 0;
     }
     return len;
@@ -199,10 +215,10 @@ bool status_row_refresh(StatusRow *row) {
     if (!row) { return false; }
     uint16_t sig = 5381;
     bool has_drawn_sun = false;
-    int len = load_blob(row->line_id);
+    StatusSlotView views[STATUS_SLOT_COUNT];
+    int len = load_blob(row->line_id, views);
     for (int i = 0; i < STATUS_SLOT_COUNT && len > 0; i++) {
-        StatusSlotView slot;
-        if (!status_line_slot(s_blob_scratch, (size_t)len, i, &slot)) { break; }
+        StatusSlotView slot = views[i];
         apply_battery_override(row, i, &slot);
         resolve_slot_text(row, &slot, s_text_scratch, sizeof(s_text_scratch));
         sig = sig_fold(sig, &slot.kind, 1);
@@ -301,8 +317,8 @@ static void status_mask_draw(GContext *ctx, const StatusMask *m, int x0, int cy)
 
 void status_row_draw(StatusRow *row, GContext *ctx) {
     if (!row || !ctx) { return; }
-    int len = load_blob(row->line_id);
-    if (len == 0) { return; }
+    StatusSlotView slots[STATUS_SLOT_COUNT];
+    if (load_blob(row->line_id, slots) == 0) { return; }
 
     GFont font = row_font(row->tier, row->line_id);
     int content_h = graphics_text_layout_get_content_size(
@@ -311,18 +327,14 @@ void status_row_draw(StatusRow *row, GContext *ctx) {
     int16_t content_w = (int16_t)(row->bounds.size.w - 2 * STATUS_ROW_MARGIN);
     if (content_w < 0) { content_w = 0; }
 
-    StatusSlotView slots[STATUS_SLOT_COUNT];
     char texts[STATUS_SLOT_COUNT][STATUS_TEXT_MID_MAX + 1];
 
     for (int i = 0; i < STATUS_SLOT_COUNT; i++) {
-        if (!status_line_slot(s_blob_scratch, (size_t)len, i, &slots[i])) {
-            return;
-        }
         apply_battery_override(row, i, &slots[i]);
         resolve_slot_text(row, &slots[i], texts[i], sizeof(texts[i]));
     }
 
-    int text_y_rel = status_text_y(row->bounds.size.h, font);
+    int text_y_rel = row_text_y(row, font);
     int text_y = row->bounds.origin.y + text_y_rel;
     int glyph_cy = row->bounds.origin.y
         + status_glyph_center_y(text_y_rel, content_h);

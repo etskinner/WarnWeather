@@ -5,10 +5,12 @@
  * openmeteo.js (unixtime/GMT + timestamp alignment). ES5 only (aplite PKJS).
  */
 
+// Leaf http helper (no provider cycle): call through the module object so
+// tests can stub http.request at runtime.
+var http = require('./http.js');
 var AIR_QUALITY_BASE = 'https://air-quality-api.open-meteo.com/v1/air-quality';
 var WAQI_BASE = 'https://api.waqi.info';
-var FORECAST_HOURS = 24;
-var HOUR_SECONDS = 60 * 60;
+var alignHourly = require('./hourly-window.js').alignHourly;
 
 /**
  * @param {string} scale 'us' selects US AQI; anything else selects European AQI.
@@ -48,23 +50,9 @@ function buildAqiUrl(lat, lon, scale) {
  * @returns {Array.<(number|null)>|null} AQI values, or null when malformed.
  */
 function mapAqi(json, startTime, scale) {
-    var hourly = json && json.hourly;
-    var times = hourly && hourly.time;
-    var aqi = hourly && hourly[scaleField(scale)];
-    if (!hourly || !Array.isArray(times) || !Array.isArray(aqi)) {
-        return null;
-    }
-    var byTime = {};
-    var i;
-    for (i = 0; i < times.length; i += 1) { byTime[times[i]] = aqi[i]; }
-    var out = [];
-    var h;
-    var value;
-    for (h = 0; h < FORECAST_HOURS; h += 1) {
-        value = byTime[startTime + h * HOUR_SECONDS];
-        out.push(typeof value === 'number' ? value : null);
-    }
-    return out;
+    // hourly-window owns the remap — this used to be a byte-identical copy of
+    // openmeteo.js's alignHourly with the field name parameterized.
+    return alignHourly(json, scaleField(scale), startTime);
 }
 
 /**
@@ -104,9 +92,8 @@ function mapWaqi(json) {
  * @returns {void}
  */
 function fetchOpenMeteoInto(provider, lat, lon, scale, done) {
-    var request = require('./provider.js').request;
     var url = buildAqiUrl(lat, lon, scale);
-    request(url, 'GET', function(resp) {
+    http.request(url, 'GET', function(resp) {
         var aqi = null;
         try { aqi = mapAqi(JSON.parse(resp), provider.startTime, scale); }
         catch (ex) { aqi = null; }
@@ -130,9 +117,8 @@ function fetchOpenMeteoInto(provider, lat, lon, scale, done) {
  * @returns {void}
  */
 function fetchWaqiInto(provider, lat, lon, done, notFound) {
-    var request = require('./provider.js').request;
     var url = buildWaqiUrl(lat, lon, provider.aqicnToken);
-    request(url, 'GET', function(resp) {
+    http.request(url, 'GET', function(resp) {
         var aqi = null;
         try { aqi = mapWaqi(JSON.parse(resp)); }
         catch (ex) { aqi = null; }

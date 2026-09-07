@@ -125,5 +125,60 @@ test('composeWeatherPayload works with no extras and no transform', () => {
   });
   const out = p.composeWeatherPayload(null, undefined);
   assert.equal(out.CITY, 'Town');
-  assert.ok(Array.isArray(out.TEMP_TREND_UINT8));
+  // Raw whole-degree temps: the transform (applyForecastSeries) owns the ONE
+  // encode into TEMP_TREND_UINT8; with no transform the raw series rides out.
+  assert.deepEqual(out.TEMP_RAW_TREND, [50, 51, 52]);
+});
+
+// Pressure rides as a transient non-byte series (hPa 950..1050 doesn't fit a
+// uint8), mirroring AQI_TREND rather than the *_TREND_UINT8 keys.
+function pressureProvider(over) {
+  return makeProvider(Object.assign({
+    numEntries: 24,
+    tempTrend: new Array(24).fill(50),
+    precipTrend: new Array(24).fill(0),
+    rainTrend: new Array(24).fill(0),
+    startTime: 1000,
+    currentTemp: 60,
+    cityName: 'Testville',
+    sunEvents: [
+      { type: 'sunrise', date: new Date(1000 * 1000) },
+      { type: 'sunset', date: new Date(2000 * 1000) }
+    ]
+  }, over));
+}
+
+test('getPayload emits an empty PRESSURE_TREND when no provider sourced it', () => {
+  assert.deepEqual(pressureProvider().getPayload().PRESSURE_TREND, []);
+});
+
+test('getPayload emits sourced pressure verbatim, trimmed to numEntries', () => {
+  const p = pressureProvider({ pressureTrend: new Array(30).fill(1013.5) });
+  const out = p.getPayload().PRESSURE_TREND;
+  assert.equal(out.length, 24);
+  assert.equal(out[0], 1013.5); // no byte-scaling: hPa stay real numbers
+});
+
+// Feels-like rides as transient keys, but unlike PRESSURE_TREND they are
+// emitted only when sourced — a feels-less payload has no keys to strip.
+test('getPayload omits FEELS_TREND/FEELS_CURRENT when no provider sourced them', () => {
+  const payload = pressureProvider().getPayload();
+  assert.equal('FEELS_TREND' in payload, false);
+  assert.equal('FEELS_CURRENT' in payload, false);
+});
+
+test('getPayload emits sourced feelsTrend as whole °F, trimmed to numEntries', () => {
+  const p = pressureProvider({ feelsTrend: new Array(30).fill(47.3) });
+  const out = p.getPayload();
+  assert.equal(out.FEELS_TREND.length, 24);
+  // Rounded at the source: fractional Steadman/apparent values would otherwise
+  // widen the joint band into the int32 TEMP_MIN/TEMP_MAX wire keys.
+  assert.equal(out.FEELS_TREND[0], 47);
+  assert.equal('FEELS_CURRENT' in out, false, 'current is independent of the trend');
+});
+
+test('getPayload rounds FEELS_CURRENT like CURRENT_TEMP (0 °F is a real value)', () => {
+  const p = pressureProvider({ currentFeels: 46.6 });
+  assert.equal(p.getPayload().FEELS_CURRENT, 47);
+  assert.equal(pressureProvider({ currentFeels: 0 }).getPayload().FEELS_CURRENT, 0);
 });

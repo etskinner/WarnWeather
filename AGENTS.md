@@ -16,6 +16,10 @@ contributor tool working in this repo. (Claude Code reads it through `CLAUDE.md`
 - After any change, run `mise build` to verify it builds.
 - For runtime logs, `mise install-emulator --logs` runs it in an emulator and prints
   logs to the terminal. The process stays alive until the emulator is closed.
+- **Shut emulators down when you're done with them** — `pebble kill`, then verify with
+  `ps aux | grep qemu-pebble`: repeated installs can accumulate qemu processes that
+  `pebble kill` misses; `pkill -f qemu-pebble; pkill -f pypkjs` clears the stragglers.
+  Booted emulators linger indefinitely otherwise and keep eating CPU/RAM.
 - For config-UI (settings page) work, `mise preview-config` renders the live page —
   real schema, blocks, and onBuild hooks injected — to
   `build/config-ui-preview.html`. Open it in a desktop
@@ -30,8 +34,10 @@ contributor tool working in this repo. (Claude Code reads it through `CLAUDE.md`
 ## Tests
 
 - `mise test` regenerates `page.generated.js` first (a gitignored build artifact the
-  tests depend on transitively), then runs the suite with Node's native runner
-  (`node --test` / `node:test` — not Jest or Mocha). Test files are `test/*.test.js`.
+  tests depend on transitively), then runs two Node test globs with Node's native runner
+  (`node --test` / `node:test` — not Jest or Mocha): `test/**/*.test.js` and
+  `src/pkjs/config-ui/test/**/*.test.js`, then `scripts/test-c.sh` (host-compiled C layout
+  tests).
 - Tests that touch storage must install a `global.localStorage` mock before the watch
   modules load (see `test/change-detector.test.js` for the pattern).
 
@@ -68,11 +74,14 @@ platforms and in the build:
   v1.1.0 weather-fetch crash via `Object.assign`).
 
 Write watch-runtime PKJS as ES5: `var` + `function`, no arrow/template-literal syntax,
-and avoid ES6 built-ins. Already polyfilled and safe to call: `Object.assign` and
+and avoid ES6 built-ins. Already polyfilled and safe to call: `Object.assign`, `Math.trunc`, and
 `Array.prototype.find`/`findIndex`/`includes` (see `src/pkjs/polyfills.js`, required
 first in `index.js`). Need another ES6 method? Add a guarded polyfill there instead of
-calling it directly. Exempt: `src/pkjs/clay/` is vendored and runs in the phone webview
-(modern JS), so its ES6 usage doesn't reach the watch.
+calling it directly. No exemption for webview-only files: `src/pkjs/config-ui/`
+(the settings UI on all platforms) requires ES5 even in files that only run in the phone
+webview (e.g. `lib/show-when.js`, `lib/engine.js`) to protect ancient Android WebViews,
+enforced by an automated regex guardrail in the test suite — see its own README.md's
+"ES5 constraint" section.
 
 ### Module conventions
 
@@ -83,22 +92,32 @@ calling it directly. Exempt: `src/pkjs/clay/` is vendored and runs in the phone 
   `change-detector.js`, bundle only the categories whose content changed into ONE send
   (the AppMessage channel is half-duplex, so back-to-back sends collide), and commit the
   last-sent cache only in the ACK callback so a NACK retries next time.
-- **Keep the bundled message within the watch's inbox — `inbox_size = 528` B
+- **Keep the bundled message within the watch's inbox — `inbox_size = 536` B
   (`src/c/appendix/app_message.c`).** Because all changed categories ride in one send, a
   new or enlarged payload key has to keep the *heaviest* bundle under budget. The buffer
-  is allocated from aplite's already-tiny heap, so 528 B is effectively a hard ceiling —
+  is allocated from aplite's already-tiny heap, so 536 B is effectively a hard ceiling —
   you can't just bump it. An overflow is dropped silently (`APP_MSG_BUFFER_OVERFLOW` →
   "Message dropped!"). Worst realistic case is DWD + wind with City in every status slot
-  ≈517 B (see `test/inbox-size.test.js` — the authoritative computation; keep its recorded
-  size in sync). The palette now rides the Clay/settings message instead. `test/inbox-size.test.js`
-  guards both the weather and Clay bundles; when
-  you grow the worst-case bundle, update its `buildHeaviestBundle()`, and treat bumping
-  `inbox_size` as a last resort.
+  = 482 B, leaving 54 B of headroom (see `test/inbox-size.test.js` — the authoritative
+  computation, which records both bundle sizes exactly; keep them in sync). That headroom
+  was 10 B until the settings-derived tuples were moved off this message: the rain-bar and
+  radar palettes first, then the forecast line styling (line colours + fill flag, 4 × 11 B
+  of scalars → one `CLAY_LINE_STYLE_UINT8` array, since grown to 10 B so it also carries
+  the five night colours and their flag byte), both of which now ride the Clay/settings
+  message. `test/inbox-size.test.js` guards both the weather and Clay
+  bundles; when you grow the worst-case bundle, update its `buildHeaviestBundle()`, and
+  treat bumping `inbox_size` as a last resort. Before spending weather-message bytes, ask
+  whether the value is settings-derived — if it is, it belongs on the Clay message, which
+  has far more room (490 B of 536 B used).
 - **Message boundary: settings ride the settings (Clay) message; weather data rides the
   weather message.** Config-derived values — colour palettes, formatting/display toggles,
   the holiday mask — belong in `sendClaySettings` (`outbox.sendClay`). The weather payload
   carries only forecast/status/sun/radar/sleep. (The rain-bar/radar palette rides the Clay
-  message as of v1.4; `clay-payload.js` builds and sends it alongside the other settings.)
+  message as of v1.4, and the forecast line styling — `CLAY_LINE_STYLE_UINT8`, built by
+  `line-style.js` — joined it later; `clay-payload.js` builds and sends both alongside the
+  other settings. Colours pack as single `GColor8` argb bytes, not int32 hex: an array
+  tuple costs 7 B + N, a scalar costs 7 B + 4, so packing several into one array is the
+  cheap shape.)
 - **A new telemetry setting must be added in two places or it's silently dropped:** the
   watch-side snapshot in `src/pkjs/telemetry.js` AND the Deno `.strip()` schema in
   `supabase/functions/telemetry-ingest/index.ts`.
@@ -197,17 +216,29 @@ and hosted-deploy commands are in `DEV.md` / `CONTRIBUTING.md`.
   conventional commits to `main` opens/updates a release PR that bumps the version in
   `package.template.json` (`$.version`); merging that PR tags the release and uploads
   `build/warnweather.pbw`. The commit prefixes drive the version bump, so they matter.
-- **Every release needs a `release-notifications.json` entry.** Add one keyed by the exact
-  new version string (e.g. `"1.4.0"`) with non-empty `title` + `body` — the upgrade
-  "what's new" toast. The *Release Notification Required* CI check
-  (`scripts/check-release-notification.js`) fails the release PR without it.
-  `prepare-package.sh` injects the matching entry into `package.json`; preview the copy
-  locally with `forceShowReleaseNotificationOnBoot` in `dev-config.js`. See `RELEASE.md`.
-- **Every release also needs a detailed news entry in the `public.news` Supabase table**
-  (hosted news backend — the *News & Feedback* section of the settings screen, not the
-  boot toast above). Insert one row with `target_version` set to the **exact** new version
-  string (e.g. `'1.9.2'`) so it's shown only to watches on that build — never leave it
-  `NULL` (that broadcasts to everyone). The `release-notifications.json` toast is a one-line
+- **A FEATURE release needs a `release-notifications.json` entry; a fix-only patch does
+  not.** The entry is keyed by the exact new version string (e.g. `"1.4.0"`) with
+  non-empty `title` + `body` — the upgrade "what's new" toast. It interrupts the user on
+  first launch after an upgrade, so it is spent on releases that give them something to
+  do: **required for `x.y.0`, optional for `x.y.z` (z > 0)**. The *Release Notification
+  Required* CI check (`scripts/check-release-notification.js`) enforces exactly that, and
+  still rejects a half-filled entry at ANY version — `prepare-package.sh` throws on one.
+  Omitting it is safe by construction: `prepare-package.sh` injects
+  `pkg.releaseNotification` only when the manifest holds the built version, and the watch
+  shows the newest *unseen* entry at or below the running version — so 1.13.1 → 1.13.2
+  shows nothing while 1.13.0 → 1.13.2 still shows the 1.13.1 toast it never saw. Watch for
+  `Release-As:` pinning a FEATURE to a patch version (1.13.1 did): the check reads the
+  version, not the commits, so it won't ask for a toast on the release that most wants
+  one — add it by hand there. Preview the copy locally with
+  `forceShowReleaseNotificationOnBoot` in `dev-config.js`. See `RELEASE.md`.
+- **Every release — patches included — needs a detailed news entry in the `public.news`
+  Supabase table** (hosted news backend — the *News & Feedback* section of the settings
+  screen, not the boot toast above). Unlike that toast, this one has no feature/patch
+  exemption and **nothing in CI enforces it**, so it is on you at release time. Insert one row with `target_version` left **`NULL`** so every watch
+  sees it, whatever version it runs — release news doubles as the nudge to update.
+  (An exact version string like `'1.9.2'` limits a row to watches on that build;
+  reserve that for version-specific notices, e.g. "this build broke X, update".)
+  The `release-notifications.json` toast is a one-line
   summary; the news `body_md` is the longer changelog. Match the style of the existing
   rows: a `"What's new in <version>"` title and `body_md` using the supported markdown
   subset (`**bold**` section headers, `- ` bullets, `*italic*`, `[text](https://…)` links —

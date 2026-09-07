@@ -17,20 +17,59 @@ const items = allItems(schema);
 const byKey = (k) => items.filter((i) => i.messageKey === k)[0];
 function forecastItems(s) { return s.tabs.find((t) => t.id === 'forecast').sections[0].items; }
 
+// Threshold highlighting adds six keys per kind (7 kinds: the toggle, the pair, the
+// scale max, two colors), generated the same way schema.js's thresholdSection()
+// generates them — listing 42 literals would just invite drift. THRESH_COLOR_KEYS is
+// reused by the color-defaults assertion below.
+const THRESH_STEMS = ['Aqi', 'Pollen', 'Wind', 'Gust', 'Steps', 'Sleep', 'Distance', 'Uv'];
+const threshKeys = (suffixes) => THRESH_STEMS.reduce((acc, stem) =>
+  acc.concat(suffixes.map((suffix) => 'thresh' + stem + suffix)), []);
+const THRESH_COLOR_KEYS = threshKeys(['WarnColor', 'DangerColor']);
+// The bold-only slot kinds (wire ids 8..19 in status-thresholds.js) add ONE key
+// each: a Bold row is their whole sheet (Temp additionally carries the
+// tempSlotDisplay row — listed with the plain keys below). The battery GLYPH item
+// is deliberately absent — its slot draws a glyph, not text, so it has no sheet
+// and no key; the battery PERCENTAGE kind (BatteryPct) renders text and has both.
+// PhoneBattery is ONE stem for TWO wire kinds (18 phoneBattery, 19 phoneBatteryPlain):
+// both KINDS entries share key 'PhoneBattery', so they share one sheet and one key.
+const BOLD_ONLY_STEMS = ['Temp', 'Pressure', 'Sun', 'Date', 'Week', 'City', 'Countdown', 'Hr', 'BatteryPct', 'Dew',
+  'PhoneBattery'];
+const BOLD_ONLY_KEYS = BOLD_ONLY_STEMS.map((stem) => 'thresh' + stem + 'BoldMode');
+const THRESH_KEYS = threshKeys(['On', 'BoldMode', 'WarnOutlineOn', 'Warn', 'Danger', 'Max'])
+  .concat(THRESH_COLOR_KEYS)
+  .concat(BOLD_ONLY_KEYS)
+  // Per-kind display rows that ride a threshold sheet: the wind/gust direction arrows
+  // and their "Show unit" toggles (Temp's tempSlotDisplay is listed with the plain keys
+  // below, next to the other three "Show unit" keys on bold-only sheets).
+  .concat(['windSlotDirection', 'gustSlotDirection', 'windSlotUnit', 'gustSlotUnit']);
+// The "Show unit" toggles on the BOLD-ONLY sheets. Six kinds have one — the six whose
+// slot text the phone bakes; the watch-formatted kinds (distance, heart rate, sleep,
+// battery %) would need the flag on the wire and are deliberately absent.
+const UNIT_KEYS = ['tempSlotUnit', 'pressureSlotUnit', 'countdownSlotUnit', 'dewSlotUnit'];
+// The Graph-colors rows: every metric colour, with one picker per theme polarity so a
+// Dark and a Light pick never overwrite one another (the colorUSFederal idiom). The list
+// comes from line-style.js because the schema builds its rows from the same call — this
+// file asserts the card matches the RENDERER's key list, not that both match a third
+// copy kept here.
+const lineStyle = require('../src/pkjs/line-style.js');
+const GRAPH_COLOR_KEYS = lineStyle.graphColorKeys();
+
 const EXPECTED_KEYS = [
   'theme',
   'timeLeadingZero','timeShowAmPm','axisTimeFormat','timeFont','colorTime',
   'weekStartDay','firstWeek','colorToday','colorSunday','colorSaturday','holidaysEnabled','colorUSFederal',
   'holidayCountry','holidayRegion',
   'fetchIntervalMin','gpsCacheMin','sleepNightEnabled','sleepStartHour','sleepEndHour','fetch','fetchNoticeAck','locationMode','location',
-  'temperatureUnits','aqiSource','aqiScale','windUnits','distanceUnits','dayNightShading','healthMode','secondaryLine','secondaryLineFill','windScale','thirdLine',
-  'barSource','rainBarColor','provider','owmApiKey','yandexApiKey','tomorrowioApiKey','tomorrowioFitBudget','radarMode','radarProvider','radarColor','rainCountdownHorizon',
-  'layoutPreset','viewResetMin','swapClockStatus','configTheme','showQt','vibe','btIcons','telemetryEnabled','onboardingDone','devStatsEnabled','devStatsClear','reset',
+  'temperatureUnits','aqiSource','aqiScale','windUnits','distanceUnits','dayNightShading','healthMode','hrScale','secondaryLine','secondaryLineFill','windScale','pressureScale','thirdLine','tempSlotDisplay',
+  'dateSlotMonthFormat','dateSlotFullFormat',
+  'barSource','rainBarColor','provider','owmApiKey','yandexApiKey','tomorrowioApiKey','tomorrowioFitBudget','radarMode','radarProvider','radarColor','radarNoRainText','rainCountdownHorizon',
+  'layoutPreset','largeGraphFont','viewResetMin','swapClockStatus','configTheme','showQt','vibe','btIcons','telemetryEnabled','onboardingDone','devStatsEnabled','devStatsClear','reset',
+  'statusBoldAll',
   'statusForecastLeft','statusForecastLeftCountdown','statusForecastMid','statusForecastMidCountdown','statusForecastRight','statusForecastRightCountdown',
   'statusRadarLeft','statusRadarLeftCountdown','statusRadarMid','statusRadarMidCountdown','statusRadarRight','statusRadarRightCountdown',
   'statusTopLeft','statusTopLeftCountdown','statusTopMid','statusTopMidCountdown','statusTopRight','statusTopRightCountdown',
   'batteryLowOnly','statusHealthLeft','statusHealthLeftCountdown','statusHealthMid','statusHealthMidCountdown','statusHealthRight','statusHealthRightCountdown'
-];
+].concat(THRESH_KEYS).concat(UNIT_KEYS).concat(GRAPH_COLOR_KEYS);
 
 test('every Clay messageKey present; theme/windScale/colorUSFederal are the only duplicates (contextual slots)', () => {
   EXPECTED_KEYS.forEach((k) => assert.ok(byKey(k), 'missing messageKey: ' + k));
@@ -38,14 +77,16 @@ test('every Clay messageKey present; theme/windScale/colorUSFederal are the only
   const counts = {};
   seen.forEach((k) => { counts[k] = (counts[k] || 0) + 1; });
   const dups = Object.keys(counts).filter((k) => counts[k] > 1);
-  // windScale: solid-line slot vs. dotted-line slot. theme: color-env (4 options) vs.
-  // B&W-env (2 options). colorUSFederal: dark-exclude-white vs. light-exclude-black.
-  // tomorrowioApiKey/tomorrowioFitBudget: General tab (weather provider) vs. Radar tab
-  // (radar-only) — mutually-exclusive showWhen, so only one instance ever renders.
+  // windScale: solid-line slot vs. dotted-line slot. pressureScale: same split (secondary
+  // vs. third line context). theme: color-env (4 options) vs. B&W-env (2 options).
+  // colorUSFederal: dark-exclude-white vs. light-exclude-black. tomorrowioApiKey/
+  // tomorrowioFitBudget: General tab (weather provider) vs. Radar tab (radar-only) —
+  // mutually-exclusive showWhen, so only one instance ever renders.
   assert.deepEqual(dups.sort(),
-    ['colorUSFederal', 'theme', 'tomorrowioApiKey', 'tomorrowioFitBudget', 'windScale'],
+    ['colorUSFederal', 'pressureScale', 'theme', 'tomorrowioApiKey', 'tomorrowioFitBudget', 'windScale'],
     'unexpected duplicates: ' + dups.join(','));
   assert.equal(counts.windScale, 6, 'windScale appears in six slots (2 contexts × 3 units)');
+  assert.equal(counts.pressureScale, 2, 'pressureScale appears in two slots (secondary + third)');
   assert.equal(counts.theme, 2, 'theme appears in exactly two slots');
   assert.equal(counts.colorUSFederal, 2, 'colorUSFederal appears in exactly two slots');
   assert.equal(counts.tomorrowioApiKey, 2, 'tomorrow.io key in the General + Radar tabs');
@@ -111,7 +152,9 @@ test('color defaults are ints', () => {
   // colorUSFederal now has two contextual slots (dark-exclude-white / light-exclude-black),
   // like windScale/theme — dedupe by messageKey to assert the SET of color-typed controls.
   const colorTypeKeys = Array.from(new Set(items.filter((i) => i.type === 'color').map((i) => i.messageKey))).sort();
-  assert.deepEqual(colorTypeKeys, ['colorSaturday','colorSunday','colorTime','colorToday','colorUSFederal']);
+  assert.deepEqual(colorTypeKeys,
+    ['colorSaturday','colorSunday','colorTime','colorToday','colorUSFederal']
+      .concat(THRESH_COLOR_KEYS).concat(GRAPH_COLOR_KEYS).sort());
 });
 
 test('B/W bar-scale hints are staticText, gated to effective non-color + the picker condition', () => {
@@ -138,9 +181,22 @@ test('B/W bar-scale hints actually show for bw-light (not just bw) via the show-
 
 test('COLOR-capability + showWhen wiring', () => {
   ['rainBarColor','radarColor','colorTime'].forEach((k) => assert.ok(byKey(k).capabilities.indexOf('COLOR') >= 0));
-  assert.equal(byKey('secondaryLineFill').showWhen, undefined); // fill now available for every metric
+  // Fill is available for every metric EXCEPT feels-like, which rides the temperature
+  // axis and so has no meaningful zero to fill down to.
+  assert.deepEqual(byKey('secondaryLineFill').showWhen, { key: 'secondaryLine', ne: 'feels' });
   assert.deepEqual(byKey('owmApiKey').showWhen, { key: 'provider', eq: 'openweathermap' });
   assert.deepEqual(byKey('devStatsClear').showWhen, { key: 'devStatsEnabled', eq: true });
+});
+
+test('the fill toggle hides for feels-like and stays visible for every other metric', () => {
+  const fill = byKey('secondaryLineFill');
+  ['precip_prob', 'wind', 'gust', 'uv', 'pressure'].forEach((m) => {
+    assert.equal(showWhen.isVisible(fill, { secondaryLine: m, env: {} }), true, m + ' keeps the fill row');
+  });
+  assert.equal(showWhen.isVisible(fill, { secondaryLine: 'feels', env: {} }), false,
+    'feels-like hides the fill row');
+  // The metric picker carries the hook that clears the stored value on the way in.
+  assert.equal(byKey('secondaryLine').onChange, 'forecastMetricFill');
 });
 
 test('tomorrow.io key renders under whichever picker uses it: General (weather) or Radar (radar-only)', () => {
@@ -232,6 +288,49 @@ test("Health Status Bar slots show only when a dedicated Health view is enabled"
   });
 });
 
+test('hrScale is a range slider gated to HR hardware and the graph mode', () => {
+  const it = byKey('hrScale');
+  assert.ok(it, 'hrScale item exists');
+  assert.equal(it.type, 'range');
+  // The default, the clay-payload fallback and the watch's HEALTH_HR_LO/HEALTH_HR_HI
+  // are one number in three places: a watch that never received the key must draw the
+  // same scale as one that did. Assert against the C header rather than a literal, so
+  // moving one of the three without the others fails here.
+  assert.equal(it.defaultValue, '40-150');
+  const graphC = require('fs').readFileSync(
+    require('path').join(__dirname, '../src/c/layers/health_graph_layer.c'), 'utf8');
+  const lo = /#define\s+HEALTH_HR_LO\s+(\d+)/.exec(graphC);
+  const hi = /#define\s+HEALTH_HR_HI\s+(\d+)/.exec(graphC);
+  assert.ok(lo && hi, 'HEALTH_HR_LO/HI found in health_graph_layer.c');
+  assert.equal(it.defaultValue, lo[1] + '-' + hi[1],
+    'the schema default and the watch constants must stay in lockstep');
+  assert.equal(it.min, 30);
+  assert.equal(it.max, 220);
+  assert.equal(it.step, 5);
+  assert.equal(it.minSpan, 50);
+  assert.equal(it.unit, 'BPM');
+  // The HR *line* only exists in the graph, and only sensor watches ever have data.
+  assert.deepEqual(it.showWhen, {
+    all: [{ env: 'hr' }, { key: 'healthMode', eq: 'all' }],
+  });
+});
+
+test('hrScale is hidden on aplite and on sensorless watches', () => {
+  const it = byKey('hrScale');
+  const S = { healthMode: 'all' };
+  const vis = (plat) => showWhen.isVisible(it, Object.assign({}, S, {
+    env: platform.computeEnv({ platform: plat }),
+  }));
+  assert.equal(vis('diorite'), true, 'Pebble 2 has an HR sensor');
+  assert.equal(vis('emery'), true, 'Pebble Time 2 has an HR sensor');
+  assert.equal(vis('aplite'), false, 'aplite has no health at all');
+  assert.equal(vis('basalt'), false, 'no HR sensor -> no scale to set');
+  // Right platform, wrong mode.
+  assert.equal(showWhen.isVisible(it, {
+    healthMode: 'status', env: platform.computeEnv({ platform: 'diorite' }),
+  }), false, 'no graph in status mode');
+});
+
 test('radar tab is gated to radar-capable platforms', () => {
   // aplite compiles the rain-radar view out (WW_RAIN_RADAR undefined) to reclaim
   // boot heap, so hide the whole tab there instead of showing controls that do
@@ -241,10 +340,63 @@ test('radar tab is gated to radar-capable platforms', () => {
   assert.deepEqual(radarTab.showWhen, { env: 'radar' });
 });
 
-test('secondaryLine is a 4-metric dropdown with no Off', () => {
+test('radarNoRainText: visible default, 24-char UI cap, graph-only', () => {
+  const item = byKey('radarNoRainText');
+  assert.ok(item, 'radarNoRainText item exists');
+  assert.equal(item.type, 'text');
+  // The watch's built-in string ships as a VISIBLE defaultValue (not a
+  // placeholder) so users see and override the actual message; clearing the
+  // field falls back to the built-in string watch-side.
+  assert.equal(item.defaultValue, 'No rain ahead');
+  // Soft UI cap; the real limit is 24 UTF-8 BYTES, enforced phone-side at pack
+  // time.
+  assert.equal(item.attributes.maxlength, 24);
+  // Only the radar GRAPH (rain_radar_layer.c) ever draws the message — the
+  // status bar and the countdown have no plot to write it on — so the field
+  // follows the graph, not the radar as a whole.
+  assert.deepEqual(item.showWhen, {key: 'radarMode', eq: 'graph'},
+    'shown only in Status + Graph mode');
+  const radarItems = schema.tabs.find((t) => t.id === 'radar').sections[0].items;
+  const idx = radarItems.indexOf(item);
+  assert.ok(idx !== -1, 'lives in the Radar tab');
+  assert.equal(radarItems[idx - 1].messageKey, 'radarColor',
+    'follows the radar appearance settings, not mid-provider-config');
+  // End-to-end through the real renderer: the maxlength attribute and the
+  // visible default both land on the <input>.
+  const eng = require('../src/pkjs/config-ui/lib/engine.js');
+  const S = eng.hydrate(schema, {});
+  const ENV = platform.computeEnv({ platform: 'basalt' });
+  const body = eng.renderBody(schema, 'radar', {
+    S: S, ENV: ENV, USERDATA: {}, openColor: null, openSelect: null,
+    openEdit: null, selectQuery: '', collapsed: {},
+    evalCtx: Object.assign({}, S, { env: ENV }),
+  });
+  assert.match(body, /data-k="radarNoRainText" value="No rain ahead" placeholder="" maxlength="24"/,
+    'the rendered input carries the visible default and the 24 cap');
+
+  // ...and it disappears in the modes with no graph to draw it in.
+  ['status', 'countdown', 'off'].forEach((mode) => {
+    const S2 = eng.hydrate(schema, {});
+    S2.radarMode = mode;
+    const html = eng.renderBody(schema, 'radar', {
+      S: S2, ENV: ENV, USERDATA: {}, openColor: null, openSelect: null,
+      openEdit: null, selectQuery: '', collapsed: {},
+      evalCtx: Object.assign({}, S2, { env: ENV }),
+    });
+    assert.ok(html.indexOf('data-k="radarNoRainText"') === -1,
+      'no-rain field hidden in radarMode=' + mode);
+  });
+});
+
+const metricOptions = (S, env, args) =>
+  global.PConf.optionsResolvers.get('forecastMetric')(S, env, args);
+
+test('secondaryLine is a 6-metric dropdown with no Off (resolver-derived)', () => {
   const sec = byKey('secondaryLine');
   assert.equal(sec.type, 'select');
-  assert.deepEqual(sec.options.map((o) => o[1]), ['precip_prob', 'wind', 'gust', 'uv']);
+  assert.equal(sec.optionsFrom.resolver, 'forecastMetric');
+  const vals = metricOptions({}, { platform: 'basalt' }).map((o) => o[1]);
+  assert.deepEqual(vals, ['precip_prob', 'wind', 'gust', 'uv', 'pressure', 'feels']);
   assert.equal(sec.defaultValue, 'precip_prob');
 });
 
@@ -252,15 +404,24 @@ test('thirdLine derives options from secondaryLine, excluding it, with Off + def
   const third = byKey('thirdLine');
   assert.equal(third.type, 'select');
   assert.equal(third.defaultValue, 'uv');
-  assert.equal(third.optionsFrom.byKey, 'secondaryLine');
-  const map = third.optionsFrom.map;
-  // Every secondary metric maps to Off + the OTHER three (never itself).
-  ['precip_prob', 'wind', 'gust', 'uv'].forEach((sec) => {
-    const vals = map[sec].map((o) => o[1]);
+  assert.equal(third.optionsFrom.resolver, 'forecastMetric');
+  assert.equal(third.optionsFrom.args.third, true);
+  // Every secondary metric yields Off + the OTHER five (never itself).
+  ['precip_prob', 'wind', 'gust', 'uv', 'pressure', 'feels'].forEach((sec) => {
+    const vals = metricOptions({ secondaryLine: sec }, { platform: 'basalt' }, { third: true })
+      .map((o) => o[1]);
     assert.equal(vals[0], 'off', sec + ' third options must start with off');
     assert.ok(!vals.includes(sec), sec + ' must be excluded from its own third-line options');
-    assert.equal(vals.length, 4, sec + ' → off + 3 others');
+    assert.equal(vals.length, 6, sec + ' → off + 5 others');
   });
+});
+
+test('feels-like is left out of both metric pickers on aplite', () => {
+  const sec = metricOptions({}, { platform: 'aplite' }).map((o) => o[1]);
+  assert.deepEqual(sec, ['precip_prob', 'wind', 'gust', 'uv', 'pressure']);
+  const third = metricOptions({ secondaryLine: 'precip_prob' }, { platform: 'aplite' }, { third: true })
+    .map((o) => o[1]);
+  assert.deepEqual(third, ['off', 'wind', 'gust', 'uv', 'pressure']);
 });
 
 test('UV hint explains the fixed 0-11 scale (parallel to precip percentage)', () => {
@@ -341,6 +502,17 @@ test('night battery saver toggle is renamed and still gates the From/To sleep-ho
   assert.deepEqual(byKey('sleepEndHour').showWhen, { key: 'sleepNightEnabled', eq: true });
 });
 
+// The saver no longer only stops weather FETCHES: with the phone-battery slot it also
+// suppresses the status micro-send (level changes and charging transitions alike), so
+// the hint has to describe sending rather than fetching or it under-promises what the
+// toggle now turns off. Pinned verbatim — this is user-facing copy, and the wording was
+// dictated by the design (docs/superpowers/specs/2026-08-20-phone-battery-slot-design.md
+// §3), not derived.
+test('the night battery saver hint is about SENDING updates, not fetching weather', () => {
+  assert.equal(byKey('sleepNightEnabled').hint,
+    'Stop sending updates to your watch between the hours below to save battery.');
+});
+
 test('windUnits is a segmented kph/mph/Knots picker defaulting to kph', () => {
   const w = byKey('windUnits');
   assert.equal(w.type, 'segmented');
@@ -407,24 +579,31 @@ test('forecast line pickers use the new metric-oriented labels', () => {
 });
 
 test('metric options are spelled out fully on both pickers', () => {
-  assert.deepEqual(byKey('secondaryLine').options, [
-    ['Precipitation %', 'precip_prob'], ['Wind speed', 'wind'], ['Wind gusts', 'gust'], ['UV Index', 'uv']
+  assert.deepEqual(metricOptions({}, { platform: 'basalt' }), [
+    ['Precipitation %', 'precip_prob'], ['Wind speed', 'wind'], ['Wind gusts', 'gust'], ['UV Index', 'uv'], ['Air pressure (hPa)', 'pressure'], ['Feels-like temperature', 'feels']
   ]);
-  const map = byKey('thirdLine').optionsFrom.map;
-  const labelOf = (sec, val) => map[sec].find((o) => o[1] === val)[0];
-  assert.equal(map.precip_prob[0][0], 'Off');
+  const thirdOf = (sec) => metricOptions({ secondaryLine: sec }, { platform: 'basalt' }, { third: true });
+  const labelOf = (sec, val) => thirdOf(sec).find((o) => o[1] === val)[0];
+  assert.equal(thirdOf('precip_prob')[0][0], 'Off');
   assert.equal(labelOf('wind', 'precip_prob'), 'Precipitation %');
   assert.equal(labelOf('precip_prob', 'gust'), 'Wind gusts');
   assert.equal(labelOf('precip_prob', 'uv'), 'UV Index');
   assert.equal(labelOf('gust', 'wind'), 'Wind speed');
+  assert.equal(labelOf('precip_prob', 'feels'), 'Feels-like temperature');
+  assert.equal(labelOf('feels', 'pressure'), 'Air pressure (hPa)');
 });
 
 test('Second metric picker hints note that it is drawn as bar-aligned square dots', () => {
   const hints = byKey('thirdLine').hintByValue;
-  ['precip_prob', 'wind', 'gust', 'uv'].forEach((m) => {
+  ['precip_prob', 'wind', 'gust', 'uv', 'pressure', 'feels'].forEach((m) => {
     assert.match(hints[m], /square dots.*rain bars/i, m + ' hint should mention bar-aligned square dots');
   });
   assert.match(hints.off, /No second metric/i);
+});
+
+test('feels-like hint says it shares the temperature scale, on both pickers', () => {
+  assert.match(byKey('secondaryLine').hintByValue.feels, /same scale as the temperature curve/i);
+  assert.match(byKey('thirdLine').hintByValue.feels, /same scale as the temperature curve/i);
 });
 
 test('forecast tab nests fill and wind scale under the line that enables them', () => {
@@ -500,6 +679,32 @@ test('layoutPreset offers the four adaptive presets', () => {
   assert.equal(byKey('firstWeek').showWhen, undefined);
 });
 
+// A hidden compactDense must lie DORMANT, not be migrated away: rendering the Layout tab
+// while neither health nor radar shows a status row displays the compactCal fallback but
+// leaves the stored choice untouched, so briefly disabling health+radar and saving does
+// not lose the dense preset — it comes back when a status row re-enables it. (The wire
+// compiles stored-dense-with-nothing-enabled to the identical compactCal cycle, so the
+// watch always matches what the radio shows.) A truly invalid value still hard-snaps.
+test('hidden compactDense renders the compactCal fallback but stays in state', () => {
+  const eng = require('../src/pkjs/config-ui/lib/engine.js');
+  const ENV = platform.computeEnv({ platform: 'basalt' });
+  const cx = (S) => ({ S, ENV, USERDATA: {}, evalCtx: Object.assign({}, S, { env: ENV }) });
+
+  const S = eng.hydrate(schema, {});
+  S.layoutPreset = 'compactDense';
+  S.healthMode = 'off';
+  S.radarMode = 'off';   // dense hidden in this mode
+  const html = eng.renderBody(schema, 'layout', cx(S));
+  assert.equal(S.layoutPreset, 'compactDense', 'stored dense choice survives the render');
+  assert.match(html, /class="on" data-k="layoutPreset" data-v="compactCal"/,
+    'the radio shows compactCal selected as the display fallback');
+
+  // The generic lockstep rule is untouched: an unknown value still snaps into state.
+  S.layoutPreset = 'bogus';
+  eng.renderBody(schema, 'layout', cx(S));
+  assert.equal(S.layoutPreset, 'compactCal', 'invalid values still hard-snap');
+});
+
 test('viewResetMin is hidden on aplite and carries its explanation as its own hint', () => {
   const layout = schema.tabs.find((t) => t.id === 'layout');
   const layoutItems = layout.sections[0].items;
@@ -516,11 +721,14 @@ test('viewResetMin is hidden on aplite and carries its explanation as its own hi
   assert.equal(showWhen.isVisible(reset, aplite), false);
 });
 
-test('swapClockStatus toggle exists, defaults false, and is shown for compactCal on all platforms', () => {
+test('swapClockStatus toggle exists, defaults ON, and is shown for compactCal on all platforms', () => {
   const it = byKey('swapClockStatus');
   assert.ok(it, 'swapClockStatus item exists');
   assert.equal(it.type, 'toggle');
-  assert.equal(it.defaultValue, false);
+  // A fresh install gets the swapped Compact layout: the status row reads better beside
+  // the forecast than above the clock. Existing installs already store an explicit value,
+  // so this only ever moves a NEW install (deliberately no migration).
+  assert.equal(it.defaultValue, true);
   assert.match(it.hint, /status row below the clock/);
   assert.deepEqual(it.showWhen, { key: 'layoutPreset', eq: 'compactCal' });
   // aplite supports the forecast-only swap too (its lean twin carries a single lower band), so
@@ -533,18 +741,41 @@ test('swapClockStatus toggle exists, defaults false, and is shown for compactCal
   assert.equal(showWhen.isVisible(it, basaltOtherPreset), false, 'hidden for other presets');
 });
 
-test('Layout tab is one section: combined preview above the preset radio, reset segmented then swap toggle below', () => {
+test('Layout tab leads with the arrangement section: combined preview above the preset radio, then the font toggle, swap toggle and reset segmented below', () => {
   const layout = schema.tabs.find((t) => t.id === 'layout');
-  assert.equal(layout.sections.length, 1, 'single Layout section');
+  // Time and Calendar (moved from the Watch tab) follow the arrangement section.
+  assert.equal(layout.sections.length, 3, 'arrangement + Time + Calendar');
   const items = layout.sections[0].items;
   const presetIdx = items.findIndex((i) => i.messageKey === 'layoutPreset');
+  const fontIdx = items.findIndex((i) => i.messageKey === 'largeGraphFont');
   const resetIdx = items.findIndex((i) => i.messageKey === 'viewResetMin');
   const swapIdx = items.findIndex((i) => i.messageKey === 'swapClockStatus');
   assert.ok(presetIdx >= 0, 'layoutPreset present');
   assert.equal(items[presetIdx].blockBefore, 'layoutPreviewCombined', 'combined preview hosted on the preset radio');
   assert.equal(items[presetIdx].blockBeforeSticky, true, 'preview sticky');
-  assert.equal(resetIdx, presetIdx + 1, 'viewResetMin sits directly below the preset radio');
-  assert.equal(swapIdx, resetIdx + 1, 'swapClockStatus sits directly below viewResetMin');
+  assert.equal(fontIdx, presetIdx + 1, 'largeGraphFont sits directly below the preset radio');
+  assert.equal(swapIdx, fontIdx + 1, 'swapClockStatus sits directly below largeGraphFont');
+  assert.equal(resetIdx, swapIdx + 1, 'viewResetMin sits directly below swapClockStatus');
+  assert.equal(resetIdx, items.length - 1, 'and closes the section');
+});
+
+test('largeGraphFont is offered on emery only, and hidden when watchInfo is unavailable', () => {
+  const it = byKey('largeGraphFont');
+  assert.equal(it.type, 'toggle');
+  // ON out of the box: the taller tier is the more readable one on emery's 200 px
+  // screen, so it is the shipped default rather than something to go and find.
+  assert.equal(it.defaultValue, true);
+  assert.equal(it.label, 'Larger graph fonts');
+  assert.deepEqual(it.showWhen, { env: 'platform', eq: 'emery' });
+  const emery = { env: platform.computeEnv({ platform: 'emery' }) };
+  const basalt = { env: platform.computeEnv({ platform: 'basalt' }) };
+  const aplite = { env: platform.computeEnv({ platform: 'aplite' }) };
+  // computeEnv(null).platform is '' - an emery-only cosmetic toggle fails closed.
+  const unknown = { env: platform.computeEnv(null) };
+  assert.equal(showWhen.isVisible(it, emery), true, 'shown on emery');
+  assert.equal(showWhen.isVisible(it, basalt), false, 'hidden on basalt (no room; its left axis is already calendar-sized)');
+  assert.equal(showWhen.isVisible(it, aplite), false, 'hidden on aplite');
+  assert.equal(showWhen.isVisible(it, unknown), false, 'hidden without watchInfo');
 });
 
 test('flick/positioning narrative lives only in the Layout tab, not Health/Radar copy', () => {
@@ -580,12 +811,40 @@ test('radarMode is a four-step radio with per-mode hint copy', () => {
     ['Status bar', 'status'],
     ['Status + Graph', 'graph']
   ]);
+  // Each mode's hint is SELF-CONTAINED — it states everything that mode shows,
+  // rather than "also adds" deltas relative to the option above (user request).
   assert.deepEqual(item.hintByValue, {
     off: 'Radar is hidden.',
-    countdown: 'Shows a “Rain in X′” countdown in the Watch Status Bar, without adding a separate Radar view.',
-    status: 'Adds the Radar Status Bar while retaining the forecast graph.',
-    graph: 'Also adds the full radar graph.'
+    countdown: 'Shows a “Rain in X′” countdown in the Watch Status Bar.',
+    status: 'Adds the Radar Status Bar.',
+    graph: 'Adds the Radar Status Bar and the full radar rain graph.'
   });
+});
+
+// Mode hints talk about the STATUS BAR and the GRAPH, never about views (where a status
+// bar lands depends on the layout preset — flick view on most, folded into compactDense's
+// default — so naming a view or a position would lie somewhere; user request). The
+// status modes say the bar is added without saying where.
+test('mode hints mention bar/graph only — no view claims, no positions', () => {
+  const radar = byKey('radarMode').hintByValue;
+  const health = byKey('healthMode').hintByValue;
+  [radar, health].forEach((hints) => Object.keys(hints).forEach((k) => {
+    assert.ok(!/\bview\b/i.test(hints[k]), k + ' hint must not mention a view');
+  }));
+  assert.ok(!/above the/i.test(radar.status) && !/above the/i.test(health.status),
+    'status hints say the bar is added, not where');
+  assert.equal(radar.status, 'Adds the Radar Status Bar.');
+  assert.match(health.status, /^Adds the Health Status Bar/);
+  assert.equal(radar.graph, 'Adds the Radar Status Bar and the full radar rain graph.');
+  assert.match(health.all, /^Adds the Health Status Bar and a health graph/);
+});
+
+test('compactDense hint holds for every pairing (health OR radar), not just health', () => {
+  const hint = byKey('layoutPreset').hintByValue.compactDense;
+  // With health off/slot the dense pair is Radar + Forecast — the hint must not
+  // promise the Health bar specifically.
+  assert.ok(!/health and forecast/i.test(hint), 'must not hard-code the health pairing');
+  assert.match(hint, /two status bars/i);
 });
 
 test('radar provider hides when off; preview and color require the graph mode', () => {
@@ -690,9 +949,9 @@ test('theme is a two-slot select dropdown (color env: 4 options; B&W env: 2), li
   const colorItem = themeItems.find((i) => JSON.stringify(i.showWhen).indexOf('"color"') >= 0 || JSON.stringify(i.showWhen) === '{"env":"color"}');
   const bwItem = themeItems.find((i) => i !== colorItem);
   assert.deepEqual(colorItem.options.map((o) => o[1]), ['dark', 'light', 'bw', 'bw-light']);
-  assert.deepEqual(colorItem.options.map((o) => o[0]), ['Dark', 'Light (Alpha)', 'B&W', 'B&W Inverted']);
+  assert.deepEqual(colorItem.options.map((o) => o[0]), ['Dark', 'Light', 'B&W', 'B&W Inverted']);
   assert.deepEqual(bwItem.options.map((o) => o[1]), ['dark', 'light']);
-  assert.deepEqual(bwItem.options.map((o) => o[0]), ['Dark', 'Light (Alpha)']);
+  assert.deepEqual(bwItem.options.map((o) => o[0]), ['Dark', 'Light']);
   assert.ok(colorItem.hintByValue['bw-light'], 'color-env theme item has a bw-light hint');
   themeItems.forEach((i) => {
     assert.equal(i.type, 'select', 'theme is a dropdown, not segmented');
@@ -874,17 +1133,45 @@ test('AQI provider is a dropdown whose explanation switches per selected value',
   assert.ok(src.hintByValue.openmeteo.length > 0, 'Open-Meteo has its own hint');
 });
 
-test('Watch tab opens with a general status-bar intro, then the four bars in forecast/radar/health/top order', () => {
+test('Status-slots tab (id watch) opens with a general status-bar intro, then the four bars in forecast/radar/health/top order', () => {
   const watch = schema.tabs.find((t) => t.id === 'watch');
+  // The label was renamed with the Time/Calendar move; the id stays 'watch' —
+  // deep links and this very lookup key on it.
+  assert.equal(watch.label, 'Status slots', 'tab label renamed, id kept');
   const intro = watch.sections[0];
-  assert.equal(intro.title, undefined, 'first Watch section is a titleless intro');
+  assert.equal(intro.title, undefined, 'first Status-slots section is a titleless intro');
   assert.ok(/status bar/i.test(intro.intro), 'general intro describes status bars once');
   const titles = watch.sections.map((s) => s.title).filter(Boolean);
   assert.deepEqual(titles.slice(0, 4),
     ['Forecast Status Bar', 'Radar Status Bar', 'Health Status Bar', 'Watch Status Bar'],
     'four status bars grouped at the top of the Watch tab in order');
-  // Time and Calendar keep their spots below the bars.
-  assert.deepEqual(titles.slice(4), ['Time', 'Calendar'], 'Time then Calendar follow the bars');
+  // The per-slot edit sheets (sheetOnly, opened from a slot's Edit button — never
+  // cards) sit between the bars and Time in the sections array (see
+  // thresholdSection). Each is titled after the SLOT: it configures the slot's
+  // bold mode as well as its thresholds/goals, so the goal-vs-threshold split
+  // lives on the group header inside, not in the sheet title.
+  assert.deepEqual(titles.slice(4, 12),
+    ['Air quality (AQI) slot', 'Pollen slot', 'Wind speed slot',
+      'Wind gusts slot', 'UV index slot', 'Steps slot', 'Sleep slot',
+      'Walked distance slot'],
+    'per-slot edit sheets follow the four status bars, in kind order');
+  // The bold-only slot sheets (level-less kinds, one Bold row each) follow, in
+  // the contract's wire-id order (KINDS 8..19). 'Phone battery slot' is last and
+  // serves BOTH phone-battery kinds (18 and 19) — they share key 'PhoneBattery',
+  // so there are eleven sheets for twelve bold-only kinds.
+  assert.deepEqual(titles.slice(12, 23),
+    ['Temperature slot', 'Air pressure (hPa) slot', 'Sunrise/sunset slot',
+      'Date slot', 'Calendar week slot', 'City slot', 'Date countdown slot',
+      'Heart rate slot', 'Battery percentage slot', 'Dew point slot',
+      'Phone battery slot'],
+    'bold-only slot sheets follow the threshold sheets, in wire-id order');
+  // Time and Calendar moved to the END of the Layout tab (order Time, Calendar) —
+  // the Status-slots tab holds nothing but slot config now.
+  assert.deepEqual(titles.slice(23), [], 'no sections after the bold-only sheets');
+  const layoutTitles = schema.tabs.find((t) => t.id === 'layout')
+    .sections.map((s) => s.title).filter(Boolean);
+  assert.deepEqual(layoutTitles.slice(-2), ['Time', 'Calendar'],
+    'the Layout tab ends with Time then Calendar');
   assert.equal(byKey('statusTopLeft').hint, undefined, 'left-slot hint removed');
   const wsb = watch.sections.find((s) => s.title === 'Watch Status Bar').items;
   const note = wsb.find((i) => i.type === 'staticText' && /incoming-rain alert/.test(i.text || ''));
@@ -894,6 +1181,407 @@ test('Watch tab opens with a general status-bar intro, then the four bars in for
   const battIdx = wsb.findIndex((i) => i.messageKey === 'batteryLowOnly');
   assert.equal(countdownIdx, rightIdx + 1, 'top-right countdown date follows its slot');
   assert.equal(battIdx, countdownIdx + 1, 'battery toggle follows the slot date directly');
+});
+
+test('the Watch intro carries the reset-status-bars button, ungated', () => {
+  const watch = schema.tabs.find((t) => t.id === 'watch');
+  const intro = watch.sections[0];
+  assert.ok(intro.intro.indexOf('data-action="resetStatusSlots"') !== -1,
+    'the intro embeds the [data-action] button (blocks.js resetStatusSlots)');
+  assert.ok(intro.intro.indexOf('class="txt-act-btn"') !== -1,
+    'the button reuses the shared text-action chip style');
+  assert.ok(intro.intro.indexOf('Reset status bars to defaults') !== -1,
+    'the label covers slots + Bold and stays truthful on aplite');
+  // The button resets slots too, which every platform has — so unlike the Bold
+  // machinery it must NOT be thresholds-gated (the intro section stays ungated).
+  assert.equal(intro.showWhen, undefined, 'the intro section carries no platform gate');
+});
+
+test('every threshold sheet is sheetOnly and gated off on aplite (which compiles the highlight out)', () => {
+  // aplite paints its status rows from the lean status_row_aplite.c twin and has no
+  // WW_THRESHOLD_HIGHLIGHT, so a threshold sheet there would silently do nothing. The
+  // gate is section-level, and it composes with — not replaces — the per-item health
+  // gate and the color pickers' COLOR-capability + non-B&W-theme rules.
+  const watch = schema.tabs.find((t) => t.id === 'watch');
+  const threshSections = watch.sections.filter((s) => s.sheetOnly);
+  assert.equal(threshSections.length, 19,
+    'one edit sheet per boldable slot kind (8 threshold + 11 bold-only)');
+  assert.deepEqual(threshSections.map((s) => s.sheetId),
+    ['threshAqi', 'threshPollen', 'threshWind', 'threshGust', 'threshUv',
+      'threshSteps', 'threshSleep', 'threshDistance',
+      'threshTemp', 'threshPressure', 'threshSun', 'threshDate', 'threshWeek',
+      'threshCity', 'threshCountdown', 'threshHr', 'threshBatteryPct',
+      'threshDew', 'threshPhoneBattery'],
+    'sheet ids follow the thresh<Stem> convention the slot resolver derives');
+  threshSections.forEach((sec, i) =>
+    assert.deepEqual(sec.showWhen, { env: 'thresholds' },
+      'threshold sheet ' + i + ' (' + sec.title + ') carries the platform gate'));
+
+  const aplite = { env: platform.computeEnv({ platform: 'aplite' }) };
+  const basalt = { env: platform.computeEnv({ platform: 'basalt' }) };
+  const diorite = { env: platform.computeEnv({ platform: 'diorite' }) };
+  threshSections.forEach((sec) => {
+    assert.equal(showWhen.isVisible(sec, aplite), false,
+      (sec.title || 'intro') + ' hidden on aplite');
+    assert.equal(showWhen.isVisible(sec, basalt), true,
+      (sec.title || 'intro') + ' still shown on basalt');
+    assert.equal(showWhen.isVisible(sec, diorite), true,
+      (sec.title || 'intro') + ' still shown on diorite (B&W but capable)');
+  });
+
+  // Composition check: the health kinds' slider keeps the health gate (showWhen);
+  // the off-state is a DISABLE (disabledWhen), not a hide — and the color pickers
+  // keep COLOR + non-B&W-theme, unchanged.
+  assert.deepEqual(byKey('threshStepsWarn').showWhen,
+    { all: [{ env: 'health' }, { key: 'healthMode', ne: 'off' }] },
+    'health kinds keep the health/healthMode item gate');
+  assert.equal(byKey('threshAqiWarn').showWhen, undefined,
+    'weather kinds carry no item gate — the section gate is what hides them on aplite');
+  assert.deepEqual(byKey('threshAqiWarn').disabledWhen, { not: { key: 'threshAqiOn' } },
+    'the off-state mutes the slider instead of hiding it');
+  THRESH_COLOR_KEYS.forEach((k) => {
+    assert.deepEqual(byKey(k).capabilities, ['COLOR'], k + ' keeps the COLOR capability');
+    assert.equal(showWhen.isVisible(byKey(k), { env: platform.computeEnv({ platform: 'basalt' }), theme: 'bw', healthMode: 'status' }), false,
+      k + ' still hidden by a B&W theme');
+  });
+});
+
+// The phone-battery slot's Bold sheet. Unlike every other bold-only sheet this ONE
+// section serves TWO catalog items and TWO wire kinds: 'phoneBattery' (icon + NN%,
+// kind 18) and 'phoneBatteryPlain' (NN%, no icon, kind 19). The no-icon variant needs
+// its own wire kind so it can't fall through to City's bold row (the pressure-slot bug,
+// d22581f/0a05a7a), but both KINDS entries carry key 'PhoneBattery', so the resolver
+// lands both pencils on this one sheet and the packer writes the one mode into both
+// cells. If someone ever splits them into two keys, this test is what says the sheet
+// list has to grow with them.
+test('the Phone battery sheet exists once and BOTH phone-battery slot codes resolve to it', () => {
+  const watch = schema.tabs.find((t) => t.id === 'watch');
+  const sheets = watch.sections.filter((s) => s.sheetId === 'threshPhoneBattery');
+  assert.equal(sheets.length, 1, 'exactly one Phone battery sheet, shared by both kinds');
+  const sheet = sheets[0];
+  assert.equal(sheet.title, 'Phone battery slot');
+  assert.equal(sheet.sheetOnly, true, 'opened from a slot pencil, never rendered as a card');
+  assert.deepEqual(sheet.showWhen, { env: 'thresholds' },
+    'aplite compiles the highlight machinery out, so the sheet must not exist there');
+  // Bold is its whole sheet: no thresholds, no levels, no extra rows.
+  assert.deepEqual(sheet.items.map((i) => i.messageKey), ['threshPhoneBatteryBoldMode'],
+    'one Bold row and nothing else — the slot has no levels to threshold');
+  const bold = sheet.items[0];
+  assert.equal(bold.type, 'segmented');
+  assert.equal(bold.defaultValue, 'off');
+  assert.deepEqual(bold.options, [['Off', 'off'], ['Always', 'always']]);
+
+  // ...and the pencil actually gets here. The slot resolver walks the threshold
+  // contract's KINDS and returns 'thresh' + key, so this is the end-to-end proof that
+  // the shared key really does collapse two codes onto one sheet.
+  const resolve = PConf.sheetResolvers.get('statusSlotEditSheet');
+  assert.ok(resolve, 'blocks.js registered statusSlotEditSheet');
+  ['phoneBattery', 'phoneBatteryPlain'].forEach((code) => {
+    assert.equal(
+      resolve({ statusForecastLeft: code }, { thresholds: true }, { messageKey: 'statusForecastLeft' }),
+      'threshPhoneBattery', code + ' opens the shared Phone battery sheet');
+  });
+  // The gate is the same env flag the section carries — no pencil on aplite.
+  assert.equal(
+    resolve({ statusForecastLeft: 'phoneBattery' },
+      platform.computeEnv({ platform: 'aplite' }), { messageKey: 'statusForecastLeft' }),
+    null, 'no edit pencil on aplite, which has no threshold machinery');
+});
+
+test('threshold config lives in per-slot edit sheets: pencils + sheet on basalt, nothing on aplite', () => {
+  // End-to-end through the real renderer: no platform renders threshold CARDS any more —
+  // capable platforms get a pencil next to slots holding a threshold value, which opens
+  // the sheetOnly section in the shared dialog; aplite gets neither pencil nor sheet.
+  const eng = require('../src/pkjs/config-ui/lib/engine.js');
+  function watchCx(platformName, openEdit) {
+    // statusForecastRight defaults to 'aqi' (a threshold kind) on every platform.
+    const S = Object.assign(eng.hydrate(schema, {}), { healthMode: 'status' });
+    const ENV = platform.computeEnv({ platform: platformName });
+    return {
+      S: S, ENV: ENV, USERDATA: {}, openColor: null, openSelect: null,
+      openEdit: openEdit || null, selectQuery: '', collapsed: {},
+      evalCtx: Object.assign({}, S, { env: ENV }),
+    };
+  }
+  function watchBody(platformName) {
+    return eng.renderBody(schema, 'watch', watchCx(platformName));
+  }
+  const apliteBody = watchBody('aplite');
+  const basaltBody = watchBody('basalt');
+  // No threshold cards or controls in ANY tab body.
+  [apliteBody, basaltBody].forEach((body, i) => {
+    const who = i === 0 ? 'aplite' : 'basalt';
+    THRESH_KEYS.forEach((k) => assert.equal(body.indexOf('data-k="' + k + '"'), -1,
+      k + ' has no in-body control on ' + who + ' (sheet-only now)'));
+    assert.equal(body.indexOf('crossing the warn threshold'), -1,
+      who + ' body has no threshold intro (it moved into the sheets)');
+  });
+  // The pencil: basalt's default AQI forecast slot offers its sheet; aplite offers none.
+  assert.ok(basaltBody.indexOf('data-edit-sheet="threshAqi"') !== -1,
+    'basalt renders a pencil for the AQI forecast slot');
+  assert.equal(apliteBody.indexOf('data-edit-sheet'), -1,
+    'aplite renders no pencil anywhere (env.thresholds is false)');
+  // The sheet itself: full on basalt (Bold row + group header toggle + intro + a
+  // DISABLED slider preview while the toggle is off — behavior covered in
+  // config-thresholds.test.js), empty on aplite even if forced open.
+  const basaltSheet = eng.renderEditModal(schema, watchCx('basalt', 'threshAqi'));
+  ['data-k="threshAqiOn"', 'data-k="threshAqiBoldMode"', 'crossing the warn threshold',
+    'Air quality (AQI) slot', 'data-range="threshAqiWarn"'].forEach((frag) =>
+    assert.ok(basaltSheet.indexOf(frag) !== -1, 'basalt sheet carries ' + frag));
+  assert.ok(/class="row stack[^"]*\bdis\b/.test(basaltSheet),
+    'the slider renders disabled while the highlight toggle is off');
+  assert.equal(eng.renderEditModal(schema, watchCx('aplite', 'threshAqi')), '',
+    'aplite renders an empty sheet even when forced open');
+  // The rest of the Status-slots tab is untouched on aplite. (Time/Calendar live
+  // in the Layout tab now, so probe an always-shown Watch-Status-Bar toggle.)
+  assert.ok(apliteBody.indexOf('data-k="showQt"') !== -1,
+    'aplite keeps the Watch Status Bar toggles');
+});
+
+// The wind-direction arrow is a per-kind display option of the wind/gust slots (the
+// phone bakes a trailing sentinel byte into the slot text), so it belongs on those two
+// slots' own edit sheets — the same place Temp's display-mode row lives.
+test('the wind and gust sheets carry the direction toggle', () => {
+  const sheets = schema.tabs.find((t) => t.id === 'watch').sections.filter((s) => s.sheetOnly);
+  ['threshWind', 'threshGust'].forEach((id) => {
+    const sheet = sheets.find((s) => s.sheetId === id);
+    assert.ok(sheet, 'no sheet ' + id);
+    const key = id === 'threshWind' ? 'windSlotDirection' : 'gustSlotDirection';
+    const item = sheet.items.find((i) => i.messageKey === key);
+    assert.ok(item, id + ' is missing ' + key);
+    assert.equal(item.type, 'toggle');
+    // Wind ships ON, gusts OFF — the pair sits side by side in the Radar row's
+    // defaults and shares one bearing, so arrowing both would draw it twice.
+    assert.equal(item.defaultValue, id === 'threshWind',
+      key + (id === 'threshWind' ? ' must ship on' : ' must ship off'));
+    assert.equal(item.label, 'Show wind direction');
+    // The description is the engine's `hint` (item.description renders nowhere), and it
+    // must name the direction: the arrow flies downwind, not along the reported bearing.
+    assert.match(String(item.hint), /arrow/i, key + ' explains what it draws');
+    assert.match(String(item.hint), /blowing/i, key + ' says which way the arrow points');
+    // Bold still leads the sheet, and the extra row sits above the Thresholds group:
+    // it configures the slot, not the highlight.
+    assert.match(String(sheet.items[0].messageKey), /BoldMode$/, id + ' must open with Bold');
+    const hdr = sheet.items.findIndex((i) => i.type === 'subheader');
+    assert.ok(sheet.items.indexOf(item) < hdr,
+      key + ' must sit above the Thresholds group header');
+  });
+});
+
+test('no other slot sheet carries a direction toggle', () => {
+  schema.tabs.find((t) => t.id === 'watch').sections
+    .filter((s) => s.sheetOnly && s.sheetId !== 'threshWind' && s.sheetId !== 'threshGust')
+    .forEach((s) => assert.ok(!s.items.some((i) => /SlotDirection$/.test(i.messageKey || '')),
+      s.sheetId + ' must not offer a wind-direction toggle'));
+});
+
+// "Show unit": whether the slot prints its unit after the number. Only the six kinds
+// whose text the PHONE bakes can offer it — the watch-formatted kinds (distance, heart
+// rate, sleep, battery %) would need the flag on the wire. Each row lives on its kind's
+// own edit sheet, beside the other per-kind display rows.
+// `on`/`off` are the two renderings the hint has to name; `def` is the shipped state.
+// `on`/`off` null = the kind's unit follows the Units tab (wind, gusts), so its hint
+// deliberately names no example: quoting kph there reads as though the toggle also
+// PICKS the unit, and the engine's value-dependent hint keys off the item's own value.
+const UNIT_ROWS = [
+  { sheetId: 'threshWind', key: 'windSlotUnit', on: null, off: null, def: true },
+  { sheetId: 'threshGust', key: 'gustSlotUnit', on: null, off: null, def: true },
+  { sheetId: 'threshPressure', key: 'pressureSlotUnit', on: '1013hPa', off: '1013', def: true },
+  { sheetId: 'threshCountdown', key: 'countdownSlotUnit', on: '5d', off: '5', def: true },
+  { sheetId: 'threshTemp', key: 'tempSlotUnit', on: '12°', off: '12', def: false },
+  { sheetId: 'threshDew', key: 'dewSlotUnit', on: '12°', off: '12', def: false }
+];
+const sheetById = (id) => schema.tabs.find((t) => t.id === 'watch').sections
+  .filter((s) => s.sheetOnly).find((s) => s.sheetId === id);
+
+test('the Date sheet carries the two format pickers, wire-lockstep and Bold-led', () => {
+  const CODES = require('../src/pkjs/date-format.js');
+  const sheet = sheetById('threshDate');
+  assert.ok(sheet, 'no threshDate sheet');
+  assert.match(String(sheet.items[0].messageKey), /BoldMode$/, 'Bold still leads the sheet');
+  const month = sheet.items.find((i) => i.messageKey === 'dateSlotMonthFormat');
+  const full = sheet.items.find((i) => i.messageKey === 'dateSlotFullFormat');
+  assert.ok(month && full, 'both pickers present');
+  // Each picker says WHEN its string is on screen — the sheet's whole job is
+  // explaining that the calendar decides which format applies.
+  assert.equal(month.label, 'Date format with calendar');
+  assert.equal(month.hint, 'Used when a calendar is on screen.');
+  assert.equal(full.label, 'Date format without calendar');
+  assert.equal(full.hint, 'Used when no calendar is on screen.');
+  // The month list's values ARE the wire vocabulary (index = byte), lockstep with
+  // date-format.js and through it the C enum; the full list resolves through
+  // dateFullFormatOptions, pinned to the same rule in config-blocks.test.js.
+  assert.equal(month.type, 'radio');
+  assert.deepEqual(month.options.map((o) => o[1]), CODES.MONTH_FORMAT_CODES);
+  assert.equal(month.defaultValue, 'auto');
+  assert.equal(full.type, 'radio');
+  assert.equal(full.optionsFrom.resolver, 'dateFullFormatOptions');
+  assert.equal(full.defaultValue, 'auto');
+});
+
+test('the six phone-baked slot kinds each carry a Show unit toggle', () => {
+  UNIT_ROWS.forEach((row) => {
+    const sheet = sheetById(row.sheetId);
+    assert.ok(sheet, 'no sheet ' + row.sheetId);
+    const item = sheet.items.find((i) => i.messageKey === row.key);
+    assert.ok(item, row.sheetId + ' is missing ' + row.key);
+    assert.equal(item.type, 'toggle');
+    assert.equal(item.label, 'Show unit');
+    // The hint has to name the concrete effect for THIS kind — "shows the unit" alone
+    // leaves the reader guessing what the slot will look like afterwards.
+    if (row.on) {
+      assert.ok(String(item.hint).indexOf(row.on) !== -1,
+        row.key + ' hint must show the unit rendering (' + row.on + ')');
+      assert.ok(new RegExp('instead of ' + row.off + '\\.').test(String(item.hint)),
+        row.key + ' hint must show the bare rendering (' + row.off + ')');
+    } else {
+      assert.ok(!/kph|mph|\bkn\b/.test(String(item.hint)),
+        row.key + ' hint must not name a wind unit the Units tab controls');
+      assert.ok(String(item.hint).length > 20, row.key + ' still needs a real hint');
+    }
+    // Bold leads every slot sheet (see the sheet-shape tests above), so the extras
+    // cannot lead — and on the two threshold sheets the row configures the SLOT, not
+    // the highlight, so it stays above the Thresholds group header.
+    assert.match(String(sheet.items[0].messageKey), /BoldMode$/,
+      row.sheetId + ' must open with Bold');
+    const hdr = sheet.items.findIndex((i) => i.type === 'subheader');
+    if (hdr !== -1) {
+      assert.ok(sheet.items.indexOf(item) < hdr,
+        row.key + ' must sit above the Thresholds group header');
+    }
+  });
+  // Temp is the one sheet with two display rows: the unit toggle follows the
+  // Temp/Feels/Both picker rather than splitting it from Bold.
+  const temp = sheetById('threshTemp');
+  assert.ok(temp.items.findIndex((i) => i.messageKey === 'tempSlotUnit') >
+    temp.items.findIndex((i) => i.messageKey === 'tempSlotDisplay'),
+    'tempSlotUnit follows the temperature-selection row');
+});
+
+// The load-bearing part of this feature: an upgrade must not move a single pixel. The
+// four kinds that print a unit today ship ON, the two that never did ship OFF — so the
+// defaults are deliberately NOT uniform, and a blanket true/false would be a regression
+// for one half or the other.
+test('the Show unit defaults keep every existing watchface looking the same', () => {
+  UNIT_ROWS.forEach((row) => {
+    assert.strictEqual(byKey(row.key).defaultValue, row.def,
+      row.key + ' must ship ' + (row.def ? 'on (it prints a unit today)'
+        : 'off (that kind has never printed one)'));
+  });
+  assert.deepEqual(UNIT_ROWS.filter((r) => r.def).map((r) => r.key),
+    ['windSlotUnit', 'gustSlotUnit', 'pressureSlotUnit', 'countdownSlotUnit'],
+    'exactly the four kinds that already show a unit default on');
+  assert.deepEqual(UNIT_ROWS.filter((r) => !r.def).map((r) => r.key),
+    ['tempSlotUnit', 'dewSlotUnit'],
+    'the two degree kinds, which show no unit today, default off');
+});
+
+// The Watch tab's "Reset status bars to defaults" button covers the per-kind display
+// rows too (their sheets carry no reset of their own — the threshold group's button is
+// scoped to the thresholds). Because the six defaults are NOT uniform, a blanket
+// reset-to-false would strip kph, hPa and the countdown's d from a bar the user only
+// asked to put back to stock — so pin the reset against the schema, not against a
+// hand-copied list.
+test('resetStatusSlots restores each Show unit toggle to its schema default', () => {
+  const PConf = global.PConf;
+  const env = { thresholds: true, color: true, health: true };
+  // The engine hands actions its defaultAsStored resolver; the tests rebuild the
+  // same thing from the real schema, so the assertions stay end-to-end honest.
+  const defaultOf = (key) => PConf.engine.resolveDefaultFrom(byKey(key), env);
+  const S = {};
+  // Start from the opposite of every default, so a reset that skipped a key or wrote a
+  // blanket value would show up either way.
+  UNIT_ROWS.forEach((row) => { S[row.key] = !row.def; });
+  assert.equal(PConf.actions.resetStatusSlots(null, S, env, defaultOf), true,
+    'the action returns true so the engine re-renders');
+  UNIT_ROWS.forEach((row) => {
+    assert.strictEqual(S[row.key], byKey(row.key).defaultValue,
+      row.key + ' must come back as the schema ships it');
+  });
+});
+
+// dateSlotFullFormat is the one reset key whose fresh-install value is COUNTRY-
+// derived (the wizard writes mapCountry's pick), so the reset must land a US
+// install back on 'slash' — the schema default 'auto' would hand it the dotted
+// '09.07.26' no fresh US install ever shows. The month format has no country
+// dependence and resets to the schema's 'auto' like every other key.
+test('resetStatusSlots restores the date formats country-aware, like the wizard', () => {
+  const PConf = global.PConf;
+  const env = { thresholds: true, color: true, health: true };
+  const defaultOf = (key) => PConf.engine.resolveDefaultFrom(byKey(key), env);
+  const us = { holidayCountry: 'US', dateSlotFullFormat: 'iso', dateSlotMonthFormat: 'name' };
+  PConf.actions.resetStatusSlots(null, us, env, defaultOf);
+  assert.equal(us.dateSlotFullFormat, 'slash', 'US resets to the wizard-derived 9/7/26');
+  assert.equal(us.dateSlotMonthFormat, 'auto', 'the month format resets to the schema default');
+  const de = { holidayCountry: 'DE', dateSlotFullFormat: 'iso' };
+  PConf.actions.resetStatusSlots(null, de, env, defaultOf);
+  assert.equal(de.dateSlotFullFormat, 'auto', 'everyone else resets to Auto');
+});
+
+// Same drift guard for the two direction arrows: their defaults are NOT uniform
+// either (wind ships on, gust ships off), and the reset once hardcoded false for
+// both — written when false WAS wind's default, then left behind when the schema
+// flipped it, so "back to stock" silently disabled a shipped-on arrow.
+test('resetStatusSlots restores each direction arrow to its schema default', () => {
+  const PConf = global.PConf;
+  const env = { thresholds: true, color: true, health: true };
+  const defaultOf = (key) => PConf.engine.resolveDefaultFrom(byKey(key), env);
+  const S = { windSlotDirection: !byKey('windSlotDirection').defaultValue,
+    gustSlotDirection: !byKey('gustSlotDirection').defaultValue };
+  PConf.actions.resetStatusSlots(null, S, env, defaultOf);
+  ['windSlotDirection', 'gustSlotDirection'].forEach((key) => {
+    assert.strictEqual(S[key], byKey(key).defaultValue,
+      key + ' must come back as the schema ships it');
+  });
+});
+
+// Temperature and dew point get the DEGREE SIGN ALONE. '°C'/'°F' would restate the
+// global temperature-unit setting in every slot — and on a 3-slot status bar that is
+// two wasted characters saying something the user already chose once.
+test('the degree kinds offer the bare degree sign, not °C or °F', () => {
+  ['tempSlotUnit', 'dewSlotUnit'].forEach((key) => {
+    const hint = String(byKey(key).hint);
+    assert.ok(hint.indexOf('°') !== -1, key + ' names the degree sign');
+    assert.equal(hint.indexOf('°C'), -1, key + ' must not promise °C (the units row owns that)');
+    assert.equal(hint.indexOf('°F'), -1, key + ' must not promise °F (the units row owns that)');
+  });
+});
+
+test('no other slot sheet carries a Show unit toggle', () => {
+  const owners = UNIT_ROWS.map((r) => r.sheetId);
+  schema.tabs.find((t) => t.id === 'watch').sections
+    .filter((s) => s.sheetOnly && owners.indexOf(s.sheetId) === -1)
+    .forEach((s) => assert.ok(!s.items.some((i) => /SlotUnit$/.test(i.messageKey || '')),
+      s.sheetId + ' must not offer a unit toggle (the watch formats that kind)'));
+});
+
+// thresholdSection applies its sub-section gate in one pass so a row added later cannot
+// forget its gate line — but an extra row may bring its OWN showWhen, and the pass must
+// not clobber it (boldSection's idiom). Only the gated sheets (the health kinds) have a
+// gate to apply, and none of them carries an extra row today, so the guarantee is not
+// observable from the built schema: guard the idiom at the source instead.
+test('thresholdSection gates its extra rows without clobbering their own showWhen', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(
+    path.join(__dirname, '..', 'src', 'pkjs', 'settings', 'schema.js'), 'utf8');
+  const body = src.slice(src.indexOf('function thresholdSection('),
+    src.indexOf('function boldSection('));
+  assert.ok(body.indexOf('gateAll(') !== -1,
+    'thresholdSection must gate through the shared gateAll pass');
+  const gateAllBody = src.slice(src.indexOf('function gateAll('),
+    src.indexOf('function sheetOf('));
+  assert.ok(gateAllBody.indexOf('item.showWhen = item.showWhen || gate') !== -1,
+    'gateAll must keep the non-clobbering idiom (a row\'s own showWhen wins)');
+  assert.equal(/item\.showWhen\s*=\s*gate\s*;/.test(gateAllBody), false,
+    'gateAll must not overwrite an item\'s own showWhen with the gate');
+  // The shipped gated sheet still ends up gated: every VISIBLE row carries the health
+  // gate (the two hidden companion rows are never drawn, so they never had one).
+  const health = schema.tabs.find((t) => t.id === 'watch').sections
+    .find((s) => s.sheetId === 'threshSteps');
+  health.items.filter((i) => i.type !== 'hidden').forEach((i) =>
+    assert.match(JSON.stringify(i.showWhen), /"env":"health"/,
+      (i.messageKey || i.type) + ' lost the health gate'));
 });
 
 test('the four status sections live in the Watch tab with named headers and no per-bar intros', () => {
@@ -926,4 +1614,280 @@ test('radar and health status-line slots hide unless the feature shows their bar
 
 test('the radar rain-horizon control is labelled "Rain countdown"', () => {
   assert.equal(byKey('rainCountdownHorizon').label, 'Rain countdown');
+});
+
+test('secondaryLine offers pressure and feels-like as the fifth and sixth metrics', () => {
+  assert.deepEqual(metricOptions({}, { platform: 'basalt' }), [
+    ['Precipitation %', 'precip_prob'], ['Wind speed', 'wind'], ['Wind gusts', 'gust'],
+    ['UV Index', 'uv'], ['Air pressure (hPa)', 'pressure'], ['Feels-like temperature', 'feels']
+  ]);
+});
+
+test('thirdLine offers the five metrics the main line is not using, for all six', () => {
+  for (const metric of ['feels', 'gust', 'precip_prob', 'pressure', 'uv', 'wind']) {
+    const opts = metricOptions({ secondaryLine: metric }, { platform: 'basalt' }, { third: true });
+    assert.equal(opts.length, 6, `${metric} should offer Off + 5 metrics`);
+    assert.equal(opts[0][1], 'off');
+    assert.ok(!opts.some(([, v]) => v === metric), `${metric} must not offer itself`);
+  }
+});
+
+test('pressureScale is a Narrow/Mid/Wide control storing low/mid/high', () => {
+  const scales = items.filter((i) => i.messageKey === 'pressureScale');
+  assert.equal(scales.length, 2, 'one copy per line-context (secondary + third)');
+  for (const s of scales) {
+    assert.deepEqual(s.options, [['Narrow', 'low'], ['Mid', 'mid'], ['Wide', 'high']]);
+    assert.equal(s.defaultValue, 'mid');
+    assert.equal(s.label, 'Pressure graph scale');
+    assert.ok(s.hintByValue.mid.includes('1005\u20131025 hPa'));
+  }
+});
+
+test('pressureScale shows for the main line, and for the second line only when the main line is not pressure', () => {
+  const scales = items.filter((i) => i.messageKey === 'pressureScale');
+  const sec = scales.find((s) => s.showWhen.key === 'secondaryLine');
+  assert.deepEqual(sec.showWhen, { key: 'secondaryLine', eq: 'pressure' });
+  const third = scales.find((s) => s.showWhen.all);
+  assert.deepEqual(third.showWhen, { all: [
+    { key: 'thirdLine', eq: 'pressure' },
+    { not: { key: 'secondaryLine', eq: 'pressure' } }
+  ]});
+});
+
+test('the pressure line hint names sea-level so an altitude reading makes sense', () => {
+  assert.ok(byKey('secondaryLine').hintByValue.pressure.includes('Sea-level'));
+});
+
+// A hardcoded copy of the curve numbers here is the third copy (forecast-series.js and
+// blocks.js.PRESSURE_CURVES are the other two, and blocks.js's is drift-tested already —
+// see 'preview bands match forecast-series' in test/config-blocks.test.js). Assert
+// against forecast-series.PRESSURE_SCALE_CURVE_HPA directly, not literal numbers, so a
+// future curve change can't silently leave this copy stale even if someone re-hardcodes it.
+test('pressureScale hint copy quotes the curve core (no drift)', () => {
+  const { PRESSURE_SCALE_CURVE_HPA } = require('../src/pkjs/forecast-series.js');
+  const scales = items.filter((i) => i.messageKey === 'pressureScale');
+  for (const s of scales) {
+    for (const scale of ['low', 'mid', 'high']) {
+      const pts = PRESSURE_SCALE_CURVE_HPA[scale];
+      assert.ok(s.hintByValue[scale].includes(pts[1][0] + '\u2013' + pts[2][0] + ' hPa'),
+        `${scale} hint should quote its core (${pts[1][0]}-${pts[2][0]} hPa)`);
+    }
+  }
+});
+
+test('the wind slot arrows by default, the gust slot beside it does not', () => {
+  // Both sit in the Radar row's defaults and share one bearing, so arrowing both
+  // would print the same arrow twice on one line. Fresh installs only: an existing
+  // watch stores an explicit value and is untouched.
+  assert.equal(byKey('windSlotDirection').defaultValue, true);
+  assert.equal(byKey('gustSlotDirection').defaultValue, false);
+});
+
+// The wind-scale hints are DERIVED from forecast-series' WIND_SCALE_KMH through
+// wire-units' display conversion; pin the rendered strings so a rounding change
+// in either dependency cannot silently rewrite user-facing copy.
+test('windScale hints derive from the graph ceilings, strings pinned', () => {
+  const winds = items.filter((i) => i.messageKey === 'windScale');
+  assert.equal(winds.length, 6, 'three units x two line-contexts');
+  const hintFor = (unit) => winds.find((i) =>
+    JSON.stringify(i.showWhen).indexOf('"' + unit + '"') >= 0).hintByValue;
+  assert.equal(hintFor('kph').low, 'Tops out at 30 kph — emphasizes light, gentle winds.');
+  assert.equal(hintFor('mph').low, 'Tops out at 19 mph — emphasizes light, gentle winds.');
+  assert.equal(hintFor('mph').mid, 'Tops out at 31 mph — general use; gusts visible, typical winds sit mid-graph.');
+  assert.equal(hintFor('mph').high, 'Tops out at 43 mph — keeps strong gusts from flattening against the top.');
+  assert.equal(hintFor('knots').low, 'Tops out at 16 kn — emphasizes light, gentle winds.');
+  assert.equal(hintFor('knots').mid, 'Tops out at 27 kn — general use; gusts visible, typical winds sit mid-graph.');
+  assert.equal(hintFor('knots').high, 'Tops out at 38 kn — keeps strong gusts from flattening against the top.');
+});
+
+// --- the Graph-colors card (Forecast tab) ------------------------------------
+// One card with one row per graph metric plus the night band; each row
+// opens its own sheet. Every colour is a CONCRETE per-polarity value defaulting to the
+// built-in line-style.js resolves today, so a picker opens with the colour the graph
+// already draws highlighted — no Auto sentinel, no curated palette.
+const forecastSections = () => schema.tabs.find((t) => t.id === 'forecast').sections;
+const graphCard = () => forecastSections().find((s) => s.id === 'graphColors');
+const graphSheets = () => forecastSections().filter((s) => s.sheetOnly);
+const gcSheetById = (id) => graphSheets().find((s) => s.sheetId === id);
+// The seven rows in card order: the six metrics as the metric pickers list them, then
+// the full-height night band.
+const GRAPH_ROW_SHEETS = ['gcPrecip', 'gcWind', 'gcGust', 'gcUv', 'gcPressure', 'gcFeels', 'gcNight'];
+const GRAPH_ROW_SCOPES = ['precip_prob', 'wind', 'gust', 'uv', 'pressure', 'feels', 'night'];
+// Everything a live gate could read, so only the polarity gate is left to vary — the
+// point being that no graph-colour row reads any of them.
+const graphState = (over) => Object.assign({
+  theme: 'dark', env: { color: true },
+  secondaryLine: 'wind', secondaryLineFill: true, thirdLine: 'uv', dayNightShading: true
+}, over || {});
+
+test('the Forecast tab carries ONE Graph colors card, always open, under an explicit id', () => {
+  const card = graphCard();
+  assert.ok(card, 'the card is on the Forecast tab');
+  // Plain section: the rows are visible without a tap. Nothing on this tab collapses.
+  assert.equal(card.collapsible, undefined, 'the Graph colors card is not expandable');
+  assert.equal(forecastSections().filter((s) => s.collapsible).length, 0,
+    'no collapsible section on the Forecast tab');
+  assert.equal(card.id, 'graphColors');
+  assert.equal(card.title, 'Graph colors');
+  // A groupCard section renders through renderSectionGroup, which emits no card header
+  // — this card's title would vanish silently.
+  assert.equal(card.groupCard, undefined);
+  assert.equal(card.sheetOnly, undefined, 'the card itself is a normal tab section');
+  assert.ok(card.intro, 'the card says what its rows are');
+  assert.deepEqual(card.capabilities, ['COLOR']);
+  assert.deepEqual(card.showWhen, { key: 'theme', nin: ['bw', 'bw-light'] });
+  // Both gates, evaluated: a B&W theme or a B&W watch hides the whole card, header
+  // included (buildSectionBody runs before renderSection's open test).
+  assert.equal(showWhen.isVisible(card, { theme: 'dark', env: { color: true } }), true);
+  assert.equal(showWhen.isVisible(card, { theme: 'bw', env: { color: true } }), false);
+  assert.equal(showWhen.isVisible(card, { theme: 'bw-light', env: { color: true } }), false);
+  assert.equal(showWhen.isVisible(card, { theme: 'dark', env: { color: false } }), false);
+});
+
+test('the card is seven sheet rows in metric-picker order, each identified by its badge args', () => {
+  const rows = graphCard().items;
+  assert.equal(rows.length, 7, 'six metrics plus the night band — nothing else in the card');
+  rows.forEach((row) => assert.equal(row.type, 'sheet'));
+  assert.deepEqual(rows.map((r) => r.sheetId), GRAPH_ROW_SHEETS);
+  // The six metric rows carry the metric picker's own labels, in its own order, so the
+  // two lists read as one vocabulary instead of drifting apart.
+  assert.deepEqual(rows.slice(0, 6).map((r) => [r.label, r.editBadgeFrom.args.scope]),
+    metricOptions({}, { platform: 'basalt' }, {}));
+  assert.equal(rows[6].label, 'Night shading');
+  rows.forEach((row, i) => {
+    assert.equal(row.messageKey, undefined, row.sheetId + ' stores nothing of its own');
+    // resolveEditBadge merges the item's messageKey UNDER editBadgeFrom.args, and a
+    // `sheet` row has none — so the row's identity can only ride those args.
+    assert.equal(row.editBadgeFrom.resolver, 'graphColorSwatch');
+    assert.deepEqual(row.editBadgeFrom.args, { scope: GRAPH_ROW_SCOPES[i] });
+    // No live gate: a metric's colours are configurable before it is selected.
+    assert.equal(row.showWhen, undefined, row.sheetId + ' inherits the card gate only');
+  });
+});
+
+test('each row has a sheetOnly section carrying BOTH gates and no sticky preview', () => {
+  assert.equal(graphSheets().length, 7, 'seven sheets on the tab, one per row');
+  GRAPH_ROW_SHEETS.forEach((id) => {
+    const sec = gcSheetById(id);
+    assert.ok(sec, 'missing sheet: ' + id);
+    assert.equal(sec.sheetOnly, true);
+    assert.equal(sec.collapsible, undefined, 'a sheet is a dialog body, not a card');
+    // capabilities alone does not gate a SECTION — buildSectionBody and renderEditModal
+    // test sec.showWhen first.
+    assert.deepEqual(sec.showWhen, { key: 'theme', nin: ['bw', 'bw-light'] });
+    assert.deepEqual(sec.capabilities, ['COLOR']);
+    // No forecast preview heads these sheets: being position:sticky it would occlude
+    // the open 64-swatch palette at every scroll offset on a narrow phone.
+    assert.equal(sec.block, undefined);
+  });
+});
+
+test('every graph colour is a Dark/Light pair on one label, one visible at a time', () => {
+  GRAPH_ROW_SHEETS.forEach((id, r) => {
+    const scope = GRAPH_ROW_SCOPES[r];
+    // The roles come from the renderer, so a sheet cannot offer a colour nothing paints
+    // (feels is Line-only) or miss one it does.
+    const roles = lineStyle.graphColorRoles(scope);
+    const rows = gcSheetById(id).items.filter((i) => i.type === 'color');
+    assert.equal(rows.length, roles.length * 2, id + ': one pair per role');
+    roles.forEach((role, i) => {
+      const dark = rows[i * 2];
+      const light = rows[i * 2 + 1];
+      assert.equal(dark.messageKey, lineStyle.graphColorKey(scope, role, 'Dark'));
+      assert.equal(light.messageKey, lineStyle.graphColorKey(scope, role, 'Light'));
+      assert.equal(dark.label, light.label, dark.messageKey + ' pair shares one label');
+      [dark, light].forEach((row) => {
+        assert.deepEqual(row.capabilities, ['COLOR']);
+      });
+      // The default is the built-in taken FROM the renderer, as an int (the
+      // colorUSFederal shape) — never a hex transcribed into the schema.
+      assert.equal(typeof dark.defaultValue, 'number');
+      assert.equal(dark.defaultValue, lineStyle.graphColorDefault(scope, role, 'Dark', null));
+      assert.equal(light.defaultValue, lineStyle.graphColorDefault(scope, role, 'Light', null));
+      // Mutually exclusive on polarity, and nothing else gates them: the row shows
+      // whether or not its metric is the one currently drawn.
+      const inert = { secondaryLine: 'precip_prob', thirdLine: 'off', secondaryLineFill: false, dayNightShading: false };
+      assert.equal(showWhen.isVisible(dark, graphState(inert)), true, dark.messageKey + ' shows on dark');
+      assert.equal(showWhen.isVisible(light, graphState(inert)), false, light.messageKey + ' hides on dark');
+      assert.equal(showWhen.isVisible(light, graphState(Object.assign({ theme: 'light' }, inert))), true);
+      assert.equal(showWhen.isVisible(dark, graphState(Object.assign({ theme: 'light' }, inert))), false);
+      ['bw', 'bw-light'].forEach((theme) => {
+        assert.equal(showWhen.isVisible(dark, graphState({ theme })), false, dark.messageKey + ' hides on ' + theme);
+        assert.equal(showWhen.isVisible(light, graphState({ theme })), false, light.messageKey + ' hides on ' + theme);
+      });
+      // A B&W watch never renders a colour: the COLOR capability hides both rows
+      // whatever the stored theme says.
+      assert.equal(showWhen.isVisible(dark, graphState({ env: { color: false } })), false);
+      assert.equal(showWhen.isVisible(light, graphState({ theme: 'light', env: { color: false } })), false);
+    });
+  });
+});
+
+// The graph-colour card is a PURE EDITOR: every picker writes its own key and nothing
+// else. It used to carry a hook copying a new fill colour into the metric's night-tint
+// key, which made "did the user pick this tint?" unanswerable afterwards; the tint now
+// follows the fill at RESOLVE time (line-style.js' graphNightTint) instead. The only
+// residue is a display one — the Night rows PAINT the cascaded colour so their swatch
+// is not stale, through the engine's displayFrom hook, while still storing under
+// themselves.
+test('no graph colour row writes a sibling key; exactly the Night rows paint a derived one', () => {
+  const gcKeys = lineStyle.graphColorKeys();
+  const gcItems = items.filter((i) => gcKeys.indexOf(i.messageKey) >= 0);
+  assert.equal(gcItems.length, gcKeys.length, 'one row per graph colour key');
+  assert.deepEqual(gcItems.filter((i) => i.onChange).map((i) => i.messageKey), [],
+    'a colour pick has no side effect on any other key');
+
+  const expected = [];
+  GRAPH_ROW_SCOPES.forEach((scope) => {
+    if (lineStyle.graphColorRoles(scope).indexOf('Night') === -1) { return; }
+    ['Dark', 'Light'].forEach((suffix) => {
+      expected.push(lineStyle.graphColorKey(scope, 'Night', suffix));
+    });
+  });
+  assert.equal(expected.length, 10, 'five filling metrics x two polarities');
+  const withDisplay = gcItems.filter((i) => i.displayFrom);
+  assert.deepEqual(withDisplay.map((i) => i.messageKey).slice().sort(), expected.slice().sort());
+  // Each row names its OWN scope and polarity, not the live theme: the pair's two rows
+  // are tuned independently and only one of them is ever visible.
+  withDisplay.forEach((row) => {
+    assert.equal(row.displayFrom.resolver, 'graphNightTint');
+    assert.equal(row.messageKey,
+      lineStyle.graphColorKey(row.displayFrom.args.scope, 'Night', row.displayFrom.args.suffix),
+      row.messageKey + ' resolves against itself');
+  });
+});
+
+test('feels gets a Line pair only; the night band gets Hatch + Dusk/dawn', () => {
+  // feels never fills (resolveGraphColors pins fillOn false for it), so a Fill or a
+  // night-tint picker would offer a colour nothing can paint.
+  assert.deepEqual(gcSheetById('gcFeels').items.filter((i) => i.type === 'color').map((i) => i.messageKey),
+    ['gcFeelsLineDark', 'gcFeelsLineLight']);
+  assert.deepEqual(gcSheetById('gcNight').items.filter((i) => i.type === 'color').map((i) => i.messageKey),
+    ['gcNightHatchDark', 'gcNightHatchLight', 'gcNightBoundaryDark', 'gcNightBoundaryLight']);
+});
+
+test('each sheet resets exactly its own keys, and the seven lists partition the key set', () => {
+  let all = [];
+  GRAPH_ROW_SHEETS.forEach((id) => {
+    const sec = gcSheetById(id);
+    const keys = sec.items.filter((i) => i.type === 'color').map((i) => i.messageKey);
+    // The reset rides the SHEET, not a row inside it — renderEditModal seats a
+    // section-level labelAction beside the title text. blocks.js takes the key list from
+    // HERE through data-action-arg, so it keeps no copy that could drift. BOTH polarities
+    // ride it: leaving the hidden one tuned would resurrect old picks on the next theme
+    // switch.
+    assert.deepEqual(sec.labelAction,
+      { action: 'resetGraphColors', arg: keys.join(','), label: 'Reset to default' });
+    // Pickers and nothing else — the sheet carries no chrome row of its own now that the
+    // reset lives in the header (a 'Colors' sub-header under a "<Metric> colors" title
+    // said the same word twice).
+    assert.equal(sec.items.length, keys.length, id + ' holds its pickers and nothing else');
+    assert.equal(sec.items.filter((i) => i.labelAction).length, 0,
+      'no row carries a reset of its own');
+    all = all.concat(keys);
+  });
+  // A partition of the renderer's key list: every key is resettable from exactly one
+  // sheet, and no key is stranded without a reset.
+  assert.equal(new Set(all).size, all.length, 'no key resets from two sheets');
+  assert.deepEqual(all.slice().sort(), GRAPH_COLOR_KEYS.slice().sort());
 });

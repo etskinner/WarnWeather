@@ -3,70 +3,109 @@
 var PConf = (typeof PConf !== 'undefined') ? PConf
   : (typeof global !== 'undefined') ? (global.PConf = global.PConf || {}) : {};
 (function () {
+  // esc + the shared sheet header live in lib/html.js (concatenated before
+  // this file, attaching PConf.html — the color.js bridge pattern; required
+  // under Node).
+  var htmlLib = (typeof require !== 'undefined') ? require('./html.js') : PConf.html;
+  var esc = htmlLib.esc;
+  var sheetHeader = htmlLib.sheetHeader;
+  // The date control (value helpers + renderers + wheel wiring) lives in
+  // lib/date-picker.js; the aliases keep this file's call sites and export
+  // surface unchanged.
+  var datePicker = (typeof require !== 'undefined') ? require('./date-picker.js') : PConf.datePicker;
+  // The range/threshold slider (numeric rules + renderers + drag wiring) lives
+  // in lib/range-control.js; same alias discipline as the date picker above.
+  var rangeControl = (typeof require !== 'undefined') ? require('./range-control.js') : PConf.rangeControl;
+  var snapToStep = rangeControl.snapToStep;
+  var formatRange = rangeControl.formatRange;
+  var parseRange = rangeControl.parseRange;
+  var moveThumb = rangeControl.moveThumb;
+  var thresholdValues = rangeControl.thresholdValues;
+  var paintThresholdRange = rangeControl.paintThresholdRange;
+  var renderRange = rangeControl.renderRange;
+  var formatDateValue = datePicker.formatDateValue;
+  var parseDateParts = datePicker.parseDateParts;
+  var dateValueFromParts = datePicker.dateValueFromParts;
+  var renderDateTrigger = datePicker.renderDateTrigger;
+  var renderDateModal = datePicker.renderDateModal;
   // Shared single-source helpers: PConf.color / PConf.schemaWalk are concatenated before this
   // file in the page, and required first by the Node tests. No local re-implementation.
   var intToHex = PConf.color.intToHex;
   var eachItem = PConf.schemaWalk.eachItem;
 
   /**
-   * HTML-escape author/user text interpolated into innerHTML. NOT applied to fields
-   * documented as HTML (intro, hint, staticText.text, versionLabel) — intentional markup.
-   *
-   * @param {*} s Value to escape (coerced to string).
-   * @returns {string} Escaped HTML-safe string.
+   * One register/get pair backed by a private map — the shape every extension
+   * registry below shares. Eight hand-copied closures used to spell it out.
+   * @returns {{register: Function, get: Function}} A fresh registry.
    */
-  function esc(s) {
-    return String(s)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  function makeRegistry() {
+    var map = {};
+    return {
+      register: function (id, fn) { map[id] = fn; },
+      get: function (id) { return map[id]; }
+    };
   }
 
-  // --- block registry ---
-  var blockMap = {};
-  PConf.blocks = {
-    register: function (id, fn) { blockMap[id] = fn; },
-    get: function (id) { return blockMap[id]; }
-  };
+  // --- block registry --- fn(S, env, userData) -> htmlString for a schema block.
+  PConf.blocks = makeRegistry();
 
   // --- options-resolver registry --- a select/searchSelect/radio item opts into a
   // multi-key derived option list by name (item.optionsFrom.resolver: id) without the
-  // engine knowing what the derivation logic is — mirrors the block registry above.
+  // engine knowing what the derivation logic is.
   // fn(S, env, args) returns [[label, value], ...]; see resolveOptionsFrom below.
-  var optionsResolverMap = {};
-  PConf.optionsResolvers = {
-    register: function (name, fn) { optionsResolverMap[name] = fn; },
-    get: function (name) { return optionsResolverMap[name]; }
-  };
+  PConf.optionsResolvers = makeRegistry();
 
   // --- defaults-resolver registry --- a select item opts into a platform-aware default
   // by name (item.defaultFrom.resolver: id), resolved at hydrate + snap time. Separate
   // from optionsResolvers because a defaults resolver returns a single value, not a list.
   // fn(env, args) -> defaultValue; see resolveDefaultFrom below.
-  var defaultsResolverMap = {};
-  PConf.defaultsResolvers = {
-    register: function (name, fn) { defaultsResolverMap[name] = fn; },
-    get: function (name) { return defaultsResolverMap[name]; }
-  };
+  PConf.defaultsResolvers = makeRegistry();
 
   // --- recommend-resolver registry --- a select item flags its "best for you" option by name
   // (item.recommendFrom: id); the resolver fn(S, env) returns the recommended option VALUE and the
   // matching row in the open sheet gets a "(Recommended)" marker. Derived, like defaults, but read at
   // render time (so it tracks another key, e.g. the country selector) and yields a value, not a list.
-  var recommendResolverMap = {};
-  PConf.recommendResolvers = {
-    register: function (name, fn) { recommendResolverMap[name] = fn; },
-    get: function (name) { return recommendResolverMap[name]; }
-  };
+  PConf.recommendResolvers = makeRegistry();
+
+  // --- sheet-resolver registry --- a row opts into a per-value edit sheet by name
+  // (item.editSheetFrom: {resolver, args}); the resolver fn(S, env, args) returns the
+  // sheetId of a sheetOnly section to open for the row's CURRENT value, or null for
+  // "this value has nothing to edit" (no pencil). Read at render time, like recommend.
+  // args always carries the row's messageKey (schema args merge over it), so a resolver
+  // shared by many rows needs no per-row args at all.
+  PConf.sheetResolvers = makeRegistry();
+
+  // --- range-resolver registry --- a range item opts into settings-derived geometry and
+  // zone styling by name (item.rangeFrom: {resolver, args}); the resolver fn(S, env, args)
+  // returns the effective config (min/max/step/minSpan, dir, zone colors, seeds — see
+  // thresholdRange in blocks.js), merged over the item at render AND drag time so unit
+  // switches, a stored scale-max override and live color edits all take effect immediately.
+  PConf.rangeResolvers = makeRegistry();
+
+  // --- badge-resolver registry --- a row with an edit-sheet trigger opts into a state badge
+  // (item.editBadgeFrom: {resolver, args}); fn(S, env, args) returns null (no badge) or
+  // {label?, ariaNote?, dots: [{color, ring?}]} — an app-neutral colour preview: `dots` is the
+  // swatch that LEADS the control (each dot outlined when `ring`, filled otherwise), `label`
+  // is the trigger button's text and `ariaNote` a parenthesised state word appended to its
+  // aria-label. The library prints what it is given and knows nothing of what the colours
+  // mean. Read at render time like the sheet resolver, and only consulted when a sheet
+  // actually resolved.
+  PConf.badgeResolvers = makeRegistry();
+
+  // --- display-resolver registry --- a keyed item opts into a DERIVED display value by
+  // name (item.displayFrom: {resolver, args}); fn(S, env, args) returns the value to
+  // PAINT while the stored value stays untouched, so a key that inherits its effective
+  // value from a sibling can still show what it actually renders as. Read at render time,
+  // like the badge resolver. Only `color` reads it today (the graph night tint, which
+  // cascades from the fill colour at resolve time). Writes are unaffected: a control still
+  // stores under its own messageKey, so picking the shown value pins it.
+  PConf.displayResolvers = makeRegistry();
 
   // --- onChange registry --- a schema item opts into a post-change side effect by
-  // name (item.onChange: id) without the engine knowing what that side effect is —
-  // mirrors the block registry above. fn(S, oldValue, newValue, env) runs synchronously,
-  // right after the click handler sets the new value and before the next render(). env is the platform env (INJECTED_ENV).
-  var onChangeMap = {};
-  PConf.onChange = {
-    register: function (id, fn) { onChangeMap[id] = fn; },
-    get: function (id) { return onChangeMap[id]; }
-  };
+  // name (item.onChange: id) without the engine knowing what that side effect is.
+  // fn(S, oldValue, newValue, env) runs synchronously, right after the click handler
+  // sets the new value and before the next render(). env is the platform env (INJECTED_ENV).
+  PConf.onChange = makeRegistry();
 
   // --- hook registry ---
   var loadFns = [], submitFns = [], readyFns = [];
@@ -160,20 +199,55 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
 
   // ---- control renderers: each takes (item, value[, openColor]) -> HTML string.
   // options are [label, value] pairs; read o[0]=label, o[1]=value.
-  function optionButtons(item, v, isRadio) {
+  // `off` (optional) lists option VALUES to render inert. Disabling rather than
+  // dropping an option keeps the stored value intact: an option removed from the
+  // list is snapped away by resolveOptionsFrom, which would silently rewrite a
+  // setting the user never touched.
+  function optionButtons(item, v, isRadio, off) {
     var h = '', i, o;
     for (i = 0; i < item.options.length; i++) {
       o = item.options[i];
       var inner = isRadio ? '<span>' + esc(o[0]) + '</span><span class="dot"></span>' : esc(o[0]);
-      h += '<button class="' + (v === o[1] ? 'on' : '') + '" data-k="' + item.messageKey + '" data-v="' + esc(o[1]) + '">' + inner + '</button>';
+      var isOff = Boolean(off) && off.indexOf(o[1]) !== -1;
+      h += '<button class="' + (v === o[1] ? 'on' : '') + '" data-k="' + item.messageKey
+        + '" data-v="' + esc(o[1]) + '"' + (isOff ? ' disabled' : '') + '>' + inner + '</button>';
     }
     return h;
   }
-  function renderToggle(item, v) {
-    return '<button class="sw' + (v ? ' on' : '') + '" data-k="' + item.messageKey + '" data-toggle="1"><i></i></button>';
+
+  /**
+   * Option values to render inert, from item.optionDisabledWhen: a map of option
+   * value -> showWhen-style condition. [] when the item declares none.
+   * @param {Object} item Schema item.
+   * @param {Object} evalCtx showWhen evaluation context.
+   * @returns {string[]} Disabled option values.
+   */
+  function disabledOptionValues(item, evalCtx) {
+    var map = item.optionDisabledWhen, out = [], k;
+    if (!map) { return out; }
+    for (k in map) {
+      if (Object.prototype.hasOwnProperty.call(map, k)
+        && PConf.showWhen.evaluate(map[k], evalCtx)) { out.push(k); }
+    }
+    return out;
   }
-  function renderSegmented(item, v) { return '<div class="seg">' + optionButtons(item, v, false) + '</div>'; }
-  function renderRadio(item, v) { return '<div class="radio">' + optionButtons(item, v, true) + '</div>'; }
+  /**
+   * The .sw switch control — the ONLY producer of the switch markup; row toggles
+   * and subheader-hosted toggles both render through here.
+   * @param {Object} item Toggle schema item.
+   * @param {*} v Current value (truthy renders the switch on).
+   * @param {string} [ariaLabel] Accessible name for a switch rendered away from
+   *   its text label (a subheader-hosted toggle); omitted for row toggles, whose
+   *   row label names them.
+   * @returns {string} Switch button HTML.
+   */
+  function renderToggle(item, v, ariaLabel) {
+    return '<button class="sw' + (v ? ' on' : '') + '" data-k="' + esc(item.messageKey)
+      + '" data-toggle="1"' + (ariaLabel ? ' aria-label="' + esc(ariaLabel) + '"' : '')
+      + '><i></i></button>';
+  }
+  function renderSegmented(item, v, off) { return '<div class="seg">' + optionButtons(item, v, false, off) + '</div>'; }
+  function renderRadio(item, v, off) { return '<div class="radio">' + optionButtons(item, v, true, off) + '</div>'; }
   // Format a minute count as a human label for interval-derived option lists.
   // 1440 is checked first because it is also a multiple of 60.
   function formatMinutesLabel(min) {
@@ -276,9 +350,17 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
         ? '<span class="ssel-opt-txt"><span class="ssel-opt-name">' + esc(o[0]) + rec + '</span>'
           + '<span class="ssel-opt-desc">' + esc(meta.desc) + '</span></span>'
         : '<span>' + esc(o[0]) + rec + '</span>';
+      // A non-header meta.disabled option (a provider-gated slot item, e.g.
+      // "Pollen (DWD)" under another provider) stays visible but inert: no
+      // data-select-pick, so the delegated pick handler can never match, plus
+      // the disabled attribute against taps/keyboard. Muted inline — .ssel-opt
+      // has no [disabled] rule of its own — mirroring .seg button[disabled].
       h += '<button type="button" class="' + classes + '" role="option" aria-selected="'
-        + (value === o[1] ? 'true' : 'false') + '" data-select-pick="' + esc(o[1])
-        + '" data-k="' + esc(item.messageKey) + '">' + labelCell
+        + (value === o[1] ? 'true' : 'false') + '"'
+        + (meta.disabled
+          ? ' disabled aria-disabled="true" style="opacity:.38;cursor:not-allowed"'
+          : ' data-select-pick="' + esc(o[1]) + '" data-k="' + esc(item.messageKey) + '"')
+        + '>' + labelCell
         + (value === o[1] ? '<span class="ssel-chk">&#10003;</span>' : '') + '</button>';
       shown++;
     }
@@ -296,6 +378,197 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
     }
     return String(value == null ? '' : value);
   }
+  /**
+   * The sheetId this row's current value offers for editing, via the item's named
+   * sheet resolver — null when the item opts out or the resolver offers nothing.
+   *
+   * @param {Object} item Schema item (editSheetFrom: {resolver, args}).
+   * @param {Object} S Live settings state.
+   * @param {Object} env Platform env.
+   * @returns {?string} sheetId of a sheetOnly section, or null.
+   */
+  function resolveEditSheet(item, S, env) {
+    if (!item.editSheetFrom) { return null; }
+    var fn = PConf.sheetResolvers.get(item.editSheetFrom.resolver);
+    if (!fn) { return null; }
+    var args = Object.assign({ messageKey: item.messageKey }, item.editSheetFrom.args || {});
+    var id = fn(S, env, args);
+    return id == null ? null : String(id);
+  }
+
+  /**
+   * The effective item for a range row: a rangeFrom item resolves its settings-derived
+   * config through the named range-resolver and returns a merged clone; a plain range
+   * item passes through unchanged. Resolved at render time AND again at drag/keyboard
+   * time, so the pointer math always uses the current units/colors/scale max.
+   *
+   * @param {Object} item Range schema item (rangeFrom: {resolver, args}).
+   * @param {Object} S Live settings state.
+   * @param {Object} env Platform env.
+   * @returns {Object} The item to render/drag with.
+   */
+  function resolveRangeItem(item, S, env) {
+    if (!item.rangeFrom) { return item; }
+    var fn = PConf.rangeResolvers.get(item.rangeFrom.resolver);
+    if (!fn) { return item; }
+    var args = Object.assign({ messageKey: item.messageKey }, item.rangeFrom.args || {});
+    return Object.assign({}, item, fn(S, env, args));
+  }
+
+  /**
+   * The state badge for a row's edit-sheet trigger, via the item's named badge
+   * resolver — null when the item opts out or the resolver reports nothing to show.
+   *
+   * `args` gets the item's own messageKey merged UNDER editBadgeFrom.args, so a keyless
+   * row (a `sheet` item) must carry its identity in editBadgeFrom.args instead.
+   *
+   * @param {Object} item Schema item (editBadgeFrom: {resolver, args}).
+   * @param {Object} S Live settings state.
+   * @param {Object} env Platform env.
+   * @returns {?{label: (string|undefined), ariaNote: (string|undefined),
+   *   dots: Array<{color: string, ring: (boolean|undefined)}>}} Badge, or null.
+   */
+  function resolveEditBadge(item, S, env) {
+    if (!item.editBadgeFrom) { return null; }
+    var fn = PConf.badgeResolvers.get(item.editBadgeFrom.resolver);
+    if (!fn) { return null; }
+    var args = Object.assign({ messageKey: item.messageKey }, item.editBadgeFrom.args || {});
+    return fn(S, env, args) || null;
+  }
+
+  /**
+   * The value a row should PAINT, via the item's named display resolver — undefined when
+   * the item opts out or the resolver is missing, in which case the control falls back to
+   * the stored value. The stored value is never rewritten: this is a display override for
+   * a key whose effective value is derived elsewhere (a colour that cascades from a
+   * sibling key), and picking the shown value through the normal control still writes it.
+   *
+   * `args` gets the item's own messageKey merged UNDER displayFrom.args, matching the
+   * sheet/badge resolvers, so a resolver shared by many rows needs no per-row args.
+   *
+   * @param {Object} item Schema item (displayFrom: {resolver, args}).
+   * @param {Object} S Live settings state.
+   * @param {Object} env Platform env.
+   * @returns {*} The value to display, or undefined for "use the stored value".
+   */
+  function resolveDisplayValue(item, S, env) {
+    if (!item.displayFrom) { return undefined; }
+    var fn = PConf.displayResolvers.get(item.displayFrom.resolver);
+    if (!fn) { return undefined; }
+    var args = Object.assign({ messageKey: item.messageKey }, item.displayFrom.args || {});
+    return fn(S, env, args);
+  }
+
+  // Rotate-ccw glyph for a label's reset-to-defaults button (item.labelAction).
+  var RESET_SVG = '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor"'
+    + ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    + '<polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>';
+
+  /**
+   * The small icon button beside a label or sub-header (item.labelAction:
+   * {action, arg, label}), dispatching through the shared [data-action] path —
+   * e.g. the threshold group's reset-to-defaults. '' when the item has none.
+   * @param {Object} item Schema item.
+   * @returns {string} Button HTML, or ''.
+   */
+  function labelActionHtml(item) {
+    if (!item.labelAction) { return ''; }
+    return '<button type="button" class="lbl-act" data-action="' + esc(item.labelAction.action)
+      + '" data-action-arg="' + esc(item.labelAction.arg == null ? '' : item.labelAction.arg)
+      + '" aria-label="' + esc(item.labelAction.label || 'Reset') + '">' + RESET_SVG + '</button>';
+  }
+
+  /**
+   * A `subheader` item: an in-body group header (the .subhdr the grouped cards
+   * already use) that can host the group's master toggle and a labelAction. It
+   * lets ONE section hold more than one group — the threshold sheets keep a
+   * slot-level Bold row outside the threshold group, so the group needs a header
+   * of its own and the master switch belongs on it rather than in the sheet's
+   * title row.
+   *
+   * The hosted toggle keeps its normal place in sec.items (hydrate, serialize,
+   * findItem and its onChange hook all still see it); only its row is suppressed
+   * (the isHostedRow predicate, consulted by every row-emitting path).
+   *
+   * @param {Object} item The subheader item ({text, toggleKey?, labelAction?}).
+   * @param {Object} sec The section holding it (searched for the toggle item).
+   * @param {Object} cx Render context.
+   * @returns {string} Sub-header HTML.
+   */
+  function renderSubheader(item, sec, cx) {
+    var toggle = '', i, it = null;
+    if (item.toggleKey) {
+      for (i = 0; i < (sec.items || []).length; i++) {
+        if (sec.items[i].messageKey === item.toggleKey && sec.items[i].type === 'toggle') {
+          it = sec.items[i];
+        }
+      }
+      // A gated-off toggle leaves the header bare rather than drawing a switch
+      // the platform can't honour. The toggle's text label stays behind in the
+      // body, so the accessible name must ride the switch itself.
+      if (it && PConf.showWhen.isVisible(it, cx.evalCtx)) {
+        toggle = renderToggle(it, cx.S[it.messageKey], String(it.label || 'Enable'));
+      }
+    }
+    // item.intro is the group's own explanatory copy — the section-level `intro`
+    // moved down here for the threshold sheets, where it describes the group
+    // rather than the whole sheet. HTML, like every other intro/hint.
+    return '<div class="subhdr grp"><span>' + esc(item.text || '') + '</span>'
+      + labelActionHtml(item) + toggle + '</div>'
+      + (item.intro ? '<div class="intro">' + item.intro + '</div>' : '');
+  }
+
+  /**
+   * The edit-sheet trigger for a row whose value resolved a sheet, or ''. A proper
+   * outlined text button (was a pencil icon): the badge resolver supplies its label,
+   * defaulting to "Edit" when the row has no badge at all. The same label LEADS the
+   * aria-label ("Edit settings for the … value"), so the announced text tracks the
+   * visible button without repeating it, and the badge's optional `ariaNote` is
+   * appended in parentheses so a state the swatch shows visually is also announced.
+   *
+   * @param {Object} item Schema item (for the aria label).
+   * @param {{editSheet: ?string, editBadge: ?Object}} view Render view state.
+   * @returns {string} Trigger button HTML, or ''.
+   */
+  function editPenHtml(item, view) {
+    if (!view.editSheet) { return ''; }
+    var badge = view.editBadge;
+    var label = (badge && badge.label) || 'Edit';
+    return '<button type="button" class="thr-btn" data-edit-sheet="' + esc(view.editSheet)
+      + '" aria-label="' + esc(label) + ' settings for the '
+      + esc(String(item.label || 'selected'))
+      + ' value' + esc((badge && badge.ariaNote) ? ' (' + String(badge.ariaNote) + ')' : '') + '">'
+      + '<span>' + esc(label) + '</span></button>';
+  }
+
+  /**
+   * The badge's state preview — a bold "B" when badge.bold is set (the slot's value
+   * renders always-bold on the watch), then one dot per entry in badge.dots, outlined
+   * when the entry sets `ring` and filled otherwise — or '' when the row has neither.
+   * It sits BEFORE the control as a passive preview, not inside the edit button:
+   * carried inside, the swatches widened the button by ~29px exactly on the rows that
+   * had them, so the Edit buttons could never line up down the right edge. Out here
+   * the button is one fixed width and the swatch reads as what it is — a preview,
+   * with nothing to press. aria-hidden like the dots: the badge's ariaNote already
+   * announces the state on the Edit button itself.
+   *
+   * @param {{editSheet: ?string, editBadge: ?Object}} view Render view state.
+   * @returns {string} Swatch HTML, or ''.
+   */
+  function editSwatchHtml(view) {
+    var badge = view.editBadge;
+    var dots = (badge && badge.dots) || [];
+    var bold = Boolean(badge && badge.bold);
+    if (!view.editSheet || (!dots.length && !bold)) { return ''; }
+    var h = '<span class="thr-swatch" aria-hidden="true">', i;
+    if (bold) { h += '<span class="pen-b">B</span>'; }
+    for (i = 0; i < dots.length; i++) {
+      h += '<span class="pen-dot ' + (dots[i].ring ? 'ring' : 'fill')
+        + '" style="--th-c:' + esc(String(dots[i].color)) + '"></span>';
+    }
+    return h + '</span>';
+  }
+
   /**
    * Shared trigger for both `select` and `searchSelect`: a select-like button that opens
    * the modal popup. aria-controls points at the option list the modal renders into #modal.
@@ -354,160 +627,55 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
     // Inner content only — the host <dialog id="modal"> is the sheet, and its ::backdrop
     // replaces the old dim overlay. The dialog carries role/modal semantics natively;
     // boot() copies titleId onto the dialog's aria-labelledby when it opens.
-    return '<div class="ssel-modal-hdr"><span class="ssel-modal-ttl" id="' + titleId + '">' + title + '</span>'
-      + '<button type="button" class="ssel-modal-close" data-select-close aria-label="Close">×</button></div>'
+    return sheetHeader(titleId, title)
       + search
       + '<div id="' + listId + '" class="ssel-list" role="listbox" aria-label="' + title
       + ' options" data-ssel-list="' + key + '">'
       + renderSelectOptions(item, value, cx.selectQuery, resolveRecommended(item, cx.S, cx.ENV)) + '</div>';
   }
 
-  var MONTH_NAMES = [
-    'January', 'February', 'March', 'April', 'May', 'June',
-    'July', 'August', 'September', 'October', 'November', 'December'
-  ];
-  var MONTH_SHORT = [
-    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
-  ];
-
   /**
-   * @param {number} n Number to pad.
-   * @returns {string} Two digits.
+   * The open edit sheet: a sheetOnly section rendered into the shared bottom-sheet
+   * dialog — header from the section title, then the section's rows (intro, text
+   * fields, color pickers …) through the same item renderer the tab body uses, so
+   * showWhen/joins/hints and the color-palette state all behave identically.
+   * '' when nothing is open, the sheetId is unknown, or the section is gated off.
+   *
+   * @param {Object} schema Config schema.
+   * @param {{S: Object, ENV: Object, openEdit: ?string}} cx Render context.
+   * @returns {string} Sheet header + body HTML, or ''.
    */
-  function datePad2(n) {
-    return (n < 10 ? '0' : '') + n;
-  }
-
-  /**
-   * @param {Date} date Local date.
-   * @returns {string} Local YYYY-MM-DD.
-   */
-  function formatDateValue(date) {
-    return date.getFullYear() + '-' + datePad2(date.getMonth() + 1)
-      + '-' + datePad2(date.getDate());
-  }
-
-  /**
-   * @param {number} year Full year.
-   * @param {number} month One-based month.
-   * @returns {number} Real day count for the month.
-   */
-  function daysInMonth(year, month) {
-    return new Date(year, month, 0).getDate();
-  }
-
-  /**
-   * @param {*} value YYYY-MM-DD candidate.
-   * @param {Date} [now] Local fallback date.
-   * @returns {{year:number, month:number, day:number}} Valid parts.
-   */
-  function parseDateParts(value, now) {
-    var fallback = now || new Date();
-    var parts = typeof value === 'string' ? value.split('-') : [];
-    if (parts.length === 3 && /^\d{4}$/.test(parts[0])
-        && /^\d{2}$/.test(parts[1]) && /^\d{2}$/.test(parts[2])) {
-      var year = parseInt(parts[0], 10);
-      var month = parseInt(parts[1], 10);
-      var day = parseInt(parts[2], 10);
-      if (month >= 1 && month <= 12 && day >= 1
-          && day <= daysInMonth(year, month)) {
-        return { year: year, month: month, day: day };
+  function renderEditModal(schema, cx) {
+    if (!cx.openEdit) { return ''; }
+    var sec = null, ti, si, tabs = schema.tabs || [];
+    for (ti = 0; ti < tabs.length; ti++) {
+      var secs = tabs[ti].sections || [];
+      for (si = 0; si < secs.length; si++) {
+        if (secs[si].sheetOnly && secs[si].sheetId === cx.openEdit) { sec = secs[si]; }
       }
     }
-    return {
-      year: fallback.getFullYear(),
-      month: fallback.getMonth() + 1,
-      day: fallback.getDate()
-    };
-  }
-
-  /**
-   * Clamp a date-part object and serialize it.
-   *
-   * @param {{year:number, month:number, day:number}} parts Date parts.
-   * @returns {string} Valid YYYY-MM-DD.
-   */
-  function dateValueFromParts(parts) {
-    var month = Math.max(1, Math.min(12, parseInt(parts.month, 10) || 1));
-    var year = parseInt(parts.year, 10) || new Date().getFullYear();
-    var day = Math.max(1, parseInt(parts.day, 10) || 1);
-    day = Math.min(day, daysInMonth(year, month));
-    return year + '-' + datePad2(month) + '-' + datePad2(day);
-  }
-
-  /**
-   * @param {Object} item Date schema item.
-   * @param {{value:*, openDate:?string}} view Render state.
-   * @returns {string} Whole-row date trigger.
-   */
-  function renderDateTrigger(item, view) {
-    var p = parseDateParts(view.value);
-    var label = p.day + ' ' + MONTH_SHORT[p.month - 1] + ' ' + p.year;
-    var key = esc(item.messageKey);
-    return '<button type="button" class="date-wrap" data-date="' + key
-      + '" aria-label="' + esc(String(item.label || 'Date') + ': ' + label)
-      + '" aria-haspopup="dialog" aria-expanded="'
-      + (view.openDate === item.messageKey ? 'true' : 'false') + '"><span>'
-      + esc(label) + '</span><svg viewBox="0 0 24 24" fill="none"'
-      + ' stroke="currentColor" stroke-width="2" aria-hidden="true">'
-      + '<rect x="3" y="5" width="18" height="16" rx="2"/>'
-      + '<path d="M16 3v4M8 3v4M3 10h18"/></svg></button>';
-  }
-
-  /**
-   * @param {string} part day|month|year.
-   * @param {Array} values Numeric values.
-   * @param {number} selected Selected numeric value.
-   * @returns {string} One scroll-snap wheel.
-   */
-  function renderDateWheel(part, values, selected) {
-    var h = '<div class="date-wheel" data-date-wheel="' + part + '">';
-    for (var i = 0; i < values.length; i++) {
-      var value = values[i];
-      var label = part === 'month' ? MONTH_NAMES[value - 1] : String(value);
-      h += '<button type="button" class="date-opt'
-        + (value === selected ? ' on' : '') + '" data-date-value="' + value
-        + '">' + esc(label) + '</button>';
-    }
-    return h + '</div>';
-  }
-
-  /**
-   * @param {Object} schema Config schema.
-   * @param {{S:Object, openDate:?string}} cx Render context.
-   * @returns {string} Date sheet inner HTML or empty string.
-   */
-  function renderDateModal(schema, cx) {
-    if (!cx.openDate) { return ''; }
-    var found = null;
-    eachItem(schema, function (it) {
-      if (it.type === 'date' && it.messageKey === cx.openDate) { found = it; }
-    });
-    if (!found) { return ''; }
-    var p = parseDateParts(cx.S[found.messageKey]);
-    var days = [], months = [], years = [], i;
-    for (i = 1; i <= daysInMonth(p.year, p.month); i++) { days.push(i); }
-    for (i = 1; i <= 12; i++) { months.push(i); }
-    var currentYear = new Date().getFullYear();
-    var firstYear = Math.min(currentYear, p.year);
-    var lastYear = Math.max(currentYear + 10, p.year);
-    for (i = firstYear; i <= lastYear; i++) { years.push(i); }
-    var key = esc(found.messageKey);
-    var titleId = 'date-ttl-' + key;
-    return '<div class="ssel-modal-hdr"><span class="ssel-modal-ttl" id="'
-      + titleId + '">' + esc(found.label || 'Date') + '</span>'
-      + '<button type="button" class="ssel-modal-close" data-date-close'
-      + ' aria-label="Close">×</button></div><div class="date-picker"'
-      + ' data-date-picker="' + key + '"><div class="date-band"></div>'
-      + renderDateWheel('day', days, p.day)
-      + renderDateWheel('month', months, p.month)
-      + renderDateWheel('year', years, p.year) + '</div>';
+    if (!sec) { return ''; }
+    // The sheet honors its section gate even when forced open — on aplite
+    // (env.thresholds false) it must stay empty regardless of how it was opened.
+    if (sec.showWhen && !PConf.showWhen.isVisible(sec, cx.evalCtx)) { return ''; }
+    var built = buildSectionBody(sec, cx);
+    if (built.isEmpty) { return ''; }
+    var titleId = 'esheet-ttl-' + esc(String(cx.openEdit));
+    // A sheet-level labelAction rides the TITLE, beside the text. Same shape as an item's
+    // (labelActionHtml reads `.labelAction` off whatever it is handed), so a sheet whose
+    // reset covers everything in it needs no group sub-header to hang the button on.
+    return sheetHeader(titleId, esc(String(sec.title || 'Edit')), labelActionHtml(sec))
+      + '<div class="ssel-list esheet">' + built.body + '</div>';
   }
 
   function renderText(item, v) {
     var ph = (item.attributes && item.attributes.placeholder) ? esc(item.attributes.placeholder) : '';
-    var input = '<input type="text" data-k="' + item.messageKey + '" value="' + esc(v || '') + '" placeholder="' + ph + '">';
+    // attributes.maxlength lands verbatim on the <input>. Note the browser counts
+    // UTF-16 code units, not bytes — byte-capped keys (e.g. radarNoRainText) are
+    // re-truncated UTF-8-safely phone-side at pack time; this is the soft UI cap.
+    var ml = (item.attributes && item.attributes.maxlength)
+      ? ' maxlength="' + esc(String(item.attributes.maxlength)) + '"' : '';
+    var input = '<input type="text" data-k="' + item.messageKey + '" value="' + esc(v || '') + '" placeholder="' + ph + '"' + ml + '>';
     if (!item.suffixAction) { return input; }
     // Optional inline action button to the RIGHT of the input (e.g. "Test" a key),
     // plus an empty result line the action fills — targeted by
@@ -518,11 +686,13 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
       + '<div class="hint txt-act-result" data-action-result="' + esc(item.messageKey) + '"></div>';
   }
   function renderColor(item, v, openColor) {
+    // Every picker offers the shared 64 Pebble swatches; excludeColors subtracts specific
+    // ones (e.g. white as the holiday color, where white means "no highlight" rather than
+    // a real color). A value the palette cannot represent — '' — is just an empty chip.
     var disp = String(v).toUpperCase();
-    var h = '<div class="sw-wrap" data-color="' + item.messageKey + '"><b style="background:' + esc(v) + '"></b><span>' + esc(disp) + '</span></div>';
+    var chip = '<b style="background:' + esc(v) + '"></b>';
+    var h = '<div class="sw-wrap" data-color="' + item.messageKey + '">' + chip + '<span>' + esc(disp) + '</span></div>';
     if (openColor === item.messageKey) {
-      // excludeColors lets a picker drop specific swatches (e.g. white as the holiday color,
-      // where white means "no highlight" rather than a real color) without touching the shared PALETTE.
       var excluded = {};
       if (item.excludeColors) { for (var e = 0; e < item.excludeColors.length; e++) { excluded[item.excludeColors[e].toUpperCase()] = true; } }
       h += '<div class="palette">';
@@ -535,22 +705,26 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
     }
     return h;
   }
-  var CONTROLS = {
+    var CONTROLS = {
     toggle: function (item, view) { return renderToggle(item, view.value); },
-    segmented: function (item, view) { return renderSegmented(item, view.value); },
-    radio: function (item, view) { return renderRadio(item, view.value); },
+    segmented: function (item, view) { return renderSegmented(item, view.value, view.disabledOptions); },
+    radio: function (item, view) { return renderRadio(item, view.value, view.disabledOptions); },
     select: function (item, view) { return renderSelectTrigger(item, view); },
     date: function (item, view) { return renderDateTrigger(item, view); },
     text: function (item, view) { return renderText(item, view.value); },
-    color: function (item, view) { return renderColor(item, view.value, view.openColor); },
-    searchSelect: function (item, view) { return renderSelectTrigger(item, view); }
+    // view.displayValue (item.displayFrom) paints a derived colour — the chip AND the
+    // palette's current-swatch marker follow it; the write path stays on the messageKey.
+    color: function (item, view) { return renderColor(item, view.displayValue == null ? view.value : view.displayValue, view.openColor); },
+    searchSelect: function (item, view) { return renderSelectTrigger(item, view); },
+    range: function (item, view) { return renderRange(item, view); }
   };
   /**
    * Dispatch to the control renderer for item.type; '' for an unknown type.
    *
    * @param {Object} item Schema item.
-   * @param {{value: *, openColor: ?string, openSelect: ?string, openDate: ?string,
-   *   selectQuery: ?string}} view Render view state.
+   * @param {{value: *, displayValue: *, openColor: ?string, openSelect: ?string,
+   *   openDate: ?string, selectQuery: ?string}} view Render view state
+   *   (displayValue overrides what a `color` control paints; see resolveDisplayValue).
    * @returns {string} Control HTML.
    */
   function renderControl(item, view) {
@@ -581,10 +755,20 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
     // label's line and the label wraps into the width the control leaves, then the hint
     // drops to a full-width line below.
     var wideSegmented = item.type === 'segmented' && item.options && item.options.length > 3;
-    var stacked = item.type === 'text' || item.type === 'radio'
+    var stacked = item.type === 'text' || item.type === 'radio' || item.type === 'range'
       || (item.type === 'color' && view.openColor === item.messageKey);
     var hintHtml = hint ? '<div class="hint">' + hint + '</div>' : '';
-    var label = '<div class="lbl">' + esc(item.label) + '</div>';
+    // An optional small icon button beside the label (item.labelAction: {action, arg,
+    // label}) dispatching through the shared [data-action] path — e.g. the threshold
+    // slider's reset-to-defaults.
+    var labelAct = labelActionHtml(item);
+    // A row may legitimately carry no label — the threshold slider's title lives
+    // on its group sub-header instead, and repeating it here read as a stutter.
+    // Drop the whole box then (esc(undefined) used to print "undefined"), unless
+    // a labelAction still needs somewhere to sit.
+    var label = (item.label || labelAct)
+      ? '<div class="lbl">' + (item.label ? esc(item.label) : '') + labelAct + '</div>'
+      : '';
     // Status-line slot pickers are compact rows: the .slot modifier tightens the vertical
     // rhythm so consecutive slot rows sit closer together. Status slots are plain selects
     // (matched via the statusSlot resolver, since they carry no distinguishing type), while
@@ -592,14 +776,27 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
     // row keeps normal padding so its expanded content isn't cramped.
     var isStatusSlot = item.optionsFrom && item.optionsFrom.resolver === 'statusSlot';
     var rowCls = 'row' + (stacked ? ' stack' : '') + (wideSegmented ? ' segwide' : '') + nbClass(noDivider)
-      + ((item.type === 'searchSelect' || isStatusSlot) && !stacked ? ' slot' : '');
+      + ((item.type === 'searchSelect' || isStatusSlot) && !stacked ? ' slot' : '')
+      // A disabled row (item.disabledWhen) stays visible — showing what WOULD be
+      // configurable — but muted and inert (CSS pointer-events; the range handlers
+      // also guard on .dis for keyboard focus that CSS can't block).
+      + (view.disabled ? ' dis' : '');
     if (stacked) {
       return '<div class="' + rowCls + '">' + label + hintHtml + '<div>' + renderControl(item, view) + '</div></div>';
     }
+    // A resolved edit sheet splits its two affordances around the control: the passive
+    // colour swatch leads, the Edit button trails. The control cell is right-aligned and
+    // the button is one fixed width, so every row's Edit lands on the same right edge
+    // however wide its dropdown's current value happens to be — which is the whole point
+    // of the arrangement. rgtClose is what closes .rgt, so all three row shapes below
+    // pick the button up without repeating it.
+    var rgtOpen = view.editSheet
+      ? '<div class="rgt has-pen">' + editSwatchHtml(view) : '<div class="rgt">';
+    var rgtClose = (view.editSheet ? editPenHtml(item, view) : '') + '</div>';
     // Wide segmented (.segwide): control on the label's line, label wraps into the leftover
     // width (.lft flex), hint on its own full-width line below (.segwide .hint flex-basis).
     if (wideSegmented) {
-      return '<div class="' + rowCls + '"><div class="lft">' + label + '</div><div class="rgt">' + renderControl(item, view) + '</div>' + hintHtml + '</div>';
+      return '<div class="' + rowCls + '"><div class="lft">' + label + '</div>' + rgtOpen + renderControl(item, view) + rgtClose + hintHtml + '</div>';
     }
     // Rows with a multi-line hint float the control right (.wrap layout) so the
     // hint flows around it and reclaims the full width below the control instead
@@ -608,9 +805,9 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
     // isn't measurable at render time, so "multi-line" is a plain-text length
     // heuristic — short one-liners keep the centered two-column row.
     if (hintHtml && String(hint).replace(/<[^>]*>/g, '').length > 64) {
-      return '<div class="' + rowCls + ' wrap">' + label + '<div class="rgt">' + renderControl(item, view) + '</div>' + hintHtml + '</div>';
+      return '<div class="' + rowCls + ' wrap">' + label + rgtOpen + renderControl(item, view) + rgtClose + hintHtml + '</div>';
     }
-    return '<div class="' + rowCls + '"><div class="lft">' + label + hintHtml + '</div><div class="rgt">' + renderControl(item, view) + '</div></div>';
+    return '<div class="' + rowCls + '"><div class="lft">' + label + hintHtml + '</div>' + rgtOpen + renderControl(item, view) + rgtClose + '</div>';
   }
 
   // Render a registered block by id, wrapped in .blockrow ('.blockrow sticky' when sticky).
@@ -633,6 +830,13 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
   // that mutates cx.S during render — isolated here so renderItem stays a pure dispatcher.
   // Returns the row item to render (a derived-options clone, or the original unchanged).
   function resolveRowItem(item, view, cx) {
+    // A rangeFrom range renders from its resolved config (geometry/zones/colors); the
+    // companion danger value rides the view, since the control renderer receives only
+    // (item, view) — the warn value is the row's ordinary view.value.
+    if (item.type === 'range' && item.rangeFrom) {
+      view.dangerValue = cx.S[item.dangerKey];
+      return resolveRangeItem(item, cx.S, cx.ENV);
+    }
     if ((item.type !== 'select' && item.type !== 'searchSelect' && item.type !== 'radio') || !item.optionsFrom) {
       return item;
     }
@@ -641,9 +845,39 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
       var dflt = resolveDefaultFrom(item, cx.ENV);
       var snap = (dflt != null && optionHasValue(derived, dflt)) ? dflt : derived[0][1];
       view.value = snap;
-      cx.S[item.messageKey] = snap;
+      // A DORMANT value (declared in item.dormantValues) is a valid choice the current
+      // mode merely hides — e.g. compactDense while neither health nor radar shows a
+      // status row: render the fallback but leave cx.S untouched, so the stored choice
+      // returns when the mode re-enables it. Anything else is truly invalid and snaps
+      // into state so the control and state stay in lockstep.
+      var stored = cx.S[item.messageKey];
+      if (!(item.dormantValues && item.dormantValues.indexOf(stored) >= 0)) {
+        cx.S[item.messageKey] = snap;
+      }
     }
     return Object.assign({}, item, { options: derived });
+  }
+
+  /**
+   * A whole-row tap target that leads somewhere: a `button` item's action or a `sheet`
+   * item's sheetOnly section. Both rows are the same chrome — label, optional hint, a
+   * chevron on the right — and differ only in the data attribute the click delegate
+   * matches on, so they share one builder. The chevron takes its color from the .chev
+   * rule in shell.html (var(--link)), which the card-header chevron uses too: hard-coded
+   * here it stayed at the DARK link color when the page flipped to the light theme.
+   *
+   * @param {Object} item Schema item; uses `label` and the optional `hint`.
+   * @param {string} attr Data attribute the click delegate matches ('data-action' or
+   *   'data-edit-sheet').
+   * @param {string} value That attribute's value — the action id or the sheet id.
+   * @param {(string|boolean)} noDivider Join mode from nextVisibleJoins(), for nbClass().
+   * @returns {string} Row HTML.
+   */
+  function chevronRow(item, attr, value, noDivider) {
+    var hint = item.hint ? '<div class="hint">' + item.hint + '</div>' : '';
+    return '<div class="row' + nbClass(noDivider) + '" ' + attr + '="' + esc(value) + '" style="cursor:pointer">'
+      + '<div class="lft"><div class="lbl">' + esc(item.label) + '</div>' + hint + '</div>'
+      + '<div class="rgt"><span class="chev">&#9656;</span></div></div>';
   }
 
   // Render one schema item honoring showWhen. Returns { html, kind } with kind in
@@ -654,11 +888,25 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
     if (item.type === 'hidden') { return { html: '', kind: 'hidden' }; }
     // A tappable action row: dispatches to PConf.actions[item.action] via the scroll click handler.
     if (item.type === 'button') {
-      var bHint = item.hint ? '<div class="hint">' + item.hint + '</div>' : '';
-      return { kind: 'control', html:
-        '<div class="row' + nbClass(noDivider) + '" data-action="' + esc(item.action) + '" style="cursor:pointer">'
-        + '<div class="lft"><div class="lbl">' + esc(item.label) + '</div>' + bHint + '</div>'
-        + '<div class="rgt"><span style="color:#FF6A52;font-size:16px;font-weight:700;line-height:1">&#9656;</span></div></div>' };
+      return { kind: 'control', html: chevronRow(item, 'data-action', item.action, noDivider) };
+    }
+    // A row whose only job is to open a sheetOnly section — the button row's shape,
+    // dispatching to the edit-sheet handler instead of PConf.actions. Use it for a sheet
+    // that belongs to no single control, where the per-value pencil chip would read wrong.
+    if (item.type === 'sheet') {
+      var sId = item.sheetId || resolveEditSheet(item, cx.S, cx.ENV);
+      if (!sId) { return { html: '', kind: 'hidden' }; }
+      // A sheet row that declares a badge renders as an ordinary row with the preview +
+      // Edit pair instead (renderControl yields '' for type 'sheet', so the control cell
+      // holds only those two); without one it stays a chevron row. resolveEditBadge
+      // merges the item's messageKey UNDER editBadgeFrom.args and a sheet row has none,
+      // so such a row identifies itself through those args.
+      if (item.editBadgeFrom) {
+        view.editSheet = sId;
+        view.editBadge = resolveEditBadge(item, cx.S, cx.ENV);
+        return { kind: 'control', html: renderRow(item, view, noDivider) };
+      }
+      return { kind: 'control', html: chevronRow(item, 'data-edit-sheet', sId, noDivider) };
     }
     if (item.type === 'staticText') {
       // a joinPrevious static acts as the control's description, so the join modifier tightens its
@@ -676,21 +924,75 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
       return { html: staticHtml, kind: 'static' };
     }
     var rowItem = resolveRowItem(item, view, cx);
+    // After resolveRowItem: an invalid stored value has been snapped into cx.S, so the
+    // pencil reflects the value the row actually shows.
+    if (item.editSheetFrom) {
+      view.editSheet = resolveEditSheet(item, cx.S, cx.ENV);
+      if (view.editSheet) { view.editBadge = resolveEditBadge(item, cx.S, cx.ENV); }
+    }
+    // disabledWhen: the row renders but muted + inert (vs showWhen, which removes it) —
+    // a feature that is OFF still shows what turning it on would offer.
+    if (item.disabledWhen) {
+      view.disabled = PConf.showWhen.evaluate(item.disabledWhen, cx.evalCtx);
+    }
+    // optionDisabledWhen: individual options go inert while the row stays live —
+    // e.g. "bold on warn" is unreachable until the slot's thresholds are on.
+    if (item.optionDisabledWhen) {
+      view.disabledOptions = disabledOptionValues(item, cx.evalCtx);
+    }
+    // displayFrom: the row paints a DERIVED value while storing under its own key —
+    // for a setting whose effective value cascades from a sibling until it is pinned.
+    if (item.displayFrom) {
+      view.displayValue = resolveDisplayValue(item, cx.S, cx.ENV);
+    }
     var html = renderBlock(item.blockBefore, cx.S, cx.ENV, cx.USERDATA, item.blockBeforeSticky)
       + renderRow(rowItem, view, noDivider)
       + renderBlock(item.block, cx.S, cx.ENV, cx.USERDATA);
     return { html: html, kind: 'control' };
   }
 
+  /**
+   * Map of this section's toggle messageKeys hosted by a VISIBLE subheader
+   * (subheader.toggleKey): their switches render on that header, so their own
+   * rows must not. Collected up front because the subheader may sit after the
+   * toggle in the item list.
+   * @param {Object} sec Section whose items to scan.
+   * @param {Object} cx Render context.
+   * @returns {Object} messageKey -> true map.
+   */
+  function hostedToggleKeys(sec, cx) {
+    var hosted = {}, i;
+    for (i = 0; i < sec.items.length; i++) {
+      if (sec.items[i].type === 'subheader' && sec.items[i].toggleKey
+        && PConf.showWhen.isVisible(sec.items[i], cx.evalCtx)) {
+        hosted[sec.items[i].toggleKey] = true;
+      }
+    }
+    return hosted;
+  }
+
+  /**
+   * True when this item's own row is suppressed because a subheader hosts its
+   * toggle. THE predicate for the hosted-row rule: the main item loop, the
+   * inline-group renderer and the join look-ahead all consult it, so the rule
+   * cannot drift between render paths.
+   * @param {Object} item Schema item.
+   * @param {Object} hosted hostedToggleKeys() map for the item's section.
+   * @returns {boolean} Whether to suppress the item's row.
+   */
+  function isHostedRow(item, hosted) {
+    return item.type === 'toggle' && Boolean(hosted && hosted[item.messageKey]);
+  }
+
   // Render a run of consecutive items sharing the same inline group id as a single side-by-side
   // row (one bottom divider, no internal dividers). Each visible member becomes a compact
   // label+control cell. Inline members don't carry hints/blocks. Returns { html, controlCount };
   // controlCount is the number of visible cells (0 -> nothing rendered, group hidden).
-  function renderInlineGroup(items, cx, noDivider) {
+  function renderInlineGroup(items, cx, noDivider, hosted) {
     var cells = '', visible = 0, i, item, view;
     for (i = 0; i < items.length; i++) {
       item = items[i];
-      if (!PConf.showWhen.isVisible(item, cx.evalCtx)) { continue; }
+      if (isHostedRow(item, hosted) || !PConf.showWhen.isVisible(item, cx.evalCtx)) { continue; }
       view = {
         value: cx.S[item.messageKey],
         openColor: cx.openColor,
@@ -705,14 +1007,16 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
     return { html: '<div class="row inline' + nbClass(noDivider) + '">' + cells + '</div>', controlCount: visible };
   }
 
-  // Look-ahead from index "from": the join mode of the next *visible* item — '' when it doesn't
+  // Look-ahead from index "from": the join mode of the next *rendered* item — '' when it doesn't
   // join, 'loose' for a roomy join (joinPrevious: 'loose'), else 'tight' (joinPrevious: true). A
   // joining item wants no divider between it and the row above, so the preceding visible row drops
   // its divider; 'tight' also tightens the padding, 'loose' keeps the normal row spacing. Skips
-  // hidden items so the divider returns automatically when the joining group is hidden.
-  function nextVisibleJoins(items, from, cx) {
+  // hidden items — so the divider returns automatically when the joining group is hidden — and
+  // hosted-suppressed toggles (isHostedRow), whose rows never render at all.
+  function nextVisibleJoins(items, from, cx, hosted) {
     var j, jp;
     for (j = from; j < items.length; j++) {
+      if (isHostedRow(items[j], hosted)) { continue; }
       if (PConf.showWhen.isVisible(items[j], cx.evalCtx)) {
         jp = items[j].joinPrevious;
         return jp === 'loose' ? 'loose' : (jp ? 'tight' : '');
@@ -735,19 +1039,34 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
   }
 
   // Build a section's inner body HTML (intro + items + block) and whether it's empty
-  // (no intro, no visible control/static items, no block). Shared by renderSection (a
-  // standalone card) and renderSectionGroup (a section merged into a shared card), so the
-  // "hide when everything is gated off" rule stays in one place.
+  // (no intro, no visible control/static items, no block). Shared by
+  // renderSection (a standalone card) and renderSectionGroup (a section merged into a
+  // shared card), so the "hide when everything is gated off" rule stays in one place.
   function buildSectionBody(sec, cx) {
+    // A section may carry its own showWhen, for a whole feature card that a platform
+    // cannot render (e.g. threshold highlighting on aplite). Reporting it as empty is
+    // enough for both callers to drop it — card, sub-header, intro and all — without
+    // duplicating the rule. Item-level showWhen/capabilities still apply inside.
+    if (sec.showWhen && !PConf.showWhen.isVisible(sec, cx.evalCtx)) {
+      return { body: '', isEmpty: true };
+    }
     var body = sec.intro ? '<div class="intro">' + sec.intro + '</div>' : '';
     var controlCount = 0, staticCount = 0, i;
+    var hosted = hostedToggleKeys(sec, cx);
     for (i = 0; i < sec.items.length; i++) {
       var item = sec.items[i];
+      if (item.type === 'subheader') {
+        if (!PConf.showWhen.isVisible(item, cx.evalCtx)) { continue; }
+        body += renderSubheader(item, sec, cx);
+        staticCount++;
+        continue;
+      }
+      if (isHostedRow(item, hosted)) { continue; }
       if (item.inline) {
         // gather the consecutive run sharing this inline group id, render it as one row
         var run = [item];
         while (i + 1 < sec.items.length && sec.items[i + 1].inline === item.inline) { run.push(sec.items[i + 1]); i++; }
-        var g = renderInlineGroup(run, cx, nextVisibleJoins(sec.items, i + 1, cx));
+        var g = renderInlineGroup(run, cx, nextVisibleJoins(sec.items, i + 1, cx, hosted), hosted);
         controlCount += g.controlCount;
         body += g.html;
         continue;
@@ -759,7 +1078,7 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
         openDate: cx.openDate,
         selectQuery: cx.selectQuery
       };
-      var r = renderItem(item, view, cx, nextVisibleJoins(sec.items, i + 1, cx));
+      var r = renderItem(item, view, cx, nextVisibleJoins(sec.items, i + 1, cx, hosted));
       if (r.kind === 'control') { controlCount++; }
       else if (r.kind === 'static') { staticCount++; }
       body += r.html;
@@ -854,6 +1173,9 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
       if (t.id !== activeTab) { continue; }
       for (si = 0; si < t.sections.length; si++) {
         var sec = t.sections[si];
+        // A sheetOnly section renders only inside the edit-sheet dialog (renderEditModal);
+        // its items still hydrate/serialize like any other, they just have no card.
+        if (sec.sheetOnly) { continue; }
         // Consecutive sections sharing a groupCard id render into one card (titles become
         // in-card sub-headers); everything else stays a card of its own.
         if (sec.groupCard) {
@@ -877,31 +1199,116 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
    *
    * @returns {void}
    */
+  // Fraction of the peek row left visible below the fold. A bit over half: enough of the last
+  // item shows to read it, while the clipped remainder still advertises "there's more — scroll".
+  var PEEK_ROW_FRACTION = 0.66;
+  // The capped bottom edge already reads as a peek when at least this much of the fold row
+  // shows (readable) ...
+  var MIN_PEEK_PX = 20;
+  // ... AND at least this much of it is clipped (visibly cut off, so it advertises the scroll).
+  var MIN_CLIP_PX = 12;
+  // Plain select is content-sized up to the 80dvh cap. When the option list overflows, the
+  // last visible row can land flush (or as a too-thin sliver) against the sheet's bottom edge,
+  // so nothing meaningful peeks out and the sheet reads as un-scrollable. Find the row the
+  // capped edge lands in (the fold row): when the natural edge already shows a readable,
+  // clearly-clipped slice of it, the full capped height IS the peek — leave it alone. This
+  // matters for the edit sheets, whose "rows" can be whole stacked radio groups hundreds of
+  // px tall (the Date-format sheet): the old always-align-to-PEEK_ROW_FRACTION rule cut back
+  // to a fraction of such a row and collapsed the sheet far below its cap. Only when the edge
+  // lands flush on a boundary (or leaves a sliver) pull back: clip a nearly-complete fold row
+  // by MIN_CLIP_PX, or cut the classic row fraction when only a sliver shows. Idempotent:
+  // resets its own clamp and re-measures the clean 80dvh-capped height each call, so it's
+  // safe to run repeatedly (see scheduleSelectPeek in boot). .picking is excluded too: the
+  // point of the raised cap is to show the whole palette, so clamping the list to leave a
+  // peek row would undo it. Top-level (not inside boot) so the test harness can drive it
+  // against a stub dialog (select-peek.test.js).
+  function fitSelectPeek(dlg) {
+    if (!dlg.open || dlg.classList.contains('search') || dlg.classList.contains('picking')) { return; }
+    var list = dlg.querySelector('.ssel-list');
+    if (!list) { return; }
+    list.style.maxHeight = '';                  // reset → measure the clean, capped height
+    var H = list.clientHeight;
+    // Bail until the dialog is actually laid out under its cap. On a mobile webview clientHeight
+    // reads a pre-layout value right after showModal() (the whole content height, not yet capped),
+    // so scrollHeight <= H and we'd wrongly no-op — scheduleSelectPeek re-runs us once layout
+    // settles (rAF + the sheet-up animationend), when H is the real capped height and overflows.
+    if (!H || list.scrollHeight <= H + 1) { return; }
+    // Walk to the fold row — the row the capped bottom edge lands inside.
+    var rows = list.children, top = 0, i, h = 0, prevH = 0;
+    for (i = 0; i < rows.length; i++) {
+      h = rows[i].offsetHeight;
+      if (top + h > H) { break; }
+      prevH = h;
+      top += h;
+    }
+    if (i >= rows.length) { return; }           // content ends at the cap — nothing to peek
+    var shown = H - top;                        // slice of the fold row visible un-clamped
+    if (shown >= MIN_PEEK_PX && h - shown >= MIN_CLIP_PX) { return; }   // natural peek already
+    var target;
+    if (shown >= MIN_PEEK_PX) {
+      // The fold row is nearly complete — clip it by MIN_CLIP_PX instead of collapsing
+      // to its row fraction (that is the giant-row trap the fold-walk exists to avoid).
+      target = top + h - MIN_CLIP_PX;
+    } else {
+      // Flush boundary or an unreadable sliver — the classic cut: PEEK_ROW_FRACTION of
+      // the fold row, or of the row above when the fold row's fraction doesn't fit.
+      target = top + h * PEEK_ROW_FRACTION;
+      if (target > H && prevH) { target = (top - prevH) + prevH * PEEK_ROW_FRACTION; }
+    }
+    if (target > H || target < 24) { return; }
+    list.style.maxHeight = Math.round(target) + 'px';
+  }
+
   function boot() {
     var SCHEMA = INJECTED_SCHEMA, ENV = INJECTED_ENV || { color: true, round: false, platform: '', health: true };
     var USERDATA = INJECTED_USERDATA || {}, RETURN_TO = INJECTED_RETURN || 'pebblejs://close#';
     var S = hydrate(SCHEMA, INJECTED_CFG, ENV), INITIAL = Object.assign({}, S);
     var activeTab = SCHEMA.tabs[0].id;
-    var openColor = null, openSelect = null, openDate = null;
+    var openColor = null, openSelect = null, openDate = null, openEdit = null;
     var selectQuery = '', collapsed = initialCollapsed(SCHEMA);
     // Recover a schema item by messageKey so the input handler can re-filter its options in place.
     function findItem(key) { var f = null; eachItem(SCHEMA, function (it) { if (it.messageKey === key) { f = it; } }); return f; }
+    /**
+     * A key's schema default in the SAME shape hydrate() stores it (env-aware
+     * defaultFrom resolution; number color defaults as '#RRGGBB'). Handed to
+     * [data-action] handlers so a reset can land on what a fresh install actually
+     * resolves instead of hand-mirroring schema defaults — mirrored literals
+     * drift when the schema changes.
+     * @param {string} key Schema item messageKey.
+     * @returns {*} The stored-shape default, or undefined for a key with no schema item.
+     */
+    function defaultAsStored(key) {
+      var item = findItem(key);
+      if (!item) { return undefined; }
+      var dv = resolveDefaultFrom(item, ENV);
+      return (item.type === 'color' && typeof dv === 'number') ? intToHex(dv) : dv;
+    }
     // The messageKey of the trigger to restore focus to when the modal closes. Stored by key
     // (not the DOM node) because render() replaces #scroll's innerHTML, detaching any node
     // captured at open time; re-querying by key after render finds the fresh trigger.
     var lastSelectKey = null;
+    // Same, for an edit sheet: the sheetId whose pencil trigger regains focus on close.
+    var lastEditSheet = null;
     // Optional one-shot callback fired after the sheet closes, set by openSheet() so an external
     // caller (the onboarding wizard, which lives in its own overlay) can react to a pick/dismiss.
     var onSheetClose = null;
-    // One pending settled-scroll sample per date wheel part. Separate entries prevent activity
-    // in one wheel from canceling another wheel's still-pending selection.
-    var pendingDateScrolls = {};
-    // True while alignDateWheels() is programmatically writing wheel.scrollTop. Writing scrollTop
-    // dispatches a 'scroll' event, which the wheel scroll handler would otherwise mistake for a user
-    // scroll and answer with a settle -> render -> re-align, dispatching another scroll: an infinite
-    // flicker loop. The handler bails while this is set; alignDateWheels clears it once the scroll
-    // events its writes emit have flushed.
-    var suppressWheelScroll = false;
+    // The date wheel-settle machinery lives with the picker (createDateWiring);
+    // the engine hands it the live accessors and calls in through this instance.
+    var dateWiring = datePicker.createDateWiring({
+      S: S,
+      getOpenDateKey: function () { return openDate; },
+      render: render
+    });
+    // Same shape for the slider's drag machinery (createRangeWiring); the
+    // swipe-dismiss below reads isDragging() so a sheet drag never hijacks a
+    // thumb drag.
+    var rangeWiring = rangeControl.createRangeWiring({
+      S: S,
+      ENV: ENV,
+      findItem: findItem,
+      resolveRangeItem: resolveRangeItem,
+      render: render
+    });
     // On open, focus the search box (searchSelect) or the selected/first option (select).
     function focusModal() {
       var modal = document.getElementById('modal');
@@ -915,30 +1322,46 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
     function syncDialog() {
       var dlg = document.getElementById('modal');
       if (!dlg || !dlg.showModal) { return; }
-      var sheetOpen = openSelect || openDate;
+      var sheetOpen = openSelect || openDate || openEdit;
       var opening = Boolean(sheetOpen && !dlg.open);
       if (sheetOpen) {
         if (opening) { dlg.showModal(); }
         var ttl = dlg.querySelector('.ssel-modal-ttl');
         if (ttl && ttl.id) { dlg.setAttribute('aria-labelledby', ttl.id); }
+        if (openEdit) { dlg.classList.add('edit'); } else { dlg.classList.remove('edit'); }
+        // An expanded palette needs more room than the 80dvh cap allows (.picking raises it
+        // to 94dvh). syncDialog runs on EVERY render, not just the open edge, so this tracks
+        // the palette opening and closing inside an already-open sheet. add/remove, never the
+        // two-argument classList.toggle — unsafe in old Android WebViews.
+        // openColor is shared with the tab body, and only the EDIT sheet ever renders a
+        // palette; without the openEdit half, a palette left expanded in the body would
+        // also grow (and un-peek) an unrelated select sheet opened from the same card.
+        if (openEdit && openColor) { dlg.classList.add('picking'); } else { dlg.classList.remove('picking'); }
         if (openDate) {
           dlg.classList.remove('search');
           dlg.classList.add('date');
-          scheduleDateWheelAlign(dlg, opening);
+          dateWiring.scheduleAlign(dlg, opening);
         } else {
           dlg.classList.remove('date');
           // searchSelect filters as you type; pin a fixed height so a shrinking list can't
-          // resize the sheet and make it jump. Plain select stays content-sized.
+          // resize the sheet and make it jump. Plain select stays content-sized — as does
+          // the edit sheet, which shares the same peek clamp when its rows overflow.
+          // The peek runs on EVERY render pass, not just the open edge: interacting inside
+          // an edit sheet re-renders it (innerHTML rebuild), which discards the previous
+          // inline clamp — gated on `opening`, the first tap on any control visibly grew
+          // the sheet to the raw cap. Idempotent, so the repeat runs are free.
           if (dlg.querySelector('[data-select-search]')) {
             dlg.classList.add('search');
           } else {
             dlg.classList.remove('search');
-            if (opening) { scheduleSelectPeek(dlg); }
+            scheduleSelectPeek(dlg, opening);
           }
         }
       } else if (dlg.open) {
         dlg.classList.remove('search');
         dlg.classList.remove('date');
+        dlg.classList.remove('edit');
+        dlg.classList.remove('picking');
         dlg.style.bottom = '';
         dlg.style.maxHeight = '';
         dlg.style.transform = '';
@@ -971,165 +1394,47 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
         dlg.style.maxHeight = '';
       }
     }
-    // Fraction of the peek row left visible below the fold. A bit over half: enough of the last
-    // item shows to read it, while the clipped remainder still advertises "there's more — scroll".
-    var PEEK_ROW_FRACTION = 0.66;
-    // Plain select is content-sized up to the 80dvh cap. When the option list overflows, the
-    // last visible row can land flush (or as a too-thin sliver) against the sheet's bottom edge,
-    // so nothing meaningful peeks out and the sheet reads as un-scrollable. Clamp the list so its
-    // bottom edge cuts a row partway down (PEEK_ROW_FRACTION), always leaving a partial-row peek
-    // that advertises the scroll. Rows vary in height (group headers vs options), so accumulate
-    // real heights and pick the deepest row whose cut point still fits under the cap — the tallest
-    // sheet that still shows a peek. Idempotent: resets its own clamp and re-measures the clean
-    // 80dvh-capped height each call, so it's safe to run repeatedly (see scheduleSelectPeek).
-    function fitSelectPeek(dlg) {
-      if (!dlg.open || dlg.classList.contains('search')) { return; }
-      var list = dlg.querySelector('.ssel-list');
-      if (!list) { return; }
-      list.style.maxHeight = '';                  // reset → measure the clean, capped height
-      var H = list.clientHeight;
-      // Bail until the dialog is actually laid out under its cap. On a mobile webview clientHeight
-      // reads a pre-layout value right after showModal() (the whole content height, not yet capped),
-      // so scrollHeight <= H and we'd wrongly no-op — scheduleSelectPeek re-runs us once layout
-      // settles (rAF + the sheet-up animationend), when H is the real capped height and overflows.
-      if (!H || list.scrollHeight <= H + 1) { return; }
-      var rows = list.children, top = 0, target = 0, i, h, cut;
-      for (i = 0; i < rows.length; i++) {
-        h = rows[i].offsetHeight;
-        cut = top + h * PEEK_ROW_FRACTION;        // bottom edge lands here → row shown at that fraction
-        if (cut > H) { break; }                   // past the fold — the previous row is the peek
-        target = cut;                             // deepest row whose cut point still fits so far
-        top += h;
-      }
-      if (target >= 24) { list.style.maxHeight = Math.round(target) + 'px'; }
-    }
     // Run fitSelectPeek now and again after the sheet's open layout settles. The synchronous call
     // covers desktop/no-animation; the double-rAF and sheet-up animationend cover mobile webviews
     // that lay the capped dialog out a frame (or the animation) late. All runs are idempotent.
-    function scheduleSelectPeek(dlg) {
+    // `opening` gates the animationend hook: re-render calls (every render while a sheet stays
+    // open — the innerHTML rebuild drops the previous inline clamp) run on an already-settled
+    // layout, and re-adding the listener each render would stack one per interaction.
+    function scheduleSelectPeek(dlg, opening) {
       fitSelectPeek(dlg);
       if (typeof requestAnimationFrame === 'function') {
         requestAnimationFrame(function () { requestAnimationFrame(function () { fitSelectPeek(dlg); }); });
       }
+      if (!opening) { return; }
       dlg.addEventListener('animationend', function once() {
         dlg.removeEventListener('animationend', once);
         fitSelectPeek(dlg);
       });
     }
 
-    /**
-     * Center each date wheel on its selected option.
-     *
-     * @param {Object} dlg Shared dialog element.
-     * @returns {void}
-     */
-    function alignDateWheels(dlg) {
-      var wheels = dlg.querySelectorAll('[data-date-wheel]');
-      // Guard the scroll handler against the 'scroll' events these writes emit (see
-      // suppressWheelScroll). Programmatic scrolls dispatch their scroll events before the next
-      // animation frame, so clearing the flag one rAF later lets real user scrolls through again.
-      suppressWheelScroll = true;
-      for (var i = 0; i < wheels.length; i++) {
-        var selected = wheels[i].querySelector('.date-opt.on');
-        if (selected) {
-          wheels[i].scrollTop = selected.offsetTop
-            - (wheels[i].clientHeight - selected.offsetHeight) / 2;
-        }
-      }
-      if (typeof requestAnimationFrame === 'function') {
-        requestAnimationFrame(function () { suppressWheelScroll = false; });
-      } else {
-        suppressWheelScroll = false;
-      }
-    }
-
-    /**
-     * Align after layout, and once after the opening animation when first shown.
-     *
-     * @param {Object} dlg Shared dialog element.
-     * @param {boolean} opening Whether this render opened the dialog.
-     * @returns {void}
-     */
-    function scheduleDateWheelAlign(dlg, opening) {
-      // Center synchronously, before paint: render() rebuilds the wheels at scrollTop 0, and a
-      // deferred (rAF) align let them paint top-aligned for a frame or two and then jump — the
-      // reset "flash" seen on open and after every scroll settle. Reading offsetTop forces layout,
-      // so the wheels are measurable here even though showModal() just displayed the dialog.
-      alignDateWheels(dlg);
-      // One post-layout re-align as a safety net for webviews that lay the freshly shown dialog out
-      // a frame late; idempotent, so a no-op once the synchronous pass already landed.
-      if (typeof requestAnimationFrame === 'function') {
-        requestAnimationFrame(function () { alignDateWheels(dlg); });
-      }
-      if (!opening) { return; }
-      dlg.addEventListener('animationend', function once() {
-        dlg.removeEventListener('animationend', once);
-        alignDateWheels(dlg);
-      });
-    }
-
-    /**
-     * Find the wheel option nearest the visible center.
-     *
-     * @param {Object} wheel Date wheel element.
-     * @returns {?number} Nearest numeric option value.
-     */
-    function nearestDateWheelValue(wheel) {
-      var options = wheel.querySelectorAll('.date-opt');
-      var center = wheel.scrollTop + wheel.clientHeight / 2;
-      var nearest = null, distance = Infinity;
-      for (var i = 0; i < options.length; i++) {
-        var optionCenter = options[i].offsetTop + options[i].offsetHeight / 2;
-        var candidate = Math.abs(optionCenter - center);
-        if (candidate < distance) {
-          distance = candidate;
-          nearest = options[i];
-        }
-      }
-      return nearest
-        ? parseInt(nearest.getAttribute('data-date-value'), 10) : null;
-    }
-
-    /**
-     * Commit and cancel every pending date wheel before a date render or close.
-     * All selected parts are combined before clamping so the caller renders once.
-     *
-     * @returns {void}
-     */
-    function flushPendingDateScrolls() {
-      var dateKey = openDate;
-      var parts = dateKey ? parseDateParts(S[dateKey]) : null;
-      var names = ['day', 'month', 'year'];
-      var hasSelection = false;
-      for (var i = 0; i < names.length; i++) {
-        var part = names[i];
-        var pending = pendingDateScrolls[part];
-        if (!pending) { continue; }
-        clearTimeout(pending.timer);
-        delete pendingDateScrolls[part];
-        if (!parts || pending.dateKey !== dateKey) { continue; }
-        var selected = nearestDateWheelValue(pending.wheel);
-        if (selected != null) {
-          parts[part] = selected;
-          hasSelection = true;
-        }
-      }
-      if (hasSelection) { S[dateKey] = dateValueFromParts(parts); }
-    }
-
-    // Close the shared modal and return focus to the fresh trigger rendered in its place.
+        // Close the shared modal and return focus to the fresh trigger rendered in its place.
     function closeModal() {
       var selectKey = lastSelectKey;
       var dateKey = openDate;
-      flushPendingDateScrolls();
+      var editKey = lastEditSheet;
+      dateWiring.flushPending();
       openSelect = null;
       openDate = null;
+      openEdit = null;
+      // openColor is one variable serving palettes in BOTH surfaces — the tab body and an
+      // edit sheet — so clear it only when a sheet is what's closing. A palette expanded
+      // inside the sheet is going away with it (and would come back expanded on reopen);
+      // one expanded in the tab body is untouched by closing a select/date modal that
+      // happens to sit in the same card.
+      if (editKey) { openColor = null; }
       render();
       var selector = selectKey ? '[data-select="' + selectKey + '"]'
-        : dateKey ? '[data-date="' + dateKey + '"]' : null;
+        : dateKey ? '[data-date="' + dateKey + '"]'
+        : editKey ? '[data-edit-sheet="' + editKey + '"]' : null;
       var trigger = selector ? document.querySelector(selector) : null;
       if (trigger) { trigger.focus(); }
       lastSelectKey = null;
+      lastEditSheet = null;
       if (onSheetClose) {
         var cb = onSheetClose;
         onSheetClose = null;
@@ -1165,16 +1470,36 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
     function render() {
       var cx = {
         S: S, ENV: ENV, USERDATA: USERDATA, openColor: openColor,
-        openSelect: openSelect, openDate: openDate, selectQuery: selectQuery,
+        openSelect: openSelect, openDate: openDate, openEdit: openEdit,
+        selectQuery: selectQuery,
         collapsed: collapsed, evalCtx: evalCtx()
       };
       document.getElementById('tabs').innerHTML = renderTabBar(SCHEMA, activeTab, cx);
       document.getElementById('scroll').innerHTML = renderBody(SCHEMA, activeTab, cx);
-      document.getElementById('modal').innerHTML = openDate
-        ? renderDateModal(SCHEMA, cx) : renderSelectModal(SCHEMA, cx);
+      var modalEl = document.getElementById('modal');
+      var prevList = modalEl.querySelector ? modalEl.querySelector('.ssel-list') : null;
+      var keepTop = prevList ? prevList.scrollTop : 0;
+      modalEl.innerHTML = openDate
+        ? renderDateModal(SCHEMA, cx)
+        : openEdit ? renderEditModal(SCHEMA, cx) : renderSelectModal(SCHEMA, cx);
+      // The edit sheet's scroll container is a NEW node after every render, so a swatch
+      // click would otherwise snap the sheet back to the top. Restore the offset, then
+      // nudge a freshly opened palette into view. Rect math, not offsetTop (.ssel-list is
+      // not positioned, so it is not the offsetParent) and not scrollIntoView({block:…})
+      // (the options-object form is unsafe in old Android WebViews).
+      var list = (openEdit && modalEl.querySelector) ? modalEl.querySelector('.ssel-list') : null;
+      if (list) {
+        list.scrollTop = keepTop;
+        var sw = openColor ? list.querySelector('[data-color="' + openColor + '"]') : null;
+        var row = (sw && sw.closest) ? sw.closest('.row') : null;
+        if (row && row.getBoundingClientRect && list.getBoundingClientRect) {
+          var over = row.getBoundingClientRect().bottom - list.getBoundingClientRect().bottom;
+          if (over > 0) { list.scrollTop += over + 8; }
+        }
+      }
       syncDialog();
       document.getElementById('scroll').className =
-        'scroll' + (openSelect || openDate ? ' locked' : '');
+        'scroll' + (openSelect || openDate || openEdit ? ' locked' : '');
       applyTheme();
     }
 
@@ -1187,16 +1512,118 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
       document.getElementById('tabs').addEventListener('click', function (e) {
         var b = e.target.closest('[data-tab]');
         if (!b) { return; }
-        flushPendingDateScrolls();
+        dateWiring.flushPending();
         var scroll = document.getElementById('scroll');
         tabScroll[activeTab] = scroll.scrollTop;
         activeTab = b.getAttribute('data-tab');
         openColor = null;
         openSelect = null;
         openDate = null;
+        openEdit = null;
+        lastEditSheet = null;
         render();
         scroll.scrollTop = tabScroll[activeTab] || 0;
       });
+    }
+
+    // --- shared text-field wiring --- one set of live-input / pre-edit-capture / commit
+    // handlers serves BOTH #scroll and #modal: the edit sheet renders ordinary text rows
+    // inside the dialog, and they must behave exactly like their old in-card selves
+    // (S live per keystroke; onChange only on commit; repaint only on a correction).
+    // Guarded on data-k so the searchSelect's search box (data-select-search, no data-k)
+    // never writes into S.
+    var textPreEdit = {};
+    function liveTextInput(e) {
+      var inp = e.target.closest && e.target.closest('input[type=text]');
+      if (inp && inp.getAttribute('data-k') != null) { S[inp.getAttribute('data-k')] = inp.value; }
+    }
+    // The pre-edit value has to be sampled on focusin, because `input` has already
+    // overwritten S[key] by the time `change` fires (so oldValue would be the new value).
+    function captureTextPreEdit(e) {
+      var inp = e.target.closest && e.target.closest('input[type=text]');
+      if (inp && inp.getAttribute('data-k') != null) {
+        textPreEdit[inp.getAttribute('data-k')] = S[inp.getAttribute('data-k')];
+      }
+    }
+    // THE value-mutation ritual every control shares: write S, then dispatch the
+    // item's onChange as (S, old, new, ENV, key). This used to be copy-pasted at
+    // six sites across the #scroll and #modal handlers — a changed onChange
+    // contract needed six synchronized edits.
+    function setValue(key, newV, optOldV) {
+      var oldV = arguments.length > 2 ? optOldV : S[key];
+      S[key] = newV;
+      var item = findItem(key);
+      var fn = item && item.onChange && PConf.onChange.get(item.onChange);
+      if (fn) { fn(S, oldV, newV, ENV, key); }
+    }
+
+    // The delegated control cases #scroll and the edit sheet share — ONE matcher,
+    // so "which controls work inside the sheet" stops being an implicit
+    // hand-curated duplicate of #scroll's list. Returns true when handled.
+    // (The two hosts used to check these in different orders; no element matches
+    // two of the selectors — data-action rides button rows, .lbl-act and
+    // .txt-act-btn, none nested in toggle/data-v/color controls — so one
+    // canonical order serves both.)
+    function controlClick(e) {
+      var t;
+      if ((t = e.target.closest('[data-max-edit]'))) { rangeWiring.openMaxEdit(t); return true; }
+      if ((t = e.target.closest('[data-toggle]'))) {
+        // Toggles fire their onChange like any other control (e.g. thresholdToggle
+        // seeding/blanking a kind's warn+danger pair).
+        var tgK = t.getAttribute('data-k');
+        setValue(tgK, !S[tgK]);
+        render(); return true;
+      }
+      if ((t = e.target.closest('[data-color-pick]'))) {
+        setValue(t.getAttribute('data-k'), t.getAttribute('data-color-pick'));
+        openColor = null; render(); return true;
+      }
+      if ((t = e.target.closest('[data-color]'))) {
+        var ck = t.getAttribute('data-color');
+        openColor = (openColor === ck ? null : ck); render(); return true;
+      }
+      if ((t = e.target.closest('[data-v]'))) {
+        setValue(t.getAttribute('data-k'), t.getAttribute('data-v'));
+        render(); return true;
+      }
+      if ((t = e.target.closest('[data-action]'))) {
+        var act = t.getAttribute('data-action');
+        // Actions receive (arg, S, ENV, defaultAsStored); returning true asks for
+        // a re-render (e.g. resetThresholds rewrites several keys). Legacy
+        // actions ignore all of it.
+        if (PConf.actions[act]
+            && PConf.actions[act](t.getAttribute('data-action-arg'), S, ENV, defaultAsStored) === true) {
+          render();
+        }
+        return true;
+      }
+      return false;
+    }
+
+    // A text item's onChange hook fires on COMMIT (change = blur / Enter), not on the
+    // per-keystroke `input` above: a hook that rejects a value by reverting it (e.g.
+    // validateThresholdPair) would otherwise fight the user mid-typing — "100" can't be
+    // typed if the interim "1" is momentarily invalid.
+    function commitTextChange(e) {
+      var inp = e.target.closest && e.target.closest('input[type=text]');
+      if (!inp || inp.getAttribute('data-k') == null) { return; }
+      var tk = inp.getAttribute('data-k'), newV = inp.value;
+      var tItem = findItem(tk);
+      var onChangeFn = tItem && tItem.onChange && PConf.onChange.get(tItem.onChange);
+      if (!onChangeFn) { S[tk] = newV; return; }
+      // No focusin seen (programmatic value + change): fall back to the new value so a
+      // revert is a no-op rather than restoring something that was never in the field.
+      var oldV = Object.prototype.hasOwnProperty.call(textPreEdit, tk)
+        ? textPreEdit[tk] : newV;
+      delete textPreEdit[tk];
+      setValue(tk, newV, oldV);
+      // Repaint ONLY when the hook actually corrected the value: a correction has
+      // to become visible (focus has already left the field). On the common
+      // accepted-value path the input already shows what the user typed, and an
+      // unconditional render() here would swallow their next tap — in a webview
+      // focus moves on mousedown, so `change` fires BEFORE mouseup, and replacing
+      // the subtree's innerHTML detaches the node the click was about to land on.
+      if (S[tk] !== newV) { render(); }
     }
 
     // Scroll body: click (control interactions incl. opening a select/searchSelect,
@@ -1205,10 +1632,21 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
       var scroll = document.getElementById('scroll');
       scroll.addEventListener('click', function (e) {
         var t;
+        if ((t = e.target.closest('[data-edit-sheet]'))) {
+          var ek = t.getAttribute('data-edit-sheet');
+          dateWiring.flushPending();
+          openSelect = null;
+          openDate = null;
+          lastSelectKey = null;
+          openEdit = ek;
+          lastEditSheet = ek;
+          render();
+          return;
+        }
         if ((t = e.target.closest('[data-select]'))) {
           var sk = t.getAttribute('data-select');
           if (openSelect === sk) { closeModal(); return; }
-          flushPendingDateScrolls();
+          dateWiring.flushPending();
           openDate = null;
           openSelect = sk;
           selectQuery = '';
@@ -1220,33 +1658,23 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
         if ((t = e.target.closest('[data-date]'))) {
           var dk = t.getAttribute('data-date');
           if (openDate === dk) { closeModal(); return; }
-          flushPendingDateScrolls();
+          dateWiring.flushPending();
           openSelect = null;
           lastSelectKey = null;
           openDate = dk;
           render();
           return;
         }
-        if ((t = e.target.closest('[data-toggle]'))) { S[t.getAttribute('data-k')] = !S[t.getAttribute('data-k')]; render(); return; }
-        if ((t = e.target.closest('[data-color-pick]'))) { S[t.getAttribute('data-k')] = t.getAttribute('data-color-pick'); openColor = null; render(); return; }
-        if ((t = e.target.closest('[data-color]'))) { var k = t.getAttribute('data-color'); openColor = (openColor === k ? null : k); render(); return; }
-        if ((t = e.target.closest('[data-v]'))) {
-          var vk = t.getAttribute('data-k'), oldV = S[vk], newV = t.getAttribute('data-v');
-          S[vk] = newV;
-          var vItem = findItem(vk);
-          var onChangeFn = vItem && vItem.onChange && PConf.onChange.get(vItem.onChange);
-          if (onChangeFn) { onChangeFn(S, oldV, newV, ENV, vk); }
-          render();
-          return;
-        }
         if ((t = e.target.closest('[data-coll]'))) { var sid = t.getAttribute('data-coll'); collapsed[sid] = !collapsed[sid]; render(); return; }
         if ((t = e.target.closest('[data-copy]'))) { copyText(t.getAttribute('data-copy')); return; }
-        if ((t = e.target.closest('[data-action]'))) { var act = t.getAttribute('data-action'); if (PConf.actions[act]) { PConf.actions[act](); } return; }
+        // Everything else a tab body can host is a shared control case.
+        controlClick(e);
       });
-      scroll.addEventListener('input', function (e) {
-        var inp = e.target.closest('input[type=text]');
-        if (inp) { S[inp.getAttribute('data-k')] = inp.value; }
-      });
+      scroll.addEventListener('input', liveTextInput);
+      scroll.addEventListener('focusin', captureTextPreEdit);
+      scroll.addEventListener('change', commitTextChange);
+      scroll.addEventListener('focusout', rangeWiring.commitMaxEdit);
+      rangeWiring.wireRangeEvents(scroll);
     }
 
     // The #modal overlay lives outside #scroll, so it needs its own delegated handlers:
@@ -1264,20 +1692,23 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
           if (onChangeFn) { onChangeFn(S, oldV, newV, ENV, k); }
           closeModal(); return;
         }
+        // Edit-sheet controls: the sheet renders ordinary rows inside the dialog,
+        // so the SAME shared control cases #scroll dispatches must work here —
+        // one matcher (controlClick) instead of a hand-curated duplicate list.
+        // render() repaints the dialog's innerHTML in place (openEdit is
+        // unchanged), so the sheet stays open throughout. The openEdit gate keeps
+        // clicks inside date/select sheets out of the control cases.
+        if (openEdit && e.target.closest && controlClick(e)) { return; }
         if (e.target.closest && (t = e.target.closest('.date-opt')) && openDate) {
           var wheel = t.closest('[data-date-wheel]');
           if (!wheel) { return; }
           var dateKey = openDate;
-          flushPendingDateScrolls();
+          dateWiring.flushPending();
           var parts = parseDateParts(S[dateKey]);
           parts[wheel.getAttribute('data-date-wheel')] =
             parseInt(t.getAttribute('data-date-value'), 10);
           S[dateKey] = dateValueFromParts(parts);
           render();
-          return;
-        }
-        if (e.target.closest && e.target.closest('[data-date-close]')) {
-          closeModal();
           return;
         }
         // Backdrop light-dismiss: a ::backdrop click targets the dialog element itself.
@@ -1289,6 +1720,12 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
       // Escape fires the dialog's native `cancel`; route it through closeModal (the single
       // close path via render → syncDialog) instead of letting the dialog self-close.
       modal.addEventListener('cancel', function (e) { e.preventDefault(); closeModal(); });
+      // Edit-sheet text fields (warn/danger thresholds …) get the same live-input /
+      // pre-edit / commit path as #scroll's text rows; liveTextInput's data-k guard
+      // keeps the searchSelect's search box out of S.
+      modal.addEventListener('input', liveTextInput);
+      modal.addEventListener('focusin', captureTextPreEdit);
+      modal.addEventListener('change', commitTextChange);
       modal.addEventListener('input', function (e) {
         var sb = e.target.closest('[data-select-search]');
         if (!sb) { return; }
@@ -1300,41 +1737,35 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
           list.innerHTML = renderSelectOptions(item, S[sk], selectQuery, resolveRecommended(item, S, ENV));
         }
       });
-      modal.addEventListener('scroll', function (e) {
-        if (suppressWheelScroll) { return; }   // ignore our own alignment scrolls; see the flag's decl
-        var wheel = e.target.closest && e.target.closest('[data-date-wheel]');
-        if (!wheel || !openDate) { return; }
-        var part = wheel.getAttribute('data-date-wheel');
-        if (part !== 'day' && part !== 'month' && part !== 'year') { return; }
-        var dateKey = openDate;
-        var previous = pendingDateScrolls[part];
-        if (previous) { clearTimeout(previous.timer); }
-        var pending = { dateKey: dateKey, wheel: wheel, timer: null };
-        pendingDateScrolls[part] = pending;
-        pending.timer = setTimeout(function () {
-          if (pendingDateScrolls[part] !== pending
-              || openDate !== pending.dateKey) { return; }
-          flushPendingDateScrolls();
-          render();
-        }, 120);
-      }, true);
+      // The wheel settle/commit lives with the date picker (createDateWiring).
+      modal.addEventListener('scroll', dateWiring.onModalScroll, true);
       // Swipe-down-to-dismiss: only arms when the list is already at the top, so a downward
       // swipe mid-list still scrolls the list. Once armed, dragging down follows the finger
       // (translateY) and closes past a threshold; a shorter drag snaps back.
       var dragY = null, dragging = false;
       modal.addEventListener('touchstart', function (e) {
+        // A touch that lands on a slider is a value adjustment, never a sheet
+        // dismissal — arming here would drag the whole sheet along with every
+        // slightly-diagonal thumb gesture (and close it past the threshold). Same
+        // for an open palette: it is a grid of tap targets, and with the raised
+        // .picking cap the list often still sits at scrollTop 0, which is exactly
+        // what canDragSelect below arms on.
+        if (e.target.closest && e.target.closest('.rng, .palette')) {
+          dragY = null; dragging = false; modal.style.transition = '';
+          return;
+        }
         var list = modal.querySelector('.ssel-list');
         var wheel = e.target.closest && e.target.closest('[data-date-wheel]');
         var header = e.target.closest && e.target.closest('.ssel-modal-hdr');
         var canDragDate = Boolean(openDate
           && (header || (wheel && wheel.scrollTop <= 0)));
-        var canDragSelect = Boolean(openSelect && list && list.scrollTop <= 0);
+        var canDragSelect = Boolean((openSelect || openEdit) && list && list.scrollTop <= 0);
         dragY = (canDragDate || canDragSelect) ? e.touches[0].clientY : null;
         dragging = false;
         modal.style.transition = '';
       }, { passive: true });
       modal.addEventListener('touchmove', function (e) {
-        if (dragY == null) { return; }
+        if (dragY == null || rangeWiring.isDragging()) { return; }
         var dy = e.touches[0].clientY - dragY;
         if (dy <= 0) { if (dragging) { modal.style.transform = ''; dragging = false; } return; }
         dragging = true;
@@ -1348,6 +1779,10 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
         }
         dragY = null; dragging = false;
       }, { passive: true });
+      // Threshold sliders live in the edit sheet: the same shared range drag/keyboard
+      // handlers (and the scale-max commit) #scroll carries must work here too.
+      modal.addEventListener('focusout', rangeWiring.commitMaxEdit);
+      rangeWiring.wireRangeEvents(modal);
     }
 
     // Copy `text` to the clipboard from a [data-copy] control. Prefer the async Clipboard API (works
@@ -1411,7 +1846,7 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
       // which lives in its own overlay: the sheet is a showModal() top-layer dialog, so it renders
       // above that overlay. The engine sets S[key] on pick; onClose fires after any close.
       openSheet: function (key, onClose) {
-        flushPendingDateScrolls();
+        dateWiring.flushPending();
         openDate = null;
         openSelect = key;
         selectQuery = '';
@@ -1431,11 +1866,17 @@ var PConf = (typeof PConf !== 'undefined') ? PConf
     serialize: serialize, hydrate: hydrate, boot: boot, initialCollapsed: initialCollapsed,
     esc: esc, renderControl: renderControl, renderRow: renderRow, renderSelectOptions: renderSelectOptions,
     renderSelectModal: renderSelectModal, renderDateModal: renderDateModal,
+    renderEditModal: renderEditModal,
     formatDateValue: formatDateValue, parseDateParts: parseDateParts,
     dateValueFromParts: dateValueFromParts,
+    parseRange: parseRange, formatRange: formatRange,
+    snapToStep: snapToStep, moveThumb: moveThumb, renderRange: renderRange,
+    thresholdValues: thresholdValues, resolveRangeItem: resolveRangeItem,
+    paintThresholdRange: paintThresholdRange,
     renderTabBar: renderTabBar, renderBody: renderBody, resolveOptionsFrom: resolveOptionsFrom,
     resolveDefaultFrom: resolveDefaultFrom,
-    resolveTheme: resolveTheme
+    resolveTheme: resolveTheme,
+    fitSelectPeek: fitSelectPeek
   };
 })();
 if (typeof module !== 'undefined' && module.exports) {
@@ -1447,12 +1888,22 @@ if (typeof module !== 'undefined' && module.exports) {
     renderSelectOptions: PConf.engine.renderSelectOptions,
     renderSelectModal: PConf.engine.renderSelectModal,
     renderDateModal: PConf.engine.renderDateModal,
+    renderEditModal: PConf.engine.renderEditModal,
     formatDateValue: PConf.engine.formatDateValue,
     parseDateParts: PConf.engine.parseDateParts,
     dateValueFromParts: PConf.engine.dateValueFromParts,
+    parseRange: PConf.engine.parseRange, formatRange: PConf.engine.formatRange,
+    snapToStep: PConf.engine.snapToStep, moveThumb: PConf.engine.moveThumb,
+    renderRange: PConf.engine.renderRange,
+    thresholdValues: PConf.engine.thresholdValues,
+    resolveRangeItem: PConf.engine.resolveRangeItem,
+    paintThresholdRange: PConf.engine.paintThresholdRange,
+    rangeResolvers: PConf.rangeResolvers, badgeResolvers: PConf.badgeResolvers,
+    displayResolvers: PConf.displayResolvers,
     renderTabBar: PConf.engine.renderTabBar, renderBody: PConf.engine.renderBody,
     resolveOptionsFrom: PConf.engine.resolveOptionsFrom,
     resolveDefaultFrom: PConf.engine.resolveDefaultFrom,
-    resolveTheme: PConf.engine.resolveTheme
+    resolveTheme: PConf.engine.resolveTheme,
+    fitSelectPeek: PConf.engine.fitSelectPeek
   };
 }

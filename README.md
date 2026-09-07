@@ -18,14 +18,15 @@ A weather watchface for Pebble inspired by ForecasWatch2, with a 24-hour forecas
 
 | Pebble Time                                                                                       | Pebble 2 Duo                                                                                       | Pebble Time 2                                                                                      |
 |---------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------|
-| <img src="screenshot/v1.8.0/showcase/basalt-showcase.gif" alt="Pebble Time showcase"> | <img src="screenshot/v1.8.0/showcase/flint-showcase.gif" alt="Pebble 2 Duo showcase"> | <img src="screenshot/v1.8.0/showcase/emery-showcase.gif" alt="Pebble Time 2 showcase"> |
+| <img src="screenshot/v1.11.0/showcase/basalt-showcase.gif" alt="Pebble Time showcase"> | <img src="screenshot/v1.11.0/showcase/flint-showcase.gif" alt="Pebble 2 Duo showcase"> | <img src="screenshot/v1.11.0/showcase/emery-showcase.gif" alt="Pebble Time 2 showcase"> |
 
 ## Features
 
 **Forecast**
 * 24-hour forecast with a temperature line and configurable, battery-friendly updates
-* Configurable metrics such as precipitation, UV index, gusts, and wind
+* Configurable metrics such as precipitation, UV index, gusts, wind, air pressure, and feels-like temperature (drawn as a muted second line on the temperature scale)
 * Optional day/night shading
+* Recolor the forecast graph per metric
 * Multiple weather providers, including regional and worldwide sources
 
 **Rain radar**
@@ -35,14 +36,16 @@ A weather watchface for Pebble inspired by ForecasWatch2, with a 24-hour forecas
 
 **Health view** *(requires a health-capable watch; heart rate needs a heart-rate sensor)*
 * Health status for steps, sleep, distance, and heart rate
-* Last-24h health chart with steps per hour, heart rate, and a sleep band
+* Last-24h health chart with steps per hour, heart rate on a scale you set, and a sleep band
 
 **Calendar**
 * Multi-week calendar with current-day highlight
 * Selectable start of week and customizable highlights for weekends and holidays (150+ countries)
 
 **Status lines**
-* Configurable status slots on every view: fill each slot from a catalog of metrics — weather, air quality, pollen, wind, health, battery, a countdown to any date, and more
+* Configurable status slots on every view: fill each slot from a catalog of metrics — weather, dew point, air quality, pollen, wind, health, watch battery (glyph or percentage), phone battery, a countdown to any date, and more
+* Selectable date format for the date slot — German/European, US, ISO, and spelled-out-month styles, chosen separately for calendar views (month + year) and no-calendar views (full date)
+* Threshold highlighting: bold, outline, or fill a status slot when a metric crosses a warn or danger level you set
 
 **Watchface themes**
 * Dark and Light, plus Black & White options on color watches
@@ -50,14 +53,12 @@ A weather watchface for Pebble inspired by ForecasWatch2, with a 24-hour forecas
 **Watch**
 * Custom color, 12h/24h, optional AM/PM
 * Battery, Bluetooth, quiet time, and vibrate-on-disconnect indicators
-* Night battery saver (battery-saving weather update pause)
+* Night battery saver (pause updates to the watch overnight to save battery)
 
 **Layout customization**
 * Multiple layout presets, with flick-to-cycle between views and optional auto-return
-* Dense compact layout shows a Radar or Health status row alongside the forecast on the default view, no flicking needed
-* Swap clock and status row option, moving the status line next to the forecast
 * Light/Dark settings page with grouped, easy-to-browse pickers
-* First-run setup wizard that picks sensible defaults for your country
+* First-run setup wizard that picks sensible defaults for your country and watch — it bolds the rows you read first, gives air quality a warn outline, and puts steps on the top row when your watch has health
 
 *Weather and radar data from [MET Norway](https://www.met.no/) is used under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).*
 
@@ -67,8 +68,11 @@ Two things that both involve rain over time, but answer different questions:
 
 - **Forecast graph** — the hourly prediction, looking up to 24 hours ahead. Temperature is
   always shown; on top of it you choose what to add — precipitation %, wind speed, wind gusts,
-  or UV index as a main metric (solid line) and an optional second metric (drawn as bar-aligned square dots;
-  the same metric can't appear on both), plus optional bars for the hourly rain amount.
+  UV index, air pressure (sea-level, in hPa, with a Narrow/Mid/Wide graph scale), or feels-like
+  temperature (drawn muted on the same scale as the temperature curve) as a main
+  metric (solid line) and an optional second metric (drawn as bar-aligned square dots; the same
+  metric can't appear on both), plus optional bars for the hourly rain amount. The temperature
+  status slot can also show the feels-like value, or both as `12/10`.
 - **Rain radar** — unlike the forecast graph's model prediction, this is a short-term nowcast
   based on actual radar measurements moving toward you, refreshed often as new scans arrive.
   Instead of a map it's drawn as bars: the provider's radar images for the next 2 hours are
@@ -79,7 +83,7 @@ Two things that both involve rain over time, but answer different questions:
 
 ## Platforms
 
-Pebble Classic, Pebble Steel, Pebble Time, Pebble Time Steel, Pebble 2, and Pebble Time 2 are supported.
+Pebble Classic, Pebble Steel, Pebble Time, Pebble Time Steel, Pebble 2, Pebble 2 Duo, and Pebble Time 2 are supported.
 
 ## Installation
 

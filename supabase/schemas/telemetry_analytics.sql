@@ -93,7 +93,14 @@ create index telemetry_errors_provider_idx on public.telemetry_errors (provider,
 -- Daily rollup + prune. Idempotent (safe to re-run / catch up). Rolls up
 -- BEFORE pruning so a completed day is never deleted before it is captured.
 create or replace function public.telemetry_rollup_and_prune(
-  p_raw_retention_days integer default 14,
+  -- 7, down from 14 (2026-09-07): the DAU rebuild's lateral join grows with the
+  -- raw row count, and at ~95k rows (≈14 days) it crossed the cron's statement
+  -- timeout — the job then failed nightly, nothing pruned, and the DB ran into
+  -- the 500 MB plan limit. Half the window keeps steady-state raw (~50-60k
+  -- rows) well under the knife edge. If the nightly run ever times out again
+  -- at 7 days, the fix is the QUERY (index the watch_key expression, or swap
+  -- the lateral for DISTINCT ON), not a shorter window.
+  p_raw_retention_days integer default 7,
   p_error_retention_days integer default 49,
   p_prune boolean default true
 )

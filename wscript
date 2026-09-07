@@ -151,6 +151,20 @@ def build(ctx):
         # drop out and --gc-sections reaps the rest. Mirrors WW_RAIN_RADAR / WW_QUICK_VIEW.
         if platform != 'aplite':
             ctx.env.CFLAGS += ['-DWW_VIEW_CYCLE=1']
+        # Clock ink centring is compiled out of aplite. windows/layout.c seats the clock by
+        # SOLVING for optical symmetry against its neighbours' ink, which needs the active time
+        # font's measured ink handed in (layers/clock_ink.h). Hand-porting the solver into the
+        # lean twin measured +380 B, and even reduced to plumbing the metric through and
+        # applying it as a one-line font correction it measured +76 B — against 44 B of headroom
+        # under the 21804 B launch guard. So aplite keeps the fixed, Roboto-tuned anchors its
+        # twin was always built on: LayoutMetrics carries no clock field there, clock_ink.c does
+        # not link, and layout_aplite.c never sees the metric. The visible cost is that aplite's
+        # two non-default time fonts (Leco, Bitham) keep the 2-4 px lean every 144px watch had
+        # before this change; Roboto, the default, is pixel-identical either way. Every other
+        # platform defines WW_CLOCK_INK. Mirrors WW_THRESHOLD_HIGHLIGHT below, excluded for the
+        # same trigger.
+        if platform != 'aplite':
+            ctx.env.CFLAGS += ['-DWW_CLOCK_INK=1']
         # Theme polarity (the light / B&W-Inverted axis) is compiled out of aplite:
         # the 2026-07 theme sweep grew the aplite image past the ~22.06 KB launch
         # ceiling (the whole image loads into the fixed 24 KB app RAM and the loader
@@ -161,6 +175,30 @@ def build(ctx):
         # diorite/flint (also B&W) keep both polarities. Mirrors WW_RAIN_RADAR above.
         if platform != 'aplite':
             ctx.env.CFLAGS += ['-DWW_THEME_POLARITY=1']
+        # Status-slot threshold highlighting (warn outline / danger fill) is compiled
+        # out of aplite: aplite paints its status rows from the frozen lean twin
+        # layers/status_row_aplite.c, which carries no threshold code at all, so the
+        # shared contract module plus its persist/AppMessage plumbing linked in as pure
+        # dead weight — and the 2026-07 feature pushed the aplite image past its
+        # 21800 B launch guard (22148 B, +348). Every other platform defines
+        # WW_THRESHOLD_HIGHLIGHT; aplite lacks it, so the guarded call sites in
+        # app_message.c drop out and --gc-sections reaps appendix/status_threshold.c
+        # together with the two persist accessors. The persist key IDs themselves
+        # (STATUS_LEVELS = 43, THRESHOLD_SETTINGS = 44) stay in persist.c's enum on
+        # every platform — the slots are append-only on-flash IDs. Mirrors
+        # WW_FETCH_NOTICE above, which was excluded for the same trigger.
+        if platform != 'aplite':
+            ctx.env.CFLAGS += ['-DWW_THRESHOLD_HIGHLIGHT=1']
+        # Configurable forecast curve insets (CLAY_CURVE_INSET_UINT8): the phone
+        # sends render-ready per-series vertical insets so temperature and a
+        # feels-like metric line share one pixel mapping. aplite keeps its frozen
+        # constant insets (temp 7 px, metric channels full-height) — feels-like is
+        # not offered there — so the persist accessors and the app_message handler
+        # are guarded away and --gc-sections reaps the rest. The CURVE_INSETS
+        # persist key ID stays in persist.c's enum on every platform — the slots
+        # are append-only on-flash IDs. Mirrors WW_THRESHOLD_HIGHLIGHT above.
+        if platform != 'aplite':
+            ctx.env.CFLAGS += ['-DWW_CURVE_INSET=1']
         if enable_memory_logging:
             ctx.env.CFLAGS += ['-DWW_ENABLE_MEMORY_LOGGING=1']
         if fixture_now:

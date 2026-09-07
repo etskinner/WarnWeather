@@ -1,10 +1,38 @@
 {
   "name": "warnweather",
   "author": "Toasbi",
-  "version": "1.9.3",
+  "version": "1.15.3",
   "buildProfile": "{{buildProfile}}",
   "keywords": [
-    "pebble-app"
+    "pebble-app",
+    "watchface",
+    "weather",
+    "forecast",
+    "rain",
+    "radar",
+    "nowcast",
+    "calendar",
+    "health",
+    "steps",
+    "sleep",
+    "heart rate",
+    "temperature",
+    "wind",
+    "uv index",
+    "air quality",
+    "pollen",
+    "air pressure",
+    "sunrise sunset",
+    "battery",
+    "customization",
+    "customizable",
+    "themes",
+    "status bar",
+    "countdown",
+    "dew point",
+    "feels like",
+    "dwd",
+    "yandex"
   ],
   "private": true,
   "dependencies": {
@@ -143,6 +171,17 @@
         },
         {
           "type": "raw",
+          "name": "STATUS_TEMP_SMALL",
+          "file": "data/STATUS_TEMP_SMALL.pdc",
+          "targetPlatforms": [
+            "basalt",
+            "diorite",
+            "emery",
+            "flint"
+          ]
+        },
+        {
+          "type": "raw",
           "name": "STATUS_UV",
           "file": "data/STATUS_UV.pdc",
           "targetPlatforms": [
@@ -211,6 +250,39 @@
           "type": "raw",
           "name": "STATUS_COUNTDOWN",
           "file": "data/STATUS_COUNTDOWN.pdc",
+          "targetPlatforms": [
+            "basalt",
+            "diorite",
+            "emery",
+            "flint"
+          ]
+        },
+        {
+          "type": "raw",
+          "name": "STATUS_DEW",
+          "file": "data/STATUS_DEW.pdc",
+          "targetPlatforms": [
+            "basalt",
+            "diorite",
+            "emery",
+            "flint"
+          ]
+        },
+        {
+          "type": "raw",
+          "name": "STATUS_PHONE_BATTERY",
+          "file": "data/STATUS_PHONE_BATTERY.pdc",
+          "targetPlatforms": [
+            "basalt",
+            "diorite",
+            "emery",
+            "flint"
+          ]
+        },
+        {
+          "type": "raw",
+          "name": "STATUS_PHONE_BATTERY_CHG",
+          "file": "data/STATUS_PHONE_BATTERY_CHG.pdc",
           "targetPlatforms": [
             "basalt",
             "diorite",
@@ -298,7 +370,15 @@
       "STATUS_LINE_4_UINT8",
       "CLAY_BATTERY_LOW_ONLY",
       "CLAY_DATE_MONTH_FIRST",
-      "NOTICE_TEXT"
+      "NOTICE_TEXT",
+      "STATUS_LEVELS_UINT8",
+      "CLAY_THRESHOLDS_UINT8",
+      "CLAY_HR_SCALE",
+      "CLAY_NORAIN_TEXT",
+      "CLAY_CURVE_INSET_UINT8",
+      "CLAY_LINE_STYLE_UINT8",
+      "CLAY_LARGE_GRAPH_FONT",
+      "CLAY_DATE_FORMAT_UINT8"
     ]
   }
 }
