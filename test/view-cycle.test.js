@@ -167,6 +167,27 @@ test('resolvePresetKey migrates pre-preset installs (topViewMode only)', () => {
   assert.strictEqual(vc.resolvePresetKey({}), 'compactCal');
 });
 
+test("resolvePresetKey folds 'custom' to the EXPLICIT compactCal — legacy topViewMode must not redirect it", () => {
+  assert.strictEqual(vc.resolvePresetKey({ layoutPreset: 'custom' }), 'compactCal');
+  assert.strictEqual(vc.resolvePresetKey({ layoutPreset: 'custom', topViewMode: 'full' }), 'compactCal');
+  assert.strictEqual(vc.resolvePresetKey({ layoutPreset: 'custom', topViewMode: 'none' }), 'compactCal');
+});
+
+test('seedCustomKeys copies the leaving preset once and latches; preset re-picks leave keys dormant', () => {
+  const S = { healthMode: 'status', radarMode: 'graph', swapClockStatus: false, layoutPreset: 'custom' };
+  vc.seedCustomKeys(S, 'fullCal');
+  assert.equal(S.customLayoutSeeded, true);
+  assert.equal(S.viewCount, '3', 'fullCal+status+graph compiles a 3-view cycle');
+  assert.equal(S.viewTop0, 'cal3');
+  // Seeded keys compile back byte-identical to the preset cycle (zero-transmit).
+  const preset = vc.buildViewCycle('fullCal', 'status', 'graph', false).map(vc.packSpec);
+  assert.deepStrictEqual(vc.buildCustomCycle(S).map(vc.packSpec), preset);
+  // Latched: a second entry (after the user customized) must NOT re-seed.
+  S.viewTop0 = 'none';
+  vc.seedCustomKeys(S, 'compactCal');
+  assert.equal(S.viewTop0, 'none', 'custom work survives re-entering Custom');
+});
+
 test("radar 'countdown' mode uses the same cycle as 'off' (no radar flick view)", () => {
   ['fullCal', 'compactCal', 'compactDense', 'noCal'].forEach((p) => {
     ['off', 'status', 'all'].forEach((h) => {
@@ -192,4 +213,189 @@ test('packSpec fits in 10 bits and 0 decodes to null (disabled slot)', () => {
     vc.STATUS_SRC_HEALTH, vc.STATUS_SRC_FORECAST)) < 1024);
   assert.equal(vc.unpackSpec(0), null);
   assert.equal(vc.packSpec(null), 0);
+});
+
+// --- custom-layout wire fields: clockOff (bit 10), stripOff (bit 11), order (bits 12-15) ---
+
+function flagged(clockOff, stripOff, order) {
+  const s = vc.spec(vc.TIER_COMPACT, vc.TOP_CAL, vc.BODY_FC,
+    vc.STATUS_SRC_FORECAST, vc.STATUS_SRC_NONE);
+  if (clockOff) { s.clockOff = true; }
+  if (stripOff) { s.stripOff = true; }
+  if (order) { s.order = order; }
+  return s;
+}
+
+test('packSpec places clockOff/stripOff/order in bits 10/11/12-15', () => {
+  const base = vc.packSpec(flagged(false, false, 0));
+  assert.equal(vc.packSpec(flagged(true, false, 0)), base | 0x400);
+  assert.equal(vc.packSpec(flagged(false, true, 0)), base | 0x800);
+  assert.equal(vc.packSpec(flagged(false, false, 11)), base | (11 << 12));
+  assert.equal(vc.packSpec(flagged(true, true, 15)), base | 0x400 | 0x800 | (15 << 12));
+});
+
+test('packSpec/unpackSpec round-trips the custom fields in canonical form', () => {
+  [flagged(true, false, 0), flagged(false, true, 0), flagged(true, true, 7),
+   flagged(false, false, 11), flagged(true, true, 15)].forEach((s) => {
+    assert.deepEqual(vc.unpackSpec(vc.packSpec(s)), s);
+  });
+  // Unset fields stay ABSENT after a round-trip (canonical form), so legacy
+  // 10-bit values decode to exactly the pre-custom spec shape.
+  const legacy = vc.unpackSpec(0x244);
+  assert.ok(!('clockOff' in legacy) && !('stripOff' in legacy) && !('order' in legacy));
+});
+
+test('bit-15 orders pack above 0x7FFF (negative int16 on the wire) without corruption', () => {
+  const v = vc.packSpec(flagged(false, false, 8));
+  assert.ok(v > 0x7FFF, 'order 8 sets bit 15');
+  assert.deepEqual(vc.unpackSpec(v), flagged(false, false, 8));
+});
+
+// The upgrade no-op guarantee: NO preset compile, under ANY mode combination or
+// transform, may ever set bits 10-15 — presets must pack byte-identically to
+// pre-custom builds so upgrades transmit nothing.
+test('presets never carry the custom bits (full matrix sweep)', () => {
+  ['fullCal', 'compactCal', 'compactDense', 'noCal'].forEach((p) =>
+    ['off', 'slot', 'status', 'all'].forEach((h) =>
+      ['off', 'countdown', 'status', 'graph'].forEach((r) =>
+        [false, true].forEach((sw) => {
+          bytes(p, h, r, sw).forEach((v) => {
+            assert.equal(v & 0xFC00, 0,
+              p + '/' + h + '/' + r + '/' + sw + ' leaked custom bits: 0x' + v.toString(16));
+          });
+        }))));
+});
+
+// ── Custom compiler (buildCustomCycle / specToKeys) ──────────────────────────
+
+// THE upgrade-safety proof: entering Custom seeds the per-view keys from the compiled
+// preset cycle, and an untouched Custom session must compile back to BYTE-IDENTICAL
+// packed values — so the change-detector transmits nothing on mode entry.
+test('specToKeys ∘ buildViewCycle round-trips byte-identical for every preset cell', () => {
+  ['fullCal', 'compactCal', 'compactDense', 'noCal'].forEach((p) =>
+    ['off', 'slot', 'status', 'all'].forEach((h) =>
+      ['off', 'countdown', 'status', 'graph'].forEach((r) =>
+        [false, true].forEach((sw) => {
+          const cycle = vc.buildViewCycle(p, h, r, sw);
+          const S = Object.assign({ healthMode: h, radarMode: r }, vc.specToKeys(cycle));
+          const rebuilt = vc.buildCustomCycle(S);
+          assert.deepStrictEqual(rebuilt.map(vc.packSpec), cycle.map(vc.packSpec),
+            p + '/' + h + '/' + r + '/' + sw);
+        }))));
+});
+
+test('buildCustomCycle: slot 0 never carries clockOff/stripOff; flicks do', () => {
+  const S = {
+    viewCount: '2', healthMode: 'off', radarMode: 'off',
+    viewTop0: 'cal2', viewBody0: 'forecast', viewUpper0: 'weather', viewLower0: 'off', viewOrder0: 'TACB',
+    viewTop1: 'none', viewBody1: 'forecast', viewUpper1: 'off', viewLower1: 'off', viewOrder1: 'TACB',
+    viewClockOff0: true, viewStripOff0: true,   // hostile: must be ignored
+    viewClockOff1: true, viewStripOff1: true,
+  };
+  const packed = vc.buildCustomCycle(S).map(vc.packSpec);
+  assert.equal(packed[0] & 0xC00, 0, 'default view keeps clock + top bar');
+  assert.equal(packed[1] & 0xC00, 0xC00, 'flick view carries both flags');
+});
+
+test('buildCustomCycle: capability folds mirror the watch resolve', () => {
+  const base = {
+    viewCount: '1',
+    viewTop0: 'radar', viewBody0: 'radar', viewUpper0: 'radar', viewLower0: 'health',
+    viewOrder0: 'TACB',
+  };
+  // radarMode 'status': chart seats fold (top->cal3, body->forecast), the radar ROW stays.
+  let c = vc.buildCustomCycle(Object.assign({ radarMode: 'status', healthMode: 'all' }, base));
+  assert.equal(c[0].top, vc.TOP_CAL);
+  assert.equal(c[0].tier, vc.TIER_FULL);
+  assert.equal(c[0].body, vc.BODY_FC);
+  assert.equal(c[0].statusUpper, vc.STATUS_SRC_RADAR);
+  assert.equal(c[0].statusLower, vc.STATUS_SRC_HEALTH);
+  // radarMode 'countdown': the radar row folds too; healthMode 'slot' folds health rows.
+  c = vc.buildCustomCycle(Object.assign({ radarMode: 'countdown', healthMode: 'slot' }, base));
+  assert.equal(c[0].statusUpper, vc.STATUS_SRC_NONE);
+  assert.equal(c[0].statusLower, vc.STATUS_SRC_NONE);
+  // healthMode 'status': health graph body folds to forecast, health row survives.
+  c = vc.buildCustomCycle({
+    viewCount: '1', radarMode: 'off', healthMode: 'status',
+    viewTop0: 'cal2', viewBody0: 'health', viewUpper0: 'health', viewLower0: 'off', viewOrder0: 'TACB',
+  });
+  assert.equal(c[0].body, vc.BODY_FC);
+  assert.equal(c[0].statusUpper, vc.STATUS_SRC_HEALTH);
+});
+
+test('buildCustomCycle: fold-promote only under the legacy order', () => {
+  const mk = (order) => ({
+    viewCount: '1', radarMode: 'off', healthMode: 'off',
+    viewTop0: 'cal2', viewBody0: 'forecast',
+    viewUpper0: 'radar', viewLower0: 'weather', viewOrder0: order,
+  });
+  // Legacy order: folded upper promotes the surviving lower (dense degradation).
+  const legacy = vc.buildCustomCycle(mk('TACB'))[0];
+  assert.equal(legacy.statusUpper, vc.STATUS_SRC_FORECAST);
+  assert.equal(legacy.statusLower, vc.STATUS_SRC_NONE);
+  assert.ok(!('order' in legacy));
+  // Stacked order: seats are user-placed positions — the survivor stays put.
+  const stacked = vc.buildCustomCycle(mk('ATBC'))[0];
+  assert.equal(stacked.statusUpper, vc.STATUS_SRC_NONE);
+  assert.equal(stacked.statusLower, vc.STATUS_SRC_FORECAST);
+  assert.equal(stacked.order, vc.orderCode('ATBC'));
+});
+
+test('buildCustomCycle: viewCount clamps and absent keys fall back sanely', () => {
+  assert.equal(vc.buildCustomCycle({ viewCount: '9', radarMode: 'off', healthMode: 'off' }).length, 1);
+  const c = vc.buildCustomCycle({ viewCount: '1', radarMode: 'off', healthMode: 'off' });
+  assert.equal(c[0].tier, vc.TIER_COMPACT, 'default top is the 2-row calendar');
+  assert.equal(c[0].body, vc.BODY_FC);
+  assert.equal(c[0].statusUpper, vc.STATUS_SRC_NONE);
+});
+
+// The canonical order table must stay in lockstep with src/c/windows/layout.c's
+// STACK_ORDER (the C side pins the same list through rendered band order in
+// test/c/layout_test.c stacked_order_parity). Code 0 = legacy; codes 1-11 = stacker.
+test('STACK_ORDERS matches the documented canonical list, code 0 is legacy', () => {
+  assert.deepStrictEqual(vc.STACK_ORDERS, [
+    'TACB', 'TCAB', 'TABC', 'CTAB', 'CATB', 'CABT',
+    'ATCB', 'ATBC', 'ACTB', 'ACBT', 'ABTC', 'ABCT',
+  ]);
+  // Every entry: a permutation of TCAB with A before B (canonical form).
+  vc.STACK_ORDERS.forEach((s) => {
+    assert.deepStrictEqual(s.split('').sort(), ['A', 'B', 'C', 'T'], s);
+    assert.ok(s.indexOf('A') < s.indexOf('B'), s + ': A must render above B');
+  });
+  assert.equal(vc.orderCode('TACB'), 0);
+  assert.equal(vc.orderCode('CTAB'), 3);
+  assert.equal(vc.orderCode('ABCT'), 11);
+  assert.equal(vc.orderCode('BACT'), 0, 'non-canonical input falls back to legacy');
+  assert.equal(vc.orderCode('nope'), 0);
+});
+
+// Cycle transforms clone specs; a clone via the 5-arg spec() would silently drop
+// the custom fields. Pin that every transform's clone path preserves them.
+test('transforms preserve clockOff/stripOff/order through their clones', () => {
+  // swapUpperToLower's clone path: lone upper row moves down, flags survive.
+  const swapIn = flagged(true, true, 5); // lone-upper compact spec + all fields
+  const swapped = vc.swapUpperToLower(swapIn);
+  assert.notStrictEqual(swapped, swapIn, 'sanity: the transform cloned');
+  assert.equal(swapped.statusUpper, vc.STATUS_SRC_NONE);
+  assert.equal(swapped.statusLower, vc.STATUS_SRC_FORECAST);
+  assert.equal(swapped.clockOff, true);
+  assert.equal(swapped.stripOff, true);
+  assert.equal(swapped.order, 5);
+
+  // demoteRadarBody's clone path: chart body demotes, flags survive.
+  const radar = vc.spec(vc.TIER_COMPACT, vc.TOP_CAL, vc.BODY_RADAR,
+    vc.STATUS_SRC_RADAR, vc.STATUS_SRC_FORECAST);
+  radar.clockOff = true;
+  radar.order = 3;
+  const demoted = vc.demoteRadarBody(radar);
+  assert.notStrictEqual(demoted, radar, 'sanity: the transform cloned');
+  assert.equal(demoted.body, vc.BODY_FC);
+  assert.equal(demoted.clockOff, true);
+  assert.equal(demoted.order, 3);
+  assert.ok(!('stripOff' in demoted), 'unset fields stay absent (canonical form)');
+
+  // cloneSpec itself: independent copy, all fields, canonical absence.
+  const cloned = vc.cloneSpec(radar);
+  assert.notStrictEqual(cloned, radar);
+  assert.deepEqual(cloned, radar);
 });

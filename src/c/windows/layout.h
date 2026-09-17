@@ -175,6 +175,16 @@ typedef struct {
     uint8_t status_lower;   // StatusSource feeding the lower (forecast-abutting) band
     uint8_t status_tier;    // LayoutTier the status rows render at
     uint8_t weights[3];     // calendar/time/bottom band weights
+#if defined(WW_VIEW_CYCLE)
+    // Custom-layout fields, decoded from wire bits 10/11/12-15 (view-cycle.js packSpec).
+    // Guarded on the flick-cycle feature macro because custom layouts are a colour-platform
+    // feature: aplite (frozen-lean fork) folds every wire value to its preset shapes and its
+    // twin never reads these bits, so the guard keeps aplite's struct — and every byte of its
+    // copy/codegen — identical to pre-custom builds.
+    uint8_t clock_off;      // 1 = this view omits the clock band (flick views only)
+    uint8_t strip_off;      // 1 = this view omits the top status strip (flick views only)
+    uint8_t order;          // canonical band-order code; 0 = the legacy fixed order
+#endif
 } ViewSpec;
 
 typedef struct {
@@ -268,9 +278,12 @@ static inline GRect layout_status_band(const ViewSpec *spec, const MainLayout *L
     return band;
 }
 
-// Decode a packed 10-bit wire value (tier<<8 | top<<6 | body<<4 | statusUpper<<2 |
-// statusLower) to a ViewSpec. Pure — the producer (main_window) supplies the value;
-// availability is resolved separately by view_spec_resolve. Value 0 decodes to a zeroed spec.
+// Decode a packed wire value (statusLower | statusUpper<<2 | body<<4 | top<<6 |
+// tier<<8 | clockOff<<10 | stripOff<<11 | order<<12) to a ViewSpec. Pure — the
+// producer (main_window) supplies the value; availability is resolved separately by
+// view_spec_resolve. Value 0 decodes to a zeroed spec. Bits 10-15 exist only on the
+// custom-layout wire; every preset value keeps them clear, and the aplite twin never
+// reads them.
 ViewSpec view_spec_unpack(uint16_t v);
 
 // Data-availability downgrades, pure. Each status source is downgraded to NONE when its
@@ -305,9 +318,9 @@ MainLayout layout_compute_peek(GRect bounds, const ViewSpec *spec, LayoutMetrics
 // cursor state and resolves availability from the SDK (radar data present? health
 // renderable?); these helpers keep the navigation rules pure and host-testable.
 
-// Is a configured slot value renderable right now? Disabled (0) never; a radar band
-// needs radar data; a health band/row needs health. Availability is caller-supplied.
-// The slot is the full 10-bit packed value (see view_spec_unpack).
+// Is a configured slot value renderable right now? Disabled (wire tier 0) never; a
+// radar band needs radar data; a health band/row needs health. Availability is
+// caller-supplied. The slot is the full 16-bit packed value (see view_spec_unpack).
 bool view_slot_available(uint16_t value, bool has_radar, bool has_health);
 
 // Next enabled + available slot after `from`, wrapping. Index 0 (the default view) is
@@ -318,8 +331,8 @@ uint8_t view_cursor_next(uint8_t from, const uint16_t spec[3], bool has_radar, b
 // (each slot may now hold a different view), which makes the old cursor position
 // meaningless — snap back to the default view (0). An unchanged cycle keeps the cursor
 // (a radar/health availability re-apply must not yank the user off their chosen view).
-// Slots are compared as full 10-bit values, so a change confined to the tier/top bits
-// (8-9 / 6-7) still reads as a redefined cycle.
+// Slots are compared as full 16-bit values, so a change confined to the tier/top or
+// custom bits (8-9 / 6-7 / 10-15) still reads as a redefined cycle.
 uint8_t view_cursor_after_config(uint8_t cursor, const uint16_t old_spec[3],
                                  const uint16_t new_spec[3]);
 
